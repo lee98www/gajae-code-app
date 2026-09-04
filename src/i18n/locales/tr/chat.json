@@ -231,6 +231,11 @@
     "target": "→ {{name}}",
     "search": "Depolarda ara…",
     "noMatch": "Eşleşen depo yok",
+    "newRepo": "Yeni depo…",
+    "newRepoName": "Depo adı",
+    "create": "Oluştur",
+    "creating": "Oluşturuluyor…",
+    "createFailed": "Depo oluşturulamadı",
     "reason": {
       "mention": "Bahsedildi",
       "partial": "Kısmi eşleşme",

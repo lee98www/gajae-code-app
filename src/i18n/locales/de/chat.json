@@ -231,6 +231,11 @@
     "target": "→ {{name}}",
     "search": "Repos durchsuchen…",
     "noMatch": "Kein passendes Repo",
+    "newRepo": "Neues Repo…",
+    "newRepoName": "Repo-Name",
+    "create": "Erstellen",
+    "creating": "Wird erstellt…",
+    "createFailed": "Repo konnte nicht erstellt werden",
     "reason": {
       "mention": "Erwähnt",
       "partial": "Teilweise Übereinstimmung",

@@ -231,6 +231,11 @@
     "target": "→ {{name}}",
     "search": "搜索仓库…",
     "noMatch": "没有匹配的仓库",
+    "newRepo": "新建仓库…",
+    "newRepoName": "仓库名称",
+    "create": "创建",
+    "creating": "创建中…",
+    "createFailed": "无法创建仓库",
     "reason": {
       "mention": "已提及",
       "partial": "部分匹配",

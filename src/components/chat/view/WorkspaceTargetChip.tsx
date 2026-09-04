@@ -1,12 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import { ChevronDown, FolderGit2, Search } from 'lucide-react';
+import { ChevronDown, FolderGit2, Plus, Search } from 'lucide-react';
 
+import { Button } from '../../../shared/view/ui/Button';
+import { authenticatedFetch } from '../../../utils/api';
 import { cn } from '../../../utils/cn';
 import type { WorkspaceCandidate } from '../hooks/useWorkspaceTarget';
 
 interface WorkspaceTargetChipProps {
+  /** Project id of the workspace root, used to create a child repo. */
+  projectId: string;
   /** Display name of the workspace root project, shown when no target is picked. */
   workspaceRootName: string;
   candidates: WorkspaceCandidate[];
@@ -27,13 +31,18 @@ const POPUP_MAX_HEIGHT = 380;
  * root routinely has dozens of repos, so the list scrolls and filters like the
  * skill picker does.
  */
-export default function WorkspaceTargetChip({ workspaceRootName, candidates, target, onPick }: WorkspaceTargetChipProps) {
+export default function WorkspaceTargetChip({ projectId, workspaceRootName, candidates, target, onPick }: WorkspaceTargetChipProps) {
   const { t } = useTranslation('chat');
   const [open, setOpen] = useState(false);
+  const [mode, setMode] = useState<'list' | 'create'>('list');
   const [query, setQuery] = useState('');
+  const [newRepoName, setNewRepoName] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const nameRef = useRef<HTMLInputElement>(null);
   const [popupPosition, setPopupPosition] = useState<{ top?: number; bottom?: number; left: number }>({ bottom: 0, left: 0 });
 
   // Same escape hatch as SkillPicker: the popup portals to the body and opens
@@ -43,6 +52,9 @@ export default function WorkspaceTargetChip({ workspaceRootName, candidates, tar
   useEffect(() => {
     if (!open) return;
     setQuery('');
+    setMode('list');
+    setNewRepoName('');
+    setCreateError(null);
     const rect = rootRef.current?.getBoundingClientRect();
     if (rect) {
       const left = Math.max(8, Math.min(rect.left, window.innerWidth - POPUP_WIDTH - 8));
@@ -77,6 +89,38 @@ export default function WorkspaceTargetChip({ workspaceRootName, candidates, tar
     setOpen(false);
   };
 
+  const openCreateMode = () => {
+    setNewRepoName(filtered.length === 0 ? query.trim() : '');
+    setCreateError(null);
+    setMode('create');
+    window.requestAnimationFrame(() => nameRef.current?.focus());
+  };
+
+  const createRepo = async () => {
+    const name = newRepoName.trim();
+    if (!name || creating) return;
+    setCreating(true);
+    setCreateError(null);
+    try {
+      const response = await authenticatedFetch(`/api/projects/${encodeURIComponent(projectId)}/create-child`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      const body = await response.json();
+      if (!response.ok || !body?.data) {
+        setCreateError(body?.error?.message ?? t('workspaceTarget.createFailed'));
+        return;
+      }
+      const created: WorkspaceCandidate = { path: body.data.fullPath, name: body.data.displayName, score: 100, reason: 'mention' };
+      pick(created);
+    } catch {
+      setCreateError(t('workspaceTarget.createFailed'));
+    } finally {
+      setCreating(false);
+    }
+  };
+
   const label = target
     ? t('workspaceTarget.target', { name: target.name })
     : `${workspaceRootName} · ${t('workspaceTarget.chooseRepo')}`;
@@ -105,55 +149,96 @@ export default function WorkspaceTargetChip({ workspaceRootName, candidates, tar
           className="fixed z-80 overflow-hidden rounded-xl border border-border bg-popover p-1.5 text-popover-foreground shadow-xl"
           style={{ ...popupPosition, width: POPUP_WIDTH }}
         >
-          <div className="relative px-1 pb-1.5">
-            <Search className="pointer-events-none absolute top-1/2 left-3 size-3 -translate-y-1/2 text-muted-foreground" />
-            <input
-              ref={searchRef}
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && filtered.length > 0) {
-                  event.preventDefault();
-                  pick(filtered[0]);
-                }
-              }}
-              placeholder={t('workspaceTarget.search')}
-              aria-label={t('workspaceTarget.search')}
-              className="h-7 w-full rounded-md border border-input bg-background pr-2 pl-7 text-xs outline-hidden placeholder:text-muted-foreground focus:border-ring"
-            />
-          </div>
-          <div role="listbox" aria-label={t('workspaceTarget.chooseRepo')} className="max-h-72 overflow-y-auto">
-            {filtered.map((candidate) => (
-              <button
-                key={candidate.path}
-                type="button"
-                role="option"
-                aria-selected={target?.path === candidate.path}
-                onClick={() => pick(candidate)}
-                className={cn(
-                  'flex w-full flex-col rounded-lg px-2.5 py-1.5 text-left hover:bg-accent',
-                  target?.path === candidate.path && 'bg-accent/60',
+          {mode === 'create' ? (
+            <div className="px-1 pb-1">
+              <input
+                ref={nameRef}
+                value={newRepoName}
+                onChange={(event) => setNewRepoName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    void createRepo();
+                  } else if (event.key === 'Escape') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setMode('list');
+                  }
+                }}
+                disabled={creating}
+                placeholder={t('workspaceTarget.newRepoName')}
+                aria-label={t('workspaceTarget.newRepoName')}
+                className="h-7 w-full rounded-md border border-input bg-background px-2 text-xs outline-hidden placeholder:text-muted-foreground focus:border-ring disabled:opacity-50"
+              />
+              {createError && <p className="mt-1 px-0.5 text-[11px] leading-4 text-destructive">{createError}</p>}
+              <div className="mt-1.5 flex justify-end">
+                <Button type="button" size="sm" className="h-7 px-3 text-xs" disabled={!newRepoName.trim() || creating} onClick={() => void createRepo()}>
+                  {creating ? t('workspaceTarget.creating') : t('workspaceTarget.create')}
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="relative px-1 pb-1.5">
+                <Search className="pointer-events-none absolute top-1/2 left-3 size-3 -translate-y-1/2 text-muted-foreground" />
+                <input
+                  ref={searchRef}
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' && filtered.length > 0) {
+                      event.preventDefault();
+                      pick(filtered[0]);
+                    }
+                  }}
+                  placeholder={t('workspaceTarget.search')}
+                  aria-label={t('workspaceTarget.search')}
+                  className="h-7 w-full rounded-md border border-input bg-background pr-2 pl-7 text-xs outline-hidden placeholder:text-muted-foreground focus:border-ring"
+                />
+              </div>
+              <div role="listbox" aria-label={t('workspaceTarget.chooseRepo')} className="max-h-72 overflow-y-auto">
+                {filtered.map((candidate) => (
+                  <button
+                    key={candidate.path}
+                    type="button"
+                    role="option"
+                    aria-selected={target?.path === candidate.path}
+                    onClick={() => pick(candidate)}
+                    className={cn(
+                      'flex w-full flex-col rounded-lg px-2.5 py-1.5 text-left hover:bg-accent',
+                      target?.path === candidate.path && 'bg-accent/60',
+                    )}
+                  >
+                    <span className="truncate text-xs font-medium">{candidate.name}</span>
+                    <span className="text-[11px] leading-4 text-muted-foreground">{t(`workspaceTarget.reason.${candidate.reason}`)}</span>
+                  </button>
+                ))}
+                {filtered.length === 0 && (
+                  <p className="px-2.5 py-2 text-xs text-muted-foreground">{t('workspaceTarget.noMatch')}</p>
                 )}
-              >
-                <span className="truncate text-xs font-medium">{candidate.name}</span>
-                <span className="text-[11px] leading-4 text-muted-foreground">{t(`workspaceTarget.reason.${candidate.reason}`)}</span>
-              </button>
-            ))}
-            {filtered.length === 0 && (
-              <p className="px-2.5 py-2 text-xs text-muted-foreground">{t('workspaceTarget.noMatch')}</p>
-            )}
-          </div>
-          <div className="mt-1 border-t border-border/60 pt-1">
-            <button
-              type="button"
-              role="option"
-              aria-selected={target === null}
-              onClick={() => pick(null)}
-              className="flex w-full rounded-lg px-2.5 py-1.5 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
-            >
-              {t('workspaceTarget.keepAtRoot')}
-            </button>
-          </div>
+              </div>
+              <div className="mt-1 border-t border-border/60 pt-1">
+                <button
+                  type="button"
+                  role="option"
+                  onClick={openCreateMode}
+                  className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+                >
+                  <Plus className="size-3 shrink-0" />
+                  {t('workspaceTarget.newRepo')}
+                </button>
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={target === null}
+                  onClick={() => pick(null)}
+                  className="flex w-full rounded-lg px-2.5 py-1.5 text-left text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+                >
+                  {t('workspaceTarget.keepAtRoot')}
+                </button>
+              </div>
+            </>
+          )}
         </div>,
         document.body,
       )}

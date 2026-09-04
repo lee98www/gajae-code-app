@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
 import { closeConnection, initializeDatabase, projectsDb } from '@/modules/database/index.js';
-import { descendIntoChild, isWorkspaceRoot, listChildRepos, resolveWorkspaceTarget } from '@/modules/projects/services/workspace-target.service.js';
+import { createChildRepo, descendIntoChild, invalidChildNameReason, isWorkspaceRoot, listChildRepos, resolveWorkspaceTarget } from '@/modules/projects/services/workspace-target.service.js';
 import { scoreWorkspaceCandidates } from '@/modules/projects/services/workspace-target-scoring.js';
 import { AppError } from '@/shared/utils.js';
 
@@ -264,6 +264,113 @@ test('descendIntoChild: rejects non-child paths, non-git children, and traversal
         () => descendIntoChild(nonWorkspaceProject.project_id, repoA),
         (error: unknown) => code(error) === 'NOT_WORKSPACE_CHILD' && statusCode(error) === 400,
       );
+    });
+  });
+});
+
+// ---- invalidChildNameReason (pure function) ----
+
+test('invalidChildNameReason: accepts a plain name, rejects every invalid class', () => {
+  assert.equal(invalidChildNameReason('my-new-repo'), null);
+  assert.equal(invalidChildNameReason(''), 'Name is required');
+  assert.equal(invalidChildNameReason('a'.repeat(101)), 'Name must be 100 characters or fewer');
+  assert.ok(invalidChildNameReason('a'.repeat(100)) === null);
+  assert.ok(invalidChildNameReason('foo/bar'));
+  assert.ok(invalidChildNameReason('foo\\bar'));
+  assert.ok(invalidChildNameReason('foo\0bar'));
+  assert.ok(invalidChildNameReason('.'));
+  assert.ok(invalidChildNameReason('..'));
+  assert.ok(invalidChildNameReason('.hidden'));
+  assert.ok(invalidChildNameReason('node_modules'));
+});
+
+// ---- createChildRepo (fixture directory + db + real git init) ----
+
+test('createChildRepo: creates dir + .git + explicit project', async () => {
+  await withDatabase(async () => {
+    await withWorkspaceFixture(async ({ workspaceDir }) => {
+      const workspaceProject = projectsDb.createProjectPath(workspaceDir).project;
+      assert.ok(workspaceProject);
+
+      const project = await createChildRepo(workspaceProject.project_id, 'gamma');
+      const childPath = path.join(workspaceDir, 'gamma');
+      assert.equal(project.fullPath, childPath);
+      assert.equal(project.origin, 'explicit');
+
+      const headStat = await stat(path.join(childPath, '.git', 'HEAD'));
+      assert.ok(headStat.isFile());
+    });
+  });
+});
+
+test('createChildRepo: rejects each invalid name class with INVALID_CHILD_NAME', async () => {
+  await withDatabase(async () => {
+    await withWorkspaceFixture(async ({ workspaceDir }) => {
+      const workspaceProject = projectsDb.createProjectPath(workspaceDir).project;
+      assert.ok(workspaceProject);
+
+      const invalidNames = ['', 'a'.repeat(101), 'foo/bar', 'foo\\bar', 'foo\0bar', '.', '..', '.hidden', 'node_modules'];
+      for (const name of invalidNames) {
+        await assert.rejects(
+          () => createChildRepo(workspaceProject.project_id, name),
+          (error: unknown) => code(error) === 'INVALID_CHILD_NAME' && statusCode(error) === 400,
+          `expected "${name}" to be rejected`,
+        );
+      }
+    });
+  });
+});
+
+test('createChildRepo: 409 CHILD_EXISTS for an existing dir and for an existing plain file, nothing overwritten', async () => {
+  await withDatabase(async () => {
+    await withWorkspaceFixture(async ({ workspaceDir }) => {
+      const workspaceProject = projectsDb.createProjectPath(workspaceDir).project;
+      assert.ok(workspaceProject);
+
+      await mkdir(path.join(workspaceDir, 'existing-dir'), { recursive: true });
+      await assert.rejects(
+        () => createChildRepo(workspaceProject.project_id, 'existing-dir'),
+        (error: unknown) => code(error) === 'CHILD_EXISTS' && statusCode(error) === 409,
+      );
+
+      await writeFile(path.join(workspaceDir, 'existing-file'), 'hello');
+      await assert.rejects(
+        () => createChildRepo(workspaceProject.project_id, 'existing-file'),
+        (error: unknown) => code(error) === 'CHILD_EXISTS' && statusCode(error) === 409,
+      );
+      const fileContent = await readFile(path.join(workspaceDir, 'existing-file'), 'utf8');
+      assert.equal(fileContent, 'hello');
+    });
+  });
+});
+
+test('createChildRepo: NOT_WORKSPACE_CHILD when the project is a plain repo', async () => {
+  await withDatabase(async () => {
+    await withWorkspaceFixture(async ({ repoA }) => {
+      const nonWorkspaceProject = projectsDb.createProjectPath(repoA).project;
+      assert.ok(nonWorkspaceProject);
+      await assert.rejects(
+        () => createChildRepo(nonWorkspaceProject.project_id, 'delta'),
+        (error: unknown) => code(error) === 'NOT_WORKSPACE_CHILD' && statusCode(error) === 400,
+      );
+    });
+  });
+});
+
+test('createChildRepo: a second create-child for the same name is 409, nothing overwritten', async () => {
+  await withDatabase(async () => {
+    await withWorkspaceFixture(async ({ workspaceDir }) => {
+      const workspaceProject = projectsDb.createProjectPath(workspaceDir).project;
+      assert.ok(workspaceProject);
+
+      const first = await createChildRepo(workspaceProject.project_id, 'epsilon');
+      await assert.rejects(
+        () => createChildRepo(workspaceProject.project_id, 'epsilon'),
+        (error: unknown) => code(error) === 'CHILD_EXISTS' && statusCode(error) === 409,
+      );
+
+      const headStat = await stat(path.join(first.fullPath, '.git', 'HEAD'));
+      assert.ok(headStat.isFile());
     });
   });
 });

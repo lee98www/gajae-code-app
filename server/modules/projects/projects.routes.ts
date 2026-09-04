@@ -3,7 +3,7 @@ import express from 'express';
 import { deleteOrArchiveProject, restoreArchivedProject } from '@/modules/projects/services/project-delete.service.js';
 import { startCloneProject, type CloneProjectOperation } from '@/modules/projects/services/project-clone.service.js';
 import { createProject, promoteProjectOrigin, updateProjectDisplayName } from '@/modules/projects/services/project-management.service.js';
-import { descendIntoChild, resolveWorkspaceTarget } from '@/modules/projects/services/workspace-target.service.js';
+import { createChildRepo, descendIntoChild, resolveWorkspaceTarget } from '@/modules/projects/services/workspace-target.service.js';
 import {
   getProjectPermissions,
   listConfiguredProjectPermissions,
@@ -109,6 +109,14 @@ router.post('/:projectId/descend', asyncHandler(async (request, response) => {
   if (!childPath) throw new AppError('path is required', { code: 'NOT_WORKSPACE_CHILD', statusCode: 400 });
   const { created, project } = await descendIntoChild(projectId, childPath);
   response.status(created ? 201 : 200).json(createApiSuccessResponse(project));
+}));
+
+router.post('/:projectId/create-child', asyncHandler(async (request, response) => {
+  const projectId = routeProjectId(request.params.projectId, true);
+  const body: { name?: unknown } = request.body ?? {};
+  const name = typeof body.name === 'string' ? body.name : '';
+  const project = await createChildRepo(projectId, name);
+  response.status(201).json(createApiSuccessResponse(project));
 }));
 
 router.get('/:projectId/sessions', asyncHandler(async (request, response) => {

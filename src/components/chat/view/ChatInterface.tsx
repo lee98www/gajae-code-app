@@ -304,6 +304,7 @@ function ChatInterface({
       onSelectPermissionMode={projectPermissions.setMode}
       permissionsBusy={projectPermissions.isSettingMode}
       isWorkspace={composer.isWorkspace}
+      workspaceProjectId={selectedProject.projectId}
       workspaceRootName={selectedProject.displayName}
       workspaceCandidates={composer.workspaceCandidates}
       workspaceTarget={composer.workspaceTargetValue}

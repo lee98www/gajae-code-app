@@ -231,6 +231,11 @@
     "target": "→ {{name}}",
     "search": "저장소 검색…",
     "noMatch": "일치하는 저장소 없음",
+    "newRepo": "새 저장소…",
+    "newRepoName": "저장소 이름",
+    "create": "만들기",
+    "creating": "만드는 중…",
+    "createFailed": "저장소를 만들지 못했습니다",
     "reason": {
       "mention": "언급됨",
       "partial": "부분 일치",

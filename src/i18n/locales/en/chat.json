@@ -231,6 +231,11 @@
     "target": "→ {{name}}",
     "search": "Search repos…",
     "noMatch": "No repo matches",
+    "newRepo": "New repo…",
+    "newRepoName": "Repo name",
+    "create": "Create",
+    "creating": "Creating…",
+    "createFailed": "Could not create the repo",
     "reason": {
       "mention": "Mentioned",
       "partial": "Partial match",

@@ -1,5 +1,7 @@
+import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { promisify } from 'node:util';
 
 import { projectsDb } from '@/modules/database/index.js';
 import { projectApiView, type ProjectApiView } from '@/modules/projects/services/project-management.service.js';
@@ -108,6 +110,20 @@ function notWorkspaceChild(message: string): AppError {
   return new AppError(message, { code: 'NOT_WORKSPACE_CHILD', statusCode: 400 });
 }
 
+// Registers `childPath` as a sidebar project the same way "Add a project" does:
+// created or un-archived as 'explicit', and a row the session indexer had only
+// discovered ('auto'/'legacy') is promoted.
+function registerExplicitChildProject(childPath: string): { created: boolean; project: ProjectApiView } {
+  const { outcome, project: child } = projectsDb.createProjectPath(childPath);
+  if (!child) {
+    throw new AppError('Failed to register project for workspace child', { code: 'PROJECT_CREATE_FAILED', statusCode: 500 });
+  }
+  const row = outcome === 'active_conflict' && child.origin !== 'explicit'
+    ? projectsDb.promoteProjectOriginById(child.project_id) ?? child
+    : child;
+  return { created: outcome === 'created', project: projectApiView(row) };
+}
+
 export async function descendIntoChild(projectId: string, childPath: string): Promise<DescendIntoChildResult> {
   const project = projectRowOrThrow(projectId);
   if (!(await isWorkspaceRoot(project.project_path))) {
@@ -121,15 +137,67 @@ export async function descendIntoChild(projectId: string, childPath: string): Pr
     throw notWorkspaceChild('path is not an immediate child repository of the workspace project');
   }
 
-  // The user chose this repo to work in, so it becomes a sidebar project the
-  // same way "Add a project" does: created or un-archived as 'explicit', and a
-  // row the session indexer had only discovered ('auto'/'legacy') is promoted.
-  const { outcome, project: child } = projectsDb.createProjectPath(matchedChild.path);
-  if (!child) {
-    throw new AppError('Failed to register project for workspace child', { code: 'PROJECT_CREATE_FAILED', statusCode: 500 });
+  return registerExplicitChildProject(matchedChild.path);
+}
+
+const RESERVED_CHILD_NAMES = new Set(['.', '..', 'node_modules']);
+
+/**
+ * Validates a proposed child repo directory name, returning a human-readable
+ * rejection reason or `null` when the name is acceptable.
+ */
+export function invalidChildNameReason(name: string): string | null {
+  if (!name) return 'Name is required';
+  if (name.length > 100) return 'Name must be 100 characters or fewer';
+  if (name.includes('/') || name.includes('\\') || name.includes('\0')) {
+    return 'Name cannot contain "/", "\\", or NUL';
   }
-  const row = outcome === 'active_conflict' && child.origin !== 'explicit'
-    ? projectsDb.promoteProjectOriginById(child.project_id) ?? child
-    : child;
-  return { created: outcome === 'created', project: projectApiView(row) };
+  if (RESERVED_CHILD_NAMES.has(name)) return `"${name}" is a reserved name`;
+  if (name.startsWith('.')) return 'Name cannot start with "."';
+  return null;
+}
+
+function invalidChildName(reason: string): AppError {
+  return new AppError(reason, { code: 'INVALID_CHILD_NAME', statusCode: 400 });
+}
+
+const execFileAsync = promisify(execFile);
+
+export async function createChildRepo(projectId: string, name: string): Promise<ProjectApiView> {
+  const project = projectRowOrThrow(projectId);
+  if (!(await isWorkspaceRoot(project.project_path))) {
+    throw notWorkspaceChild('Project is not a workspace root');
+  }
+
+  const reason = invalidChildNameReason(name);
+  if (reason) throw invalidChildName(reason);
+
+  const childPath = path.join(project.project_path, name);
+  const childExists = await fs.stat(childPath).then(() => true, () => false);
+  if (childExists) {
+    throw new AppError(`"${name}" already exists`, { code: 'CHILD_EXISTS', statusCode: 409 });
+  }
+
+  try {
+    await fs.mkdir(childPath);
+  } catch (error) {
+    const failure = error as NodeJS.ErrnoException;
+    if (failure.code === 'EEXIST') {
+      throw new AppError(`"${name}" already exists`, { code: 'CHILD_EXISTS', statusCode: 409 });
+    }
+    throw failure;
+  }
+
+  try {
+    await execFileAsync('git', ['init', '-b', 'main'], { cwd: childPath });
+  } catch (error) {
+    await fs.rm(childPath, { recursive: true, force: true });
+    throw new AppError('Failed to initialize git repository', {
+      code: 'GIT_INIT_FAILED',
+      statusCode: 500,
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  return registerExplicitChildProject(childPath).project;
 }

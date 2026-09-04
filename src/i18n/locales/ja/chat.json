@@ -231,6 +231,11 @@
     "target": "→ {{name}}",
     "search": "リポジトリを検索…",
     "noMatch": "一致するリポジトリなし",
+    "newRepo": "新しいリポジトリ…",
+    "newRepoName": "リポジトリ名",
+    "create": "作成",
+    "creating": "作成中…",
+    "createFailed": "リポジトリを作成できませんでした",
     "reason": {
       "mention": "言及あり",
       "partial": "部分一致",

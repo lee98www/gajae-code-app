@@ -231,6 +231,11 @@
     "target": "→ {{name}}",
     "search": "Rechercher un dépôt…",
     "noMatch": "Aucun dépôt correspondant",
+    "newRepo": "Nouveau dépôt…",
+    "newRepoName": "Nom du dépôt",
+    "create": "Créer",
+    "creating": "Création…",
+    "createFailed": "Impossible de créer le dépôt",
     "reason": {
       "mention": "Mentionné",
       "partial": "Correspondance partielle",

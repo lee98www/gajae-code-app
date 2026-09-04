@@ -137,6 +137,7 @@ interface ChatComposerProps {
   permissionsBusy?: boolean;
   /** True when the selected project is a workspace root; shows the target chip. */
   isWorkspace?: boolean;
+  workspaceProjectId?: string;
   workspaceRootName?: string;
   workspaceCandidates?: WorkspaceCandidate[];
   workspaceTarget?: WorkspaceCandidate | null;
@@ -207,6 +208,7 @@ export default function ChatComposer({
   onSelectPermissionMode = () => {},
   permissionsBusy = false,
   isWorkspace = false,
+  workspaceProjectId = '',
   workspaceRootName = '',
   workspaceCandidates = [],
   workspaceTarget = null,
@@ -319,6 +321,7 @@ export default function ChatComposer({
 
       {isWorkspace && (
         <WorkspaceTargetChip
+          projectId={workspaceProjectId}
           workspaceRootName={workspaceRootName}
           candidates={workspaceCandidates}
           target={workspaceTarget}
