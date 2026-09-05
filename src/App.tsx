@@ -7,7 +7,8 @@ import { AuthProvider, ProtectedRoute } from './components/auth';
 import { WebSocketProvider } from './contexts/WebSocketContext';
 import AppContent from './components/app/AppContent';
 import DesktopDeepLinkBridge from './components/app/DesktopDeepLinkBridge';
-import { appShellRoutePaths, rootFallbackRoutePath } from './components/app/appRoutes';
+import { appShellRoutePaths, herdrRoutePaths, rootFallbackRoutePath } from './components/app/appRoutes';
+import HerdrPage from './components/herdr/view/HerdrPage';
 import i18n from './i18n/config.js';
 
 
@@ -77,6 +78,9 @@ function ApplicationRoutes({ routerBasename }: ApplicationLayoutProps) {
     <Routes>
       {appShellRoutePaths.map((path) => (
         <Route key={path} path={path} element={<AppContent />} />
+      ))}
+      {herdrRoutePaths.map((path) => (
+        <Route key={path} path={path} element={<HerdrPage />} />
       ))}
       <Route path={rootFallbackRoutePath} element={<Navigate to="/" replace />} />
     </Routes>

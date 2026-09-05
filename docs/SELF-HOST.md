@@ -61,6 +61,30 @@ port forwarding.
 ssh -N -L 3001:127.0.0.1:3001 user@server
 ```
 
+## Herdr client boundary
+
+When Herdr is installed for the same user, Gajae Code App can list admitted
+current-user Herdr API sockets under `$XDG_CONFIG_HOME/herdr` or
+`~/.config/herdr`, read selected-pane visible plain text, and send explicit
+bounded input. Gajae Code App does not start, stop, upgrade, rename, focus, or
+repair Herdr, and it does not migrate Herdr panes into SDK chat sessions.
+Collie remains an independent client.
+
+The browser never supplies a socket path. It selects an admitted session name
+and pane id; the server resolves those through its own registry. Output reads
+use Herdr `pane.read` with `source: "visible"` and `format: "text"` so routine
+refreshes do not harvest scrollback or move the operator's terminal. Treat the
+result as the current viewport, not conversation history.
+
+Input is intentionally narrow: one-line text, Send + Enter, Enter-only, or
+Escape. Text cannot contain control characters or newlines and is capped at
+16 KiB. Gajae revalidates the observed pane before dispatch and serializes its
+own same-pane submissions, but Herdr's public input request carries only
+`pane_id`, `text`, and `keys`. That check is local preflight, not atomic
+compare-and-send. A successful reply means Herdr accepted bytes; it does not
+prove delivery, target continuity, or task completion. Timeouts after a write
+may have happened are reported as unknown and are never retried automatically.
+
 ## Cutover to a verified release
 
 A cutover changes only the `current` symlink and then restarts the service.

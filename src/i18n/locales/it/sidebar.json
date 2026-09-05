@@ -104,5 +104,9 @@
     "sessionCount_one": "C'è una conversazione {{count}} in questo progetto.",
     "sessionCount_other": "Ci sono conversazioni {{count}} in questo progetto.",
     "deleteAllData": "Cancella definitivamente tutti i dati"
+  },
+  "herdr": {
+    "title": "Herdr",
+    "navigation": "Navigazione Herdr"
   }
 }

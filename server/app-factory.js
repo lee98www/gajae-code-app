@@ -8,6 +8,7 @@ import { parseAllowedHosts } from '../shared/networkHosts.js';
 import { createDesktopAuth, DESKTOP_BOOTSTRAP_PATH } from './middleware/desktop-auth.js';
 import { createWebSocketServer } from './modules/websocket/index.js';
 import { createGjcJobsRouter } from './routes/gjc-jobs.js';
+import { createHerdrRouter } from './routes/herdr.js';
 import { isAllowedRequestOrigin } from './shared/request-origin.js';
 
 /**
@@ -25,6 +26,7 @@ export function createGjcAppFactory({
   validateApiKey,
   chat,
   shell,
+  herdr = undefined,
   browser = undefined,
 }) {
   orchestrator.deps.broadcast = (jobId, event) => {
@@ -91,6 +93,9 @@ export function createGjcAppFactory({
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
   app.use('/api', validateApiKey);
   app.use('/api/gjc', authenticateGjcRoute, createGjcJobsRouter({ authority, orchestrator, gitService }));
+  if (herdr) {
+    app.use('/api/herdr', authenticateGjcRoute, createHerdrRouter(herdr));
+  }
 
   return { app, server, wss };
 }

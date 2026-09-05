@@ -37,6 +37,7 @@ import {
 } from './gjc-worker-client.js';
 import { getProductionJobAuthority, getProductionJobOrchestrator } from './services/gjc-job-orchestrator.js';
 import { getProductionGjcJobGitService } from './services/gjc-job-git.service.js';
+import { getProductionHerdrSessionsService } from './services/herdr-sessions.js';
 import {
     stripAnsiSequences,
     normalizeDetectedUrl,
@@ -167,6 +168,7 @@ const { app, server, wss } = createGjcAppFactory({
         extractUrlsFromText,
         shouldAutoOpenUrlFromOutput,
     },
+    herdr: getProductionHerdrSessionsService(),
     browser: handleBrowserConnection,
 });
 

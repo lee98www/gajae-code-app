@@ -219,5 +219,33 @@
       "commits": "瀏覽所有提交 ({{total}})",
       "branches": "瀏覽所有分支 ({{total}})"
     }
+  },
+  "herdr": {
+    "title": "Herdr 工作階段",
+    "eyebrow": "Herdr",
+    "description": "探索現有的具名工作階段，檢視可見輸出，並明確傳送受限輸入。",
+    "backToChats": "返回聊天",
+    "sessions": "工作階段",
+    "panes": "窗格",
+    "chooseSession": "請選擇工作階段。",
+    "noSessions": "未發現 Herdr 通訊端。",
+    "visibleOutput": "可見輸出",
+    "refreshing": "重新整理中…",
+    "notLoaded": "尚未載入",
+    "selectPane": "選擇 Herdr 窗格以讀取目前可見的輸出。",
+    "outputCapped": "Gajae App 已限制輸出大小。",
+    "inputLabel": "明確輸入",
+    "inputPlaceholder": "僅限單行文字；Enter 使用獨立按鈕。",
+    "sendText": "傳送文字",
+    "sendEnter": "傳送並按 Enter",
+    "enter": "Enter 鍵",
+    "escape": "Escape 鍵",
+    "inputInvalid": "輸入必須為單行、不含控制字元，且不超過 16 KiB。",
+    "residualRisk": "觀測權杖僅用於本機預先檢查，並非原子 CAS。傳送到 Herdr 前窗格可能改變。取消僅為盡力而為，無法撤回已傳送的輸入；接受不代表已送達或執行。",
+    "selectionStale": "發生變更或失敗後，必須明確重新選擇目前觀測到的窗格才能輸入。",
+    "accepted": "Herdr 已接受；尚未確認送達或執行。",
+    "inputFailed": "輸入失敗或已取消。未排入佇列或重試；送達狀態可能未知。請檢查輸出並重新選擇窗格。",
+    "readFailed": "無法安全讀取 Herdr 資料。請檢查連線，並在恢復後重新選擇窗格。",
+    "status": { "available": "可用", "unreachable": "無法連線", "unsupported": "不支援", "unknown": "未知", "idle": "閒置", "working": "工作中", "blocked": "受阻", "done": "已完成" }
   }
 }

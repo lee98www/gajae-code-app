@@ -219,5 +219,33 @@
       "commits": "すべてのコミットを表示 ({{total}})",
       "branches": "すべてのブランチを表示 ({{total}})"
     }
+  },
+  "herdr": {
+    "title": "Herdr セッション",
+    "eyebrow": "Herdr",
+    "description": "既存の名前付きセッションを検出し、表示中の出力を確認して、制限付きの入力を明示的に送信します。",
+    "backToChats": "チャットに戻る",
+    "sessions": "セッション",
+    "panes": "ペイン",
+    "chooseSession": "セッションを選択してください。",
+    "noSessions": "Herdr ソケットが見つかりません。",
+    "visibleOutput": "表示中の出力",
+    "refreshing": "更新中…",
+    "notLoaded": "未読み込み",
+    "selectPane": "Herdr ペインを選択すると、現在表示中の出力を確認できます。",
+    "outputCapped": "出力は Gajae App によって制限されました。",
+    "inputLabel": "明示的な入力",
+    "inputPlaceholder": "1 行のテキストのみ。Enter は別のボタンです。",
+    "sendText": "テキストを送信",
+    "sendEnter": "送信 + Enter",
+    "enter": "Enter キー",
+    "escape": "Escape キー",
+    "inputInvalid": "入力は制御文字を含まない 1 行で、最大 16 KiB です。",
+    "residualRisk": "観測トークンはローカルの事前確認にすぎず、アトミック CAS ではありません。Herdr への送信前にペインが変わる可能性があります。キャンセルはベストエフォートで、送信済みの入力を取り消せません。受理は到達や実行を保証しません。",
+    "selectionStale": "変更や失敗の後は、現在観測されているペインを明示的に選び直してください。",
+    "accepted": "Herdr が受理しました。到達と実行は未確認です。",
+    "inputFailed": "入力が失敗またはキャンセルされました。キューへの追加や再試行はありません。到達は不明な可能性があります。出力を確認し、ペインを選び直してください。",
+    "readFailed": "Herdr データを安全に読み取れませんでした。接続を確認し、復旧後にペインを選び直してください。",
+    "status": { "available": "利用可能", "unreachable": "接続不可", "unsupported": "未対応", "unknown": "不明", "idle": "待機中", "working": "作業中", "blocked": "ブロック中", "done": "完了" }
   }
 }

@@ -219,5 +219,33 @@
       "commits": "浏览所有提交 ({{total}})",
       "branches": "浏览所有分支 ({{total}})"
     }
+  },
+  "herdr": {
+    "title": "Herdr 会话",
+    "eyebrow": "Herdr",
+    "description": "发现现有命名会话，查看可见输出，并明确发送受限输入。",
+    "backToChats": "返回聊天",
+    "sessions": "会话",
+    "panes": "窗格",
+    "chooseSession": "请选择会话。",
+    "noSessions": "未发现 Herdr 套接字。",
+    "visibleOutput": "可见输出",
+    "refreshing": "正在刷新…",
+    "notLoaded": "尚未加载",
+    "selectPane": "选择 Herdr 窗格以读取当前可见输出。",
+    "outputCapped": "Gajae App 已限制输出大小。",
+    "inputLabel": "明确输入",
+    "inputPlaceholder": "仅限单行文本；回车使用单独按钮。",
+    "sendText": "发送文本",
+    "sendEnter": "发送并回车",
+    "enter": "回车键",
+    "escape": "退出键",
+    "inputInvalid": "输入必须为单行，不含控制字符，且不超过 16 KiB。",
+    "residualRisk": "观测令牌仅用于本地预检，并非原子 CAS。发送到 Herdr 前窗格可能变化。取消仅为尽力而为，无法撤回已发送的输入；接受不代表已送达或执行。",
+    "selectionStale": "发生变化或失败后，必须明确重新选择当前观测到的窗格才能输入。",
+    "accepted": "Herdr 已接受；尚未确认送达或执行。",
+    "inputFailed": "输入失败或已取消。未排队或重试；送达状态可能未知。请检查输出并重新选择窗格。",
+    "readFailed": "无法安全读取 Herdr 数据。请检查连接，并在恢复后重新选择窗格。",
+    "status": { "available": "可用", "unreachable": "无法连接", "unsupported": "不支持", "unknown": "未知", "idle": "空闲", "working": "工作中", "blocked": "受阻", "done": "已完成" }
   }
 }

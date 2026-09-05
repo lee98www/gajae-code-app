@@ -221,5 +221,33 @@
       "commits": "Browse all commits ({{total}})",
       "branches": "Browse all branches ({{total}})"
     }
+  },
+  "herdr": {
+    "title": "Herdr sessions",
+    "eyebrow": "Herdr",
+    "description": "Discover existing named sessions, view visible output, and send explicit bounded input.",
+    "backToChats": "Back to chats",
+    "sessions": "Sessions",
+    "panes": "Panes",
+    "chooseSession": "Choose a session.",
+    "noSessions": "No Herdr sockets were discovered.",
+    "visibleOutput": "Visible output",
+    "refreshing": "Refreshing…",
+    "notLoaded": "Not loaded",
+    "selectPane": "Select a Herdr pane to read its current visible output.",
+    "outputCapped": "Output was capped by Gajae App.",
+    "inputLabel": "Explicit input",
+    "inputPlaceholder": "One-line text only; Enter is a separate button.",
+    "sendText": "Send text",
+    "sendEnter": "Send + Enter",
+    "enter": "Enter",
+    "escape": "Escape",
+    "inputInvalid": "Input must be one line, no control characters, and at most 16 KiB.",
+    "residualRisk": "The observation token is only a local preflight check, not atomic CAS. The pane can change before Herdr dispatch. Cancellation is best-effort and cannot undo dispatched input; acceptance confirms neither delivery nor execution.",
+    "selectionStale": "Input requires explicit reselection of a currently observed pane after a change or failure.",
+    "accepted": "Accepted by Herdr; delivery and execution are not confirmed.",
+    "inputFailed": "Input failed or was cancelled. It was not queued or retried; delivery may be unknown. Inspect output and explicitly reselect the pane.",
+    "readFailed": "Herdr data could not be read safely. Check the connection and reselect the pane after recovery.",
+    "status": { "available": "Available", "unreachable": "Unreachable", "unsupported": "Unsupported", "unknown": "Unknown", "idle": "Idle", "working": "Working", "blocked": "Blocked", "done": "Done" }
   }
 }

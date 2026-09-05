@@ -116,5 +116,9 @@
     "deleteAllData": "Безвозвратно стереть все данные",
     "sessionCount_few": "В этом проекте есть беседы: {{count}}.",
     "sessionCount_many": "В этом проекте есть беседы: {{count}}."
+  },
+  "herdr": {
+    "title": "Herdr",
+    "navigation": "Навигация Herdr"
   }
 }

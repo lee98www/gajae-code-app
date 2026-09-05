@@ -221,5 +221,33 @@
       "commits": "Sfoglia tutti i commit ({{total}})",
       "branches": "Sfoglia tutti i branch ({{total}})"
     }
+  },
+  "herdr": {
+    "title": "Sessioni Herdr",
+    "eyebrow": "Herdr",
+    "description": "Scopri le sessioni con nome esistenti, leggi l’output visibile e invia esplicitamente input limitati.",
+    "backToChats": "Torna alle chat",
+    "sessions": "Sessioni",
+    "panes": "Riquadri",
+    "chooseSession": "Scegli una sessione.",
+    "noSessions": "Nessun socket Herdr trovato.",
+    "visibleOutput": "Output visibile",
+    "refreshing": "Aggiornamento…",
+    "notLoaded": "Non caricato",
+    "selectPane": "Seleziona un riquadro Herdr per leggerne l’output visibile.",
+    "outputCapped": "L’output è stato limitato da Gajae App.",
+    "inputLabel": "Input esplicito",
+    "inputPlaceholder": "Solo testo su una riga; Invio ha un pulsante separato.",
+    "sendText": "Invia testo",
+    "sendEnter": "Invia + Invio",
+    "enter": "Invio",
+    "escape": "Tasto Esc",
+    "inputInvalid": "L’input deve essere su una riga, senza caratteri di controllo e al massimo di 16 KiB.",
+    "residualRisk": "Il token di osservazione serve solo a un controllo preliminare locale, non a un CAS atomico. Il riquadro può cambiare prima dell’invio. L’annullamento non è garantito e non revoca input già inviati; l’accettazione non conferma ricezione o esecuzione.",
+    "selectionStale": "Dopo un cambiamento o un errore, seleziona di nuovo esplicitamente un riquadro attualmente osservato.",
+    "accepted": "Accettato da Herdr; ricezione ed esecuzione non confermate.",
+    "inputFailed": "Input fallito o annullato. Non è stato accodato né ritentato; la ricezione potrebbe essere sconosciuta. Controlla l’output e riseleziona il riquadro.",
+    "readFailed": "Impossibile leggere i dati Herdr in sicurezza. Controlla la connessione e riseleziona il riquadro dopo il ripristino.",
+    "status": { "available": "Disponibile", "unreachable": "Irraggiungibile", "unsupported": "Non supportato", "unknown": "Sconosciuto", "idle": "Inattivo", "working": "In corso", "blocked": "Bloccato", "done": "Completato" }
   }
 }

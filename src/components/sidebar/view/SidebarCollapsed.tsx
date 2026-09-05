@@ -1,4 +1,5 @@
-import { Settings, PanelLeftOpen, Bug } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { Settings, PanelLeftOpen, Bug, Network } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
 const DISCORD_INVITE_URL = 'https://discord.gg/dskZax5JPh';
@@ -36,6 +37,15 @@ export default function SidebarCollapsed({
       </button>
 
       <div className="my-1 nav-divider w-6" />
+
+      <Link
+        to="/herdr"
+        className="group flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-accent/80"
+        aria-label={t('herdr.title')}
+        title={t('herdr.title')}
+      >
+        <Network className="h-4 w-4 text-muted-foreground transition-colors group-hover:text-foreground" />
+      </Link>
 
       {/* Settings */}
       <button

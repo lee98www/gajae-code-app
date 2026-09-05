@@ -221,5 +221,33 @@
       "commits": "Parcourir tous les commits ({{total}})",
       "branches": "Parcourir toutes les branches ({{total}})"
     }
+  },
+  "herdr": {
+    "title": "Sessions Herdr",
+    "eyebrow": "Herdr",
+    "description": "Découvrez les sessions nommées existantes, consultez leur sortie visible et envoyez explicitement une saisie limitée.",
+    "backToChats": "Retour aux discussions",
+    "sessions": "Sessions",
+    "panes": "Volets",
+    "chooseSession": "Choisissez une session.",
+    "noSessions": "Aucun socket Herdr trouvé.",
+    "visibleOutput": "Sortie visible",
+    "refreshing": "Actualisation…",
+    "notLoaded": "Non chargé",
+    "selectPane": "Sélectionnez un volet Herdr pour lire sa sortie visible.",
+    "outputCapped": "La sortie a été limitée par Gajae App.",
+    "inputLabel": "Saisie explicite",
+    "inputPlaceholder": "Une seule ligne ; Entrée dispose d’un bouton distinct.",
+    "sendText": "Envoyer le texte",
+    "sendEnter": "Envoyer + Entrée",
+    "enter": "Entrée",
+    "escape": "Échap",
+    "inputInvalid": "La saisie doit tenir sur une ligne, sans caractères de contrôle, et ne pas dépasser 16 Kio.",
+    "residualRisk": "Le jeton d’observation sert uniquement à une vérification locale préalable, pas à un CAS atomique. Le volet peut changer avant l’envoi. L’annulation est sans garantie et ne peut pas retirer une saisie envoyée ; l’acceptation ne confirme ni réception ni exécution.",
+    "selectionStale": "Après un changement ou un échec, sélectionnez à nouveau explicitement un volet actuellement observé.",
+    "accepted": "Accepté par Herdr ; réception et exécution non confirmées.",
+    "inputFailed": "Échec ou annulation de la saisie. Aucune mise en attente ni nouvelle tentative ; la réception peut être inconnue. Vérifiez la sortie et resélectionnez le volet.",
+    "readFailed": "Impossible de lire les données Herdr de manière sûre. Vérifiez la connexion et resélectionnez le volet après rétablissement.",
+    "status": { "available": "Disponible", "unreachable": "Injoignable", "unsupported": "Non pris en charge", "unknown": "Inconnu", "idle": "Inactif", "working": "En cours", "blocked": "Bloqué", "done": "Terminé" }
   }
 }

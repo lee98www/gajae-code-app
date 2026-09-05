@@ -104,5 +104,9 @@
     "sessionCount_one": "Bu projede {{count}} görüşme var.",
     "sessionCount_other": "Bu projede {{count}} görüşme var.",
     "deleteAllData": "Tüm verileri kalıcı olarak sil"
+  },
+  "herdr": {
+    "title": "Herdr",
+    "navigation": "Herdr gezinmesi"
   }
 }

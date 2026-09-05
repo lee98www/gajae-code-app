@@ -33,6 +33,8 @@ const RETAINED_SIDEBAR_KEYS = [
   'sessions.work',
   'sessions.noSessions',
   'sessions.loadingSessions',
+  'herdr.title',
+  'herdr.navigation',
   'tooltips.refresh',
   'tooltips.createProject',
   'tooltips.createSession',
@@ -76,6 +78,31 @@ function valueAt(source: unknown, keyPath: string): unknown {
   }
   return current;
 }
+
+test('Herdr copy has complete translated safety, action, status and navigation keys in every locale', () => {
+  const english = readJson(path.join(LOCALES_DIR, 'en', 'common.json'));
+  const leaves = (value: unknown, prefix = 'herdr'): string[] => (
+    value && typeof value === 'object'
+      ? Object.entries(value).flatMap(([key, child]) => leaves(child, `${prefix}.${key}`))
+      : [prefix]
+  );
+  const keys = leaves(valueAt(english, 'herdr'));
+  for (const locale of localeNames()) {
+    const common = readJson(path.join(LOCALES_DIR, locale, 'common.json'));
+    assert.deepEqual(leaves(valueAt(common, 'herdr')).sort(), [...keys].sort(), locale);
+    for (const key of keys) {
+      assert.equal(typeof valueAt(common, key), 'string', `${locale}:${key}`);
+      assert.ok(String(valueAt(common, key)).trim(), `${locale}:${key}`);
+    }
+    if (locale !== 'en') {
+      for (const key of ['title', 'description', 'inputInvalid', 'residualRisk', 'selectionStale', 'inputFailed', 'readFailed', 'accepted']) {
+        assert.notEqual(valueAt(common, `herdr.${key}`), valueAt(english, `herdr.${key}`), `${locale}:${key}`);
+      }
+      const sidebar = readJson(path.join(LOCALES_DIR, locale, 'sidebar.json'));
+      assert.notEqual(valueAt(sidebar, 'herdr.navigation'), 'Herdr navigation', locale);
+    }
+  }
+});
 
 // The sidebar's inline filter lives under `filter.*` and in SidebarContent; the
 // keys and code paths below belong to the removed mode-tab search and must not

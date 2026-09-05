@@ -84,6 +84,20 @@ export const api = {
       body: JSON.stringify(input),
     }),
   },
+  herdr: {
+    sessions: (options: RequestInit = {}) =>
+      authenticatedFetch('/api/herdr/sessions', options),
+    snapshot: (sessionName: string, options: RequestInit = {}) =>
+      authenticatedFetch(`/api/herdr/sessions/${encodeURIComponent(sessionName)}/snapshot`, options),
+    output: (sessionName: string, paneId: string, options: RequestInit = {}) =>
+      authenticatedFetch(`/api/herdr/sessions/${encodeURIComponent(sessionName)}/panes/${encodeURIComponent(paneId)}/output`, options),
+    input: (sessionName: string, paneId: string, input: JsonBody, options: RequestInit = {}) =>
+      authenticatedFetch(`/api/herdr/sessions/${encodeURIComponent(sessionName)}/panes/${encodeURIComponent(paneId)}/input`, {
+        ...options,
+        method: 'POST',
+        body: JSON.stringify(input),
+      }),
+  },
   archivedProjects: () => authenticatedFetch('/api/projects/archived'),
   // Read-only working-tree summary for the Workspace status tab: branch plus
   // the files git reports as changed. Never writes to the repository.

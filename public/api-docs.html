@@ -125,6 +125,7 @@
       <a href="#access">Access</a>
       <a href="#health">Health check</a>
       <a href="#open-file">Open file</a>
+      <a href="#herdr">Herdr</a>
       <a href="#errors">Errors</a>
     </nav>
 
@@ -181,6 +182,43 @@
             <pre>{
   "success": true
 }</pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="herdr">
+        <p class="eyebrow">Existing terminal sessions</p>
+        <h2>Herdr discovery, output, and explicit input</h2>
+        <p>Herdr endpoints expose only current-user sessions already admitted by the local server. Gajae Code App never starts, stops, repairs, renames, focuses, or migrates Herdr sessions, and it never turns a Herdr pane into an SDK chat.</p>
+        <div class="endpoint">
+          <div class="endpoint-title"><span class="verb">GET</span><span class="path">/api/herdr/sessions</span></div>
+          <div class="endpoint-body">
+            <p>Lists discovered default and named Herdr API sockets. Socket presence is discovery only; a snapshot proves reachability.</p>
+          </div>
+        </div>
+        <div class="endpoint">
+          <div class="endpoint-title"><span class="verb">GET</span><span class="path">/api/herdr/sessions/:sessionName/snapshot</span></div>
+          <div class="endpoint-body">
+            <p>Returns the authoritative Herdr workspace/tab/pane snapshot for one admitted session. The response includes opaque observation tokens for App-side stale-target checks; tokens are not Herdr credentials.</p>
+          </div>
+        </div>
+        <div class="endpoint">
+          <div class="endpoint-title"><span class="verb">GET</span><span class="path">/api/herdr/sessions/:sessionName/panes/:paneId/output</span></div>
+          <div class="endpoint-body">
+            <p>Reads bounded visible plain text from the selected pane. It is a viewport snapshot, not transcript history, and it avoids scrollback-harvesting reads that can move the operator's terminal.</p>
+          </div>
+        </div>
+        <div class="endpoint">
+          <div class="endpoint-title"><span class="verb">POST</span><span class="path">/api/herdr/sessions/:sessionName/panes/:paneId/input</span></div>
+          <div class="endpoint-body">
+            <p>Sends one explicit bounded input action after the server revalidates the observed pane. Supported actions are <code>text</code>, <code>text-enter</code>, <code>enter</code>, and <code>escape</code>. Text is one line, has no control characters, and is capped at 16 KiB.</p>
+            <pre>{
+  "action": "text-enter",
+  "text": "hello",
+  "terminalId": "term_...",
+  "observationToken": "opaque-token"
+}</pre>
+            <aside class="callout"><strong>Residual race.</strong> Herdr's public input request carries only <code>pane_id</code>, <code>text</code>, and <code>keys</code>. Gajae's token check is local preflight, not atomic compare-and-send. An acknowledgment means Herdr accepted bytes, not that the target TUI delivered or completed the task.</aside>
           </div>
         </div>
       </section>

@@ -221,5 +221,33 @@
       "commits": "Tüm commit'lere göz at ({{total}})",
       "branches": "Tüm dallara göz at ({{total}})"
     }
+  },
+  "herdr": {
+    "title": "Herdr oturumları",
+    "eyebrow": "Herdr",
+    "description": "Mevcut adlandırılmış oturumları keşfedin, görünür çıktıyı okuyun ve sınırlı girdiyi açık bir işlemle gönderin.",
+    "backToChats": "Sohbetlere dön",
+    "sessions": "Oturumlar",
+    "panes": "Paneller",
+    "chooseSession": "Bir oturum seçin.",
+    "noSessions": "Herdr soketi bulunamadı.",
+    "visibleOutput": "Görünür çıktı",
+    "refreshing": "Yenileniyor…",
+    "notLoaded": "Yüklenmedi",
+    "selectPane": "Görünür çıktısını okumak için bir Herdr paneli seçin.",
+    "outputCapped": "Çıktı Gajae App tarafından sınırlandı.",
+    "inputLabel": "Açık girdi işlemi",
+    "inputPlaceholder": "Yalnızca tek satır; Enter için ayrı düğme vardır.",
+    "sendText": "Metni gönder",
+    "sendEnter": "Gönder + Enter",
+    "enter": "Enter tuşu",
+    "escape": "Escape tuşu",
+    "inputInvalid": "Girdi tek satır olmalı, denetim karakteri içermemeli ve 16 KiB’ı aşmamalıdır.",
+    "residualRisk": "Gözlem belirteci yalnızca yerel ön kontroldür, atomik CAS değildir. Herdr gönderiminden önce panel değişebilir. İptal garanti edilmez ve gönderilmiş girdiyi geri alamaz; kabul, teslimatı veya yürütmeyi doğrulamaz.",
+    "selectionStale": "Değişiklik veya hata sonrasında şu anda gözlemlenen paneli açıkça yeniden seçin.",
+    "accepted": "Herdr kabul etti; teslimat ve yürütme doğrulanmadı.",
+    "inputFailed": "Girdi başarısız oldu veya iptal edildi. Kuyruğa alınmadı ve yeniden denenmedi; teslimat bilinmiyor olabilir. Çıktıyı inceleyip paneli yeniden seçin.",
+    "readFailed": "Herdr verileri güvenle okunamadı. Bağlantıyı kontrol edin ve düzeldikten sonra paneli yeniden seçin.",
+    "status": { "available": "Kullanılabilir", "unreachable": "Ulaşılamıyor", "unsupported": "Desteklenmiyor", "unknown": "Bilinmiyor", "idle": "Boşta", "working": "Çalışıyor", "blocked": "Engellendi", "done": "Tamamlandı" }
   }
 }

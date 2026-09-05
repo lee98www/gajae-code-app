@@ -104,5 +104,9 @@
     "sessionCount_one": "该项目中有{{count}}条对话。",
     "sessionCount_other": "该项目中共有{{count}}条对话。",
     "deleteAllData": "清空所有记录"
+  },
+  "herdr": {
+    "title": "Herdr",
+    "navigation": "Herdr 导航"
   }
 }

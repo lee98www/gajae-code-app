@@ -1,4 +1,6 @@
 import { useState } from 'react';
+import { Link } from 'react-router-dom';
+import { Network } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
 import { ScrollArea } from '../../../shared/view/ui';
@@ -118,6 +120,15 @@ export default function SidebarContent({
               t={t}
             />
           )}
+          <nav className="shrink-0 px-2 pb-2" aria-label={t('herdr.navigation')}>
+            <Link
+              to="/herdr"
+              className="group flex h-10 w-full items-center gap-3 rounded-lg px-2.5 text-left text-[0.9375rem] font-medium text-foreground outline-hidden transition-colors hover:bg-accent/70 focus-visible:ring-1 focus-visible:ring-ring"
+            >
+              <Network className="stroke-1.8 size-4.5 shrink-0 text-foreground" aria-hidden />
+              <span className="truncate">{t('herdr.title')}</span>
+            </Link>
+          </nav>
           {hasProjects && <SidebarFilterInput value={filter.query} onChange={filter.setQuery} inputRef={filter.inputRef} t={t} />}
         </>
       )}

@@ -221,5 +221,33 @@
       "commits": "Alle Commits durchsuchen ({{total}})",
       "branches": "Alle Branches durchsuchen ({{total}})"
     }
+  },
+  "herdr": {
+    "title": "Herdr-Sitzungen",
+    "eyebrow": "Herdr",
+    "description": "Vorhandene benannte Sitzungen entdecken, sichtbare Ausgabe lesen und begrenzte Eingaben ausdrücklich senden.",
+    "backToChats": "Zurück zu Chats",
+    "sessions": "Sitzungen",
+    "panes": "Terminalbereiche",
+    "chooseSession": "Wählen Sie eine Sitzung.",
+    "noSessions": "Keine Herdr-Sockets gefunden.",
+    "visibleOutput": "Sichtbare Ausgabe",
+    "refreshing": "Wird aktualisiert…",
+    "notLoaded": "Nicht geladen",
+    "selectPane": "Wählen Sie einen Herdr-Terminalbereich, um seine sichtbare Ausgabe zu lesen.",
+    "outputCapped": "Die Ausgabe wurde von Gajae App begrenzt.",
+    "inputLabel": "Ausdrückliche Eingabe",
+    "inputPlaceholder": "Nur einzeiliger Text; die Eingabetaste hat eine eigene Schaltfläche.",
+    "sendText": "Text senden",
+    "sendEnter": "Senden + Eingabetaste",
+    "enter": "Eingabetaste",
+    "escape": "Escape-Taste",
+    "inputInvalid": "Die Eingabe muss einzeilig, ohne Steuerzeichen und höchstens 16 KiB groß sein.",
+    "residualRisk": "Das Beobachtungstoken dient nur einer lokalen Vorabprüfung, nicht atomarem CAS. Der Bereich kann sich vor dem Versand ändern. Ein Abbruch erfolgt nach bestem Bemühen und macht versandte Eingaben nicht rückgängig; Annahme bestätigt weder Zustellung noch Ausführung.",
+    "selectionStale": "Nach einer Änderung oder einem Fehler müssen Sie einen aktuell beobachteten Bereich ausdrücklich erneut auswählen.",
+    "accepted": "Von Herdr angenommen; Zustellung und Ausführung sind nicht bestätigt.",
+    "inputFailed": "Eingabe fehlgeschlagen oder abgebrochen. Sie wurde weder eingereiht noch erneut gesendet; die Zustellung ist möglicherweise unbekannt. Prüfen Sie die Ausgabe und wählen Sie den Bereich erneut.",
+    "readFailed": "Herdr-Daten konnten nicht sicher gelesen werden. Prüfen Sie die Verbindung und wählen Sie den Bereich nach der Wiederherstellung erneut.",
+    "status": { "available": "Verfügbar", "unreachable": "Nicht erreichbar", "unsupported": "Nicht unterstützt", "unknown": "Unbekannt", "idle": "Inaktiv", "working": "In Arbeit", "blocked": "Blockiert", "done": "Fertig" }
   }
 }

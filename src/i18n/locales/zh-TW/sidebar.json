@@ -104,5 +104,9 @@
     "sessionCount_one": "此專案中有 {{count}} 個對話。",
     "sessionCount_other": "此專案中共有 {{count}} 個對話。",
     "deleteAllData": "永久刪除所有資料"
+  },
+  "herdr": {
+    "title": "Herdr",
+    "navigation": "Herdr 導覽"
   }
 }
