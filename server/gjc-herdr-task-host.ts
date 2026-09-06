@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { lstatSync, realpathSync } from 'node:fs';
 import fs from 'node:fs/promises';
@@ -1111,19 +1111,26 @@ export function createManagedGjcSdkSessionFactory(bootstrap: HerdrTaskHostBootst
       // session object. Signal dispatch is not exit: the claim is fenced only
       // after the child's exit is observed, or the escalation deadline passes
       // with the child still alive, which is reported as such.
-      if (child.exitCode === null && child.signalCode === null) {
-        child.kill();
-        const exited = await new Promise<boolean>(resolve => {
-          const escalate = setTimeout(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); }, 5_000);
-          const deadline = setTimeout(() => resolve(false), 10_000);
-          escalate.unref(); deadline.unref();
-          child.once('exit', () => { clearTimeout(escalate); clearTimeout(deadline); resolve(true); });
-        });
-        if (!exited) throw new Error('Managed child did not exit after escalation.', { cause: error });
-      }
+      if (!await confirmChildExit(child)) throw new Error('Managed child did not exit after escalation.', { cause: error });
       throw error;
     }
   };
+}
+
+/**
+ * Terminates an owned child and resolves only when its exit has actually been
+ * observed: SIGTERM first, SIGKILL after the escalation delay, false when the
+ * process is still alive at the deadline. A child that already exited resolves
+ * immediately. Exported for focused regression coverage of the escalation path.
+ */
+export function confirmChildExit(child: Pick<ChildProcess, 'exitCode' | 'signalCode' | 'kill' | 'once'>, delays = { escalateMs: 5_000, deadlineMs: 10_000 }): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  child.kill();
+  return new Promise<boolean>(resolve => {
+    const escalate = setTimeout(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); }, delays.escalateMs);
+    const deadline = setTimeout(() => resolve(false), delays.deadlineMs);
+    child.once('exit', () => { clearTimeout(escalate); clearTimeout(deadline); resolve(true); });
+  });
 }
 
 /** Stored credentials are resolved privately by the SDK, never inherited from a terminal. */

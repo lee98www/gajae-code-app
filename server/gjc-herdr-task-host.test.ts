@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { PassThrough } from 'node:stream';
 import net from 'node:net';
@@ -15,7 +16,7 @@ import { HERDR_MANAGED_PROTOCOL_VERSION, type HerdrManagedCommand, type HerdrMan
 import { type HerdrManagedBridgeRequest } from '../shared/herdr-managed-bridge.js';
 import { projectManagedState } from '../shared/herdr-managed-chat.js';
 
-import { commandHash, HerdrTaskHost, initializeManagedChildSession, runHerdrTaskHostStdio, type ManagedSdkSessionFactory } from './gjc-herdr-task-host.js';
+import { commandHash, confirmChildExit, HerdrTaskHost, initializeManagedChildSession, runHerdrTaskHostStdio, type ManagedSdkSessionFactory } from './gjc-herdr-task-host.js';
 import { GjcHerdrAutomationBroker } from './gjc-herdr-automation-broker.js';
 import { parseConsoleLine, sanitizeConsoleText } from './gjc-herdr-task-console.js';
 import { ManagedBridgeLedger } from './modules/automation/managed-bridge-ledger.js';
@@ -426,6 +427,38 @@ test('task-host stdio launcher uses protected bootstrap and fixture factory with
     assert.equal(herdrManagedDb.eventsSince('managed-session', 'owner-gen-1', 0).some((event) => event.kind === 'sdk.event'), false);
     await host.close();
   });
+});
+
+test('a failed factory confirms the owned child exit before fencing, escalating to SIGKILL and reporting a survivor', async () => {
+  const fake = (behaviour: 'term' | 'kill-only' | 'immortal' | 'already-exited') => {
+    const emitter = new EventEmitter();
+    const child: Parameters<typeof confirmChildExit>[0] & { signals: string[]; signalCode: NodeJS.Signals | null } = Object.assign(emitter, {
+      exitCode: behaviour === 'already-exited' ? 0 : null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      signals: [] as string[],
+      kill(signal: NodeJS.Signals | number = 'SIGTERM') {
+        child.signals.push(String(signal));
+        const dies = behaviour === 'term' || (behaviour === 'kill-only' && signal === 'SIGKILL');
+        if (dies) setTimeout(() => { child.signalCode = signal as NodeJS.Signals; emitter.emit('exit', null, signal); }, 5);
+        return true;
+      },
+    }) as never;
+    return child;
+  };
+  const delays = { escalateMs: 30, deadlineMs: 120 };
+  const term = fake('term');
+  assert.equal(await confirmChildExit(term, delays), true);
+  assert.deepEqual(term.signals, ['SIGTERM']);
+  const stubborn = fake('kill-only');
+  assert.equal(await confirmChildExit(stubborn, delays), true);
+  assert.deepEqual(stubborn.signals, ['SIGTERM', 'SIGKILL']);
+  assert.equal(stubborn.signalCode, 'SIGKILL');
+  const immortal = fake('immortal');
+  assert.equal(await confirmChildExit(immortal, delays), false, 'signal dispatch alone is never reported as exit');
+  assert.deepEqual(immortal.signals, ['SIGTERM', 'SIGKILL']);
+  const gone = fake('already-exited');
+  assert.equal(await confirmChildExit(gone, delays), true);
+  assert.deepEqual(gone.signals, []);
 });
 
 test('console status exposes safe session, active-turn, queue and request identities', async () => {

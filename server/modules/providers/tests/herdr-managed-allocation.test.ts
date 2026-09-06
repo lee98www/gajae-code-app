@@ -77,6 +77,44 @@ test('force removal fences live and uncertain owners before native unlink; archi
   });
 });
 
+test('project force-delete cannot overtake a live or uncertain managed owner', async () => {
+  await isolated(async (directory) => {
+    const { deleteOrArchiveProject } = await import('@/modules/projects/index.js');
+    const { projectsDb } = await import('@/modules/database/index.js');
+    const db = getConnection();
+    const project = projectsDb.createProjectPath(directory, 'Owned project').project;
+    assert.ok(project);
+    const projectId = project.project_id;
+    const allocated = sessionsService.createAppSession('gjc', directory);
+    const transcript = path.join(directory, 'native.jsonl');
+    await writeFile(transcript, 'native history');
+    db.prepare('UPDATE sessions SET jsonl_path = ? WHERE session_id = ?').run(transcript, allocated.sessionId);
+    db.prepare(`INSERT INTO herdr_managed_bindings (app_session_id, owner_generation, herdr_instance_id, lifecycle) VALUES (?, 'generation', 'default', 'reserved')`).run(allocated.sessionId);
+    db.prepare(`INSERT INTO herdr_managed_provisions (app_session_id, owner_generation, claim_nonce, endpoint_json, phase, private_directory) VALUES (?, 'generation', 'nonce', '{}', 'ready', ?)`).run(allocated.sessionId, directory);
+    for (const lifecycle of ['reserved', 'claiming', 'ready', 'running', 'idle', 'unknown', 'interrupted']) {
+      db.prepare('UPDATE herdr_managed_bindings SET lifecycle = ? WHERE app_session_id = ?').run(lifecycle, allocated.sessionId);
+      await assert.rejects(deleteOrArchiveProject(projectId, true), { code: 'MANAGED_SESSION_NOT_CLOSED', statusCode: 409 });
+      assert.equal(await readFile(transcript, 'utf8'), 'native history');
+      assert.ok(sessionsDb.getSessionById(allocated.sessionId));
+      assert.ok(db.prepare('SELECT 1 FROM herdr_managed_bindings WHERE app_session_id = ?').get(allocated.sessionId), 'the binding survives the rejected cascade');
+      assert.ok(projectsDb.getProjectById(projectId));
+    }
+    // Archiving the project is always safe and stops nothing.
+    await deleteOrArchiveProject(projectId, false);
+    assert.equal(Number(projectsDb.getProjectById(projectId)?.isArchived), 1);
+    // An uncertain provision without a closed binding of its own generation still fences.
+    db.prepare(`UPDATE herdr_managed_bindings SET lifecycle = 'closed' WHERE app_session_id = ?`).run(allocated.sessionId);
+    db.prepare(`UPDATE herdr_managed_provisions SET owner_generation = 'other-generation' WHERE app_session_id = ?`).run(allocated.sessionId);
+    await assert.rejects(deleteOrArchiveProject(projectId, true), { code: 'MANAGED_SESSION_NOT_CLOSED' });
+    assert.equal(await readFile(transcript, 'utf8'), 'native history');
+    db.prepare(`UPDATE herdr_managed_provisions SET owner_generation = 'generation' WHERE app_session_id = ?`).run(allocated.sessionId);
+    await deleteOrArchiveProject(projectId, true);
+    await assert.rejects(readFile(transcript), { code: 'ENOENT' });
+    assert.equal(sessionsDb.getSessionById(allocated.sessionId), null);
+    assert.equal(projectsDb.getProjectById(projectId) ?? null, null);
+  });
+});
+
 test('nonmanaged native history removal is unchanged', async () => {
   await isolated(async (directory) => {
     for (const provider of ['gjc', 'claude']) {

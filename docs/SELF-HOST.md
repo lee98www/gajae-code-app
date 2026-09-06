@@ -172,7 +172,9 @@ pending permission requests and commits winning Always grants, including while
 the App is absent.
 Archiving hides a conversation without stopping its owner. Permanent deletion
 requires confirmed native closure and owned metadata cleanup; an active or
-uncertain owner cannot be deleted or silently adopted. Native history, rich event
+uncertain owner cannot be deleted or silently adopted. A project force-delete
+is fenced the same way for every session it contains, before any transcript is
+unlinked. Native history, rich event
 replay, and bounded paginated snapshots restore chat; terminal scraping does
 not. Private bootstrap, attach tokens, and automation target paths stay
 server-side, outside browser payloads and diagnostic logs. Tokens and prompt

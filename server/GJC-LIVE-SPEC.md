@@ -27,8 +27,9 @@ App process ownership of the task-host lifetime. Its quit or browser
 disconnect detaches clients. Ordinary coding, files, commands, asks, and
 permissions continue with the same native callbacks through Herdr/Collie.
 Archiving hides the App conversation without stopping its owner. Permanent
-deletion remains fenced until native-writer closure and owned metadata cleanup
-are confirmed; UI disconnection is not a lifecycle command.
+deletion, including project force-delete, remains fenced until native-writer
+closure and owned metadata cleanup are confirmed; UI disconnection is not a
+lifecycle command.
 
 Herdr publication is host-owned: `pane.report_agent` carries `agent: gjc` and
 idle/working/blocked/unknown status; `pane.report_metadata` carries the
