@@ -440,15 +440,16 @@ export class HerdrTaskHost {
    * executing command from being stranded when the subsequent writer fence
    * correctly rejects ordinary SDK events.
    */
-  #recordUnknownTurn(parsed: HerdrManagedCommand): HerdrManagedCommandReceipt {
+  #recordUnknownTurn(parsed: HerdrManagedCommand, cause?: unknown): HerdrManagedCommandReceipt {
     let receipt: HerdrManagedCommandReceipt | undefined;
+    const reason = cause instanceof Error ? this.#redact(cause.message.replace(/[\u0000-\u001f\u007f]/g, ' ').trim()).slice(0, 300) : '';
     getConnection().transaction(() => {
       receipt = herdrManagedDb.transitionCommand({
         appSessionId: parsed.appSessionId,
         ownerGeneration: parsed.ownerGeneration,
         actionId: parsed.actionId,
         state: 'unknown',
-        message: 'Prompt outcome is unknown.',
+        message: reason ? `Prompt outcome is unknown. ${reason}` : 'Prompt outcome is unknown.',
       });
       const state = herdrManagedDb.snapshot(parsed.appSessionId, parsed.ownerGeneration);
       if (state.activeTurnId === parsed.actionId) {
@@ -497,13 +498,22 @@ export class HerdrTaskHost {
         herdrManagedDb.finishTurn(parsed.appSessionId, parsed.ownerGeneration, parsed.actionId, { aborted: true });
         return settled;
       }
-      this.#recordUnknownTurn(parsed);
+      this.#recordUnknownTurn(parsed, error);
       throw error;
     } finally {
       this.#broadcast();
       const next = this.#drain();
       if (next) void next.catch(() => {});
     }
+  }
+
+  #secrets(): string[] {
+    return [this.#bootstrap.attachSecret, ...[...this.#operationCapabilities.values()].map(capability => capability.transportToken)]
+      .filter((secret): secret is string => typeof secret === 'string' && secret.length > 0);
+  }
+
+  #redact(text: string, secrets = this.#secrets()): string {
+    return secrets.reduce((value, secret) => value.split(secret).join('[redacted]'), text);
   }
 
   #journalEvent(frame: ManagedChildEvent): void {
@@ -539,9 +549,8 @@ export class HerdrTaskHost {
       const context = isObject(event.context) ? event.context : {};
       event = { kind: event.kind, toolName: event.toolName, requestId: event.requestId, input: {}, context: { source: context.source, options: context.options } };
     }
-    const secrets = [this.#bootstrap.attachSecret, ...[...this.#operationCapabilities.values()].map(capability => capability.transportToken)]
-      .filter((secret): secret is string => typeof secret === 'string' && secret.length > 0);
-    if (secrets.length) event = JSON.parse(JSON.stringify(event, (_key, value: unknown) => typeof value === 'string' ? secrets.reduce((text, secret) => text.split(secret).join('[redacted]'), value) : value)) as Record<string, unknown>;
+    const secrets = this.#secrets();
+    if (secrets.length) event = JSON.parse(JSON.stringify(event, (_key, value: unknown) => typeof value === 'string' ? this.#redact(value, secrets) : value)) as Record<string, unknown>;
     if (event.kind === 'session' && typeof event.providerSessionId === 'string') this.#providerSessionId = event.providerSessionId;
     const context = isObject(event.context) ? event.context : {};
     const requestKind = context.source === 'sdk-permission' ? 'permission' : event.toolName === 'ask' ? 'ask' : null;
@@ -1159,7 +1168,8 @@ export async function initializeManagedChildSession(child: ChildProcessWithoutNu
     return {
       providerSessionId: ready.providerSessionId,
       async prompt(message, actionId, turnOptions) {
-        if (!await call({ ...identity(commandHash(['action', actionId]), actionId), type: 'prompt', actionId, text: message, ...(turnOptions ? { turnOptions } : {}) })) throw new Error('Managed child prompt failed.');
+        const response = await transport.request({ ...identity(commandHash(['action', actionId]), actionId), type: 'prompt', actionId, text: message, ...(turnOptions ? { turnOptions } : {}) });
+        if (!response.ok) throw new Error(response.detail ? `Managed child prompt failed: ${response.detail}` : 'Managed child prompt failed.');
       },
       steer: (text, actionId, runId) => call({ ...identity(commandHash(['action', actionId]), runId), type: 'steer', actionId, text }),
       abort: (actionId, runId) => call({ ...identity(commandHash(['action', actionId]), runId), type: 'abort', actionId }),
@@ -1225,6 +1235,13 @@ export async function runHerdrTaskHostStdio(options: { bootstrap: HerdrTaskHostB
     } else if (event.kind === 'sdk.event' && isObject(event.payload) && event.payload.kind === 'stream_end' && typeof event.payload.content === 'string') {
       const display = renderEvent({ kind: 'conversation', text: event.payload.content }, secrets);
       if (display) writer.write(display);
+    } else if (event.kind === 'sdk.event' && isObject(event.payload) && event.payload.kind === 'error' && typeof event.payload.content === 'string') {
+      const display = renderEvent({ kind: 'error', text: event.payload.content }, secrets);
+      if (display) writer.write(display);
+    } else if (event.kind === 'managed.command' && isObject(event.payload) && event.payload.state === 'unknown' && typeof event.payload.actionId === 'string' && typeof event.payload.seq === 'number') {
+      // An uncertain outcome is a critical fact for whoever holds the terminal,
+      // whichever client started the turn.
+      writer.write(renderConsoleReceipt(event.payload.actionId, 'unknown', event.payload.seq), 'critical');
     }
   });
   function onData(chunk: Buffer | string) {

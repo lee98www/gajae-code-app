@@ -485,6 +485,32 @@ test('console status exposes safe session, active-turn, queue and request identi
   });
 });
 
+test('an App-started turn that ends unknown is announced on the console with its reason', async () => {
+  await withManagedDatabase(async tmp => {
+    herdrManagedDb.reserve({ appSessionId: 'managed-session', projectPath: '/tmp/project', herdrInstanceId: 'herdr-main', ownerGeneration: 'owner-gen-1' });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    output.setEncoding('utf8');
+    let stdout = '';
+    output.on('data', chunk => { stdout += String(chunk); });
+    const host = await runHerdrTaskHostStdio({
+      bootstrap: { appSessionId: 'managed-session', ownerGeneration: 'owner-gen-1', herdrInstanceId: 'herdr-main', projectPath: '/tmp/project', sessionRoot: tmp },
+      input,
+      output,
+      createSession: () => ({ providerSessionId: 'provider-session-1', async prompt() { throw new Error('Managed child prompt failed: provider quota exhausted'); } }),
+    });
+    const command = promptCommand('app-turn', 'from the App');
+    await assert.rejects(host.dispatch(command), /provider quota exhausted/);
+    for (let i = 0; i < 100 && !stdout.includes('ACK app-turn unknown'); i++) await new Promise(resolve => setTimeout(resolve, 5));
+    const receipt = host.snapshot().commands['app-turn'];
+    assert.equal(receipt.state, 'unknown');
+    assert.equal(receipt.message, 'Prompt outcome is unknown. Managed child prompt failed: provider quota exhausted');
+    assert.match(stdout, new RegExp(`ACK app-turn unknown ${receipt.seq}`));
+    assert.equal(host.snapshot().lifecycle, 'unknown');
+    await host.close();
+  });
+});
+
 test('a terminal user controls an App-started turn from rendered console identity alone', async () => {
   await withManagedDatabase(async tmp => {
     herdrManagedDb.reserve({ appSessionId: 'managed-session', projectPath: '/tmp/project', herdrInstanceId: 'herdr-main', ownerGeneration: 'owner-gen-1' });

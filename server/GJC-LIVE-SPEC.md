@@ -77,6 +77,14 @@ claim only after the child's exit is observed. Appending owned placement into
 an already-focused owned workspace is valid; focus is verified by comparing the
 focused identities before and after the append.
 
+The owner's configured model is durable. An App turn carrying the ambient
+`default` model does not switch an owner that already reports a configured
+model; only an explicit per-session pin or an explicit model choice changes it.
+A prompt the SDK rejects outright settles `unknown` with the SDK's bounded,
+secret-redacted reason in the receipt message, and the owned console prints the
+`ACK ACTION unknown SEQ` record plus an `ERROR` line for whichever client
+started the turn.
+
 App-dependent automation waits on the original SDK callback while disconnected.
 Renewal binds the actual browser/application target and requires explicit
 resume approval. Only authoritative completed receipts or fenced

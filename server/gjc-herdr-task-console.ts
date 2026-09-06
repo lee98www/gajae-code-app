@@ -263,8 +263,9 @@ export function renderRequest(request: ConsoleRequestView, secrets: readonly str
 export type ConsoleEventView = { kind: string; text?: string; secret?: boolean };
 /** Host projects approved conversational content explicitly; sdk.event/raw payloads are not accepted. */
 export function renderEvent(event: ConsoleEventView, secrets: readonly string[] = []): string | null {
-  if (!['conversation', 'tool_summary', 'question'].includes(event.kind)) return null;
-  return event.secret ? '[redacted]' : sanitizeConsoleText(event.text ?? '', 8192, secrets);
+  if (!['conversation', 'tool_summary', 'question', 'error'].includes(event.kind)) return null;
+  const text = event.secret ? '[redacted]' : sanitizeConsoleText(event.text ?? '', 8192, secrets);
+  return event.kind === 'error' ? `ERROR ${text}` : text;
 }
 
 /**

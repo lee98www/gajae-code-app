@@ -7,6 +7,7 @@ import { herdrManagedActionIdSchema } from '../../../../shared/herdr-managed-pro
 import type { HerdrManagedState } from '../../../../shared/herdr-managed-state.js';
 import { herdrManagedProvisionDb, herdrManagedDb, getConnection } from '../../database/index.js';
 import { appendImagesInputTag, filterImagesToUploadStore } from '../../../shared/image-attachments.js';
+import { readProviderSessionActiveModelChange } from '../../../shared/utils.js';
 import { automationService } from '../../automation/index.js';
 
 import type { HerdrManagedAttachClient } from './herdr-managed-client.js';
@@ -24,6 +25,8 @@ export type HerdrManagedChatOptions = {
   workspaces?: Pick<HerdrManagedWorkspacesService, 'isManaged' | 'ensure'> & { attach(id: string): Promise<Client> };
   db?: Pick<typeof herdrManagedProvisionDb, 'get' | 'projectState'>;
   automationTransport?: () => Promise<HerdrManagedBridgeTransport | null>;
+  /** Explicit per-session model choice recorded by the App; absent means ambient default. */
+  pinnedModel?: (sessionId: string) => Promise<{ changed: boolean; model: string | null }>;
 };
 const object = (value: unknown): Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const validActionId = (value: unknown): value is string => herdrManagedActionIdSchema.safeParse(value).success;
@@ -33,6 +36,7 @@ export class HerdrManagedChatService {
   readonly #workspaces;
   readonly #db;
   readonly #capability;
+  readonly #pinned;
   readonly #bindings = new Map<string, Binding>();
   readonly #attaching = new Map<string, Promise<Binding>>();
   readonly #detached = new WeakSet<ManagedChatConnection>();
@@ -41,6 +45,7 @@ export class HerdrManagedChatService {
   constructor(options: HerdrManagedChatOptions = {}) {
     this.#workspaces = options.workspaces ?? getProductionHerdrManagedWorkspacesService();
     this.#db = options.db ?? herdrManagedProvisionDb;
+    this.#pinned = options.pinnedModel ?? (async (sessionId: string) => readProviderSessionActiveModelChange('gjc', sessionId));
     this.#capability = options.automationTransport ?? (async () => {
       const transport = automationService.managedBridgeCapability();
       return transport ? { ownerConnectionId: randomUUID(), bridgeInstanceId: transport.bridgeInstanceId, transportLocator: transport.socketPath, transportToken: transport.token } : null;
@@ -237,13 +242,27 @@ export class HerdrManagedChatService {
       const subscribed = await this.subscribe(input.sessionId, connection);
       if (!subscribed.ok) return subscribed;
       const state = this.#bindings.get(input.sessionId)?.client.state;
-      const modelId = trusted.modelId ?? trusted.model;
+      let modelId = trusted.modelId ?? trusted.model;
       const profile = trusted.modelProfile ?? (modelId?.startsWith('profile:') ? modelId.slice(8) : undefined);
+      // The owner's configured model is durable; a reopened App only carries its
+      // ambient default. That default may not silently switch an existing
+      // conversation's model. An explicit per-session choice is a recorded pin.
+      const configured = state?.configuration && typeof state.configuration.modelId === 'string' ? state.configuration.modelId : null;
+      if (modelId === 'default' && !profile && configured) {
+        const pinned = await this.#pinnedModel(input.sessionId);
+        if (pinned !== 'default') modelId = undefined;
+      }
       const turnOptions = { ...(modelId && !profile ? { modelId } : {}), ...(profile ? { modelProfile: profile } : {}), ...(trusted.effort ? { effort: trusted.effort } : {}) };
       const prior = state ? herdrManagedDb.getCommand(input.sessionId, state.identity.ownerGeneration, input.actionId) : null;
       return await this.#command(input.sessionId, input.actionId, prior?.kind === 'prompt' || prior?.kind === 'followup' ? prior.kind : state?.activeTurnId || state?.queue.entries.length ? 'followup' : 'prompt',
         { text: appendImagesInputTag(input.content, images), displayText: input.content, images, turnOptions });
     } catch { return this.#unavailable(input.sessionId, connection); }
+  }
+  async #pinnedModel(sessionId: string): Promise<string | null> {
+    try {
+      const pin = await this.#pinned(sessionId);
+      return pin.changed && pin.model ? pin.model : null;
+    } catch { return null; }
   }
   async #command(id: string, actionId: string, kind: HerdrManagedCommand['kind'], payload: unknown): Promise<ManagedChatResult> {
     if (!validActionId(actionId)) return { ok: false, error: 'Managed command requires a stable actionId.' };

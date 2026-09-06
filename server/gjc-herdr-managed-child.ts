@@ -176,11 +176,15 @@ export async function runManagedChild(options: RunManagedChildOptions = {}): Pro
       lastActionId = frame.actionId; idleEvents = 0;
       promptIdentities.set(`${activePrompt.requestId}\u0000${activePrompt.runId}`, activePrompt);
       owner.setAutomationTurn(frame.actionId, activePrompt);
-      let ok = true;
+      let failure: string | undefined;
       try {
-        try { await owner.prompt(frame.text, frame.turnOptions); } catch { ok = false; }
+        try { await owner.prompt(frame.text, frame.turnOptions); } catch (error) {
+          // The reason travels as bounded diagnostics; the host still treats the
+          // turn as unknown because the SDK gave no authoritative outcome.
+          failure = String(error instanceof Error ? error.message : error).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 300) || 'operation failed';
+        }
         await flushed();
-        return ok ? { ok: true } : { ok: false, error: 'operation_failed' };
+        return failure === undefined ? { ok: true } : { ok: false, error: 'operation_failed', detail: failure };
       } finally { activePrompt = undefined; }
     }
     if (frame.type === 'automation-control') return { ok: await owner.automationControl(frame.control) };

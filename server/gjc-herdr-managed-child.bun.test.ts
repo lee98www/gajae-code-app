@@ -37,6 +37,7 @@ const createSessionFactory = async (input) => {
   let ui;
   let turns = 0;
   let steers = 0;
+  let thrown = 0;
   let resolveAbort;
   let permissionMode = 'allow';
   let permissionProvider;
@@ -60,9 +61,10 @@ const createSessionFactory = async (input) => {
         return;
       }
       assert.equal(this.isStreaming, false);
+      if (text === 'throw') { thrown += 1; throw new Error('provider rejected the turn: quota exhausted'); }
       this.isStreaming = true;
       turns += 1;
-      assert.equal(permissionRegistrations, turns + 1, 'permission cache resets at every retained turn boundary');
+      assert.equal(permissionRegistrations, turns + thrown + 1, 'permission cache resets at every retained turn boundary');
       assert.equal(permissionMode, 'prompt', 'managed gate is mandatory without config.permissions');
       assert.equal(typeof permissionProvider, 'function');
       if (text === 'permissions') {
@@ -300,6 +302,33 @@ test('managed Always remains host-owned and a later changed policy is consulted 
     h.ack(terminal);
     await h.response('permissions');
     h.child.stdin.end();
+    assert.equal(await h.exited, 0);
+  } finally { await h.cleanup(); }
+});
+
+test('a prompt the SDK rejects outright reports operation_failed with the bounded reason', { timeout: 20_000 }, async () => {
+  const h = await harness();
+  try {
+    await h.init();
+    h.send({ type: 'prompt', runId: 'thrown', requestId: 'thrown', actionId: 'thrown', text: 'throw' });
+    const terminal = await h.event('thrown', 'complete');
+    assert.equal(terminal.event.exitCode, 1);
+    assert.equal((await h.event('thrown', 'error')).event.content, 'GJC run failed.');
+    h.ack(terminal);
+    const response = await h.response('thrown');
+    assert.equal(response.ok, false);
+    assert.equal(response.error, 'operation_failed');
+    assert.match(String(response.detail), /provider rejected the turn: quota exhausted/);
+    assert.ok(String(response.detail).length <= 300);
+    // The child is still usable afterwards: no turn is stuck active.
+    h.send({ type: 'prompt', runId: 'after', requestId: 'after', actionId: 'after', text: 'success' });
+    const ask = await h.event('after', 'permission_request');
+    h.send({ type: 'approval', runId: 'after', requestId: 'answer:after', actionId: 'answer:after', askId: ask.event.requestId, decision: { allow: true, message: 'yes' } });
+    assert.equal((await h.response('answer:after')).ok, true);
+    h.ack(await h.event('after', 'complete'));
+    assert.equal((await h.response('after')).ok, true);
+    h.send({ type: 'close', requestId: 'close', actionId: 'close' });
+    assert.equal((await h.response('close')).ok, true);
     assert.equal(await h.exited, 0);
   } finally { await h.cleanup(); }
 });

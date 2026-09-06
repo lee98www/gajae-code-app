@@ -147,11 +147,12 @@ test('real attach projects mapping before send, reuses owner, orders two viewers
     await new Promise<void>(resolve => server!.listen(socketPath, resolve));
     client = new HerdrManagedAttachClient({ socketPath, ...identity, attachSecret: 'x'.repeat(32) });
     await client.connect(); await client.recover();
+    let pin: { changed: boolean; model: string | null } = { changed: false, model: null };
     service = new HerdrManagedChatService({ workspaces: {
       isManaged: id => id === 'app',
       ensure: async () => { order.push('ensure'); db.projectReady('app', identity.ownerGeneration, 'native'); return { status: 'ready', ...identity, providerSessionId: 'native', placement }; },
       attach: async () => { attaches++; return client!; },
-    } });
+    }, pinnedModel: async () => pin });
     const first = viewer(); const second = viewer();
     for (const actionId of [undefined, '', 'invalid action', 'a'.repeat(97)]) {
       await service.handle(first.connection, { type: 'chat.send', sessionId: 'app', actionId, content: 'invalid' });
@@ -170,6 +171,22 @@ test('real attach projects mapping before send, reuses owner, orders two viewers
     assert.equal(attaches, 1);
     assert.equal(snapshots, 1, 'healthy commands and viewers reuse the live state');
     assert.deepEqual((commands.at(-1)!.payload as { turnOptions: unknown }).turnOptions, { modelId: 'provider/model', effort: 'high' });
+    // A reopened App only knows its ambient default. Once the owner has a
+    // configured model, that default must not switch it; an explicit pin may.
+    const turnOptionsOf = () => (commands.at(-1)!.payload as { turnOptions: unknown }).turnOptions;
+    assert.equal((await service.send({ sessionId: 'app', content: 'ambient before configuration', actionId: 'ambient-0', options: { model: 'default', effort: 'low' } }, first.connection)).ok, true);
+    assert.deepEqual(turnOptionsOf(), { modelId: 'default', effort: 'low' }, 'without an owner configuration the default is the only choice');
+    herdrManagedDb.appendEvent({ ...identity, kind: 'managed.session', payload: { configuration: { modelId: 'gpt-owner', thinkingLevel: 'low' } } });
+    await client.recover();
+    assert.equal(client.state?.configuration?.modelId, 'gpt-owner');
+    assert.equal((await service.send({ sessionId: 'app', content: 'ambient after reopen', actionId: 'ambient-1', options: { model: 'default', effort: 'low' } }, first.connection)).ok, true);
+    assert.deepEqual(turnOptionsOf(), { effort: 'low' }, 'the ambient default keeps the owner model');
+    assert.equal((await service.send({ sessionId: 'app', content: 'explicit switch', actionId: 'explicit-1', options: { model: 'provider/other', effort: 'low' } }, first.connection)).ok, true);
+    assert.deepEqual(turnOptionsOf(), { modelId: 'provider/other', effort: 'low' });
+    pin = { changed: true, model: 'default' };
+    assert.equal((await service.send({ sessionId: 'app', content: 'pinned default', actionId: 'pinned-default', options: { model: 'default' } }, first.connection)).ok, true);
+    assert.deepEqual(turnOptionsOf(), { modelId: 'default' }, 'an explicit per-session pin to the default is honoured');
+    pin = { changed: false, model: null };
     assert.match(record.claimNonce, /^[a-f0-9]{64}$/);
     db.assertReadyProjection('app', identity.ownerGeneration);
     const event = herdrManagedDb.appendEvent({ ...identity, kind: 'sdk.event', payload: { kind: 'text', role: 'user', content: 'console turn' } }) as HerdrManagedEvent;

@@ -353,7 +353,7 @@ test('a reopened App recovers an owner fenced unknown read-only, without promoti
         host = new HerdrTaskHost({
           bootstrap,
           launchEnvironment: { HERDR_WORKSPACE_ID: 'w1', HERDR_TAB_ID: 'w1:t1', HERDR_PANE_ID: 'w1:p1' },
-          createSession: () => ({ providerSessionId: 'actual-provider', async prompt() { prompts++; throw new Error('private child failed mid-turn'); }, async dispose() {} }),
+          createSession: () => ({ providerSessionId: 'actual-provider', async prompt() { prompts++; throw new Error(`private child failed mid-turn (token ${bootstrap.attachSecret})`); }, async dispose() {} }),
         });
         await host.initialize(); await host.startPrivateAttachServer();
         return { workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' };
@@ -389,6 +389,7 @@ test('a reopened App recovers an owner fenced unknown read-only, without promoti
     const client = await second.attach('unknown-owner');
     assert.equal(client.state?.lifecycle, 'unknown');
     assert.equal(client.state?.commands['turn-1']?.state, 'unknown');
+    assert.equal(client.state?.commands['turn-1']?.message, 'Prompt outcome is unknown. private child failed mid-turn (token [redacted])', 'the reason is durable and secret-free');
     assert.equal(client.state?.identity.ownerGeneration, generation);
     assert.equal(client.state?.providerSessionId, 'actual-provider');
     assert.equal(herdrManagedDb.get('unknown-owner', generation)?.lifecycle, 'unknown', 'recovery never promotes the fenced lifecycle');

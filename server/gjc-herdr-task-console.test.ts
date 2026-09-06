@@ -96,6 +96,7 @@ test('allowlist rendering never serializes request schema, answers or raw frames
   assert.equal(renderEvent({ kind: 'sdk.event', text: 'raw frame' }), null);
   assert.equal(renderEvent({ kind: 'conversation', text: 'known secret', secret: true }), '[redacted]');
   assert.equal(renderEvent({ kind: 'conversation', text: '한국어 token' }, ['token']), '한국어 [redacted]');
+  assert.equal(renderEvent({ kind: 'error', text: 'GJC run failed. token' }, ['token']), 'ERROR GJC run failed. [redacted]');
   assert.equal(renderReceipt({ actionId: 'a', state: '\x1b[2J', seq: 1 }), 'ACK a unknown 1');
 });
 

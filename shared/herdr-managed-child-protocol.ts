@@ -44,6 +44,8 @@ export type ManagedChildResponse = ManagedChildIdentity & {
   ok: boolean;
   providerSessionId?: string;
   error?: 'invalid_request' | 'conflict' | 'not_ready' | 'busy' | 'operation_limit' | 'operation_failed';
+  /** Bounded, secret-free reason for `operation_failed`; diagnostics only, never an outcome. */
+  detail?: string;
   operationId?: string;
   operationState?: 'in_flight' | 'completed' | 'not_found';
 };
@@ -93,7 +95,8 @@ export function parseManagedChildOutput(line: string): ManagedChildOutput {
   const v: unknown = JSON.parse(line);
   if (!record(v) || !identity(v)) throw new Error('Invalid managed child identity.');
   if (v.type === 'event' && keys(v, ['eventSeq', 'event']) && Number.isSafeInteger(v.eventSeq) && Number(v.eventSeq) > 0 && record(v.event)) return v as ManagedChildEvent;
-  if (v.type === 'response' && keys(v, ['ok', 'providerSessionId', 'error', 'operationId', 'operationState']) && typeof v.ok === 'boolean'
+  if (v.type === 'response' && keys(v, ['ok', 'providerSessionId', 'error', 'detail', 'operationId', 'operationState']) && typeof v.ok === 'boolean'
+    && (v.detail === undefined || (typeof v.detail === 'string' && v.detail.length <= 300))
     && (v.operationId === undefined || id(v.operationId))
     && (v.operationState === undefined || (id(v.operationId) && ['in_flight', 'completed', 'not_found'].includes(String(v.operationState))))
     && (v.providerSessionId === undefined || id(v.providerSessionId))
