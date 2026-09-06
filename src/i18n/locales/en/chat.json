@@ -76,6 +76,7 @@
     "queue": {
       "sendNext": "Queue another message",
       "label": "Queued",
+      "paused": "Queue paused",
       "willSend": "Sends when the current run finishes",
       "willFollow": "Sends after the messages above",
       "edit": "Edit queued item",

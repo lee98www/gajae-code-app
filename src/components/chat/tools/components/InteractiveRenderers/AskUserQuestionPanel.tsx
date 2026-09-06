@@ -47,7 +47,7 @@ export const AskUserQuestionPanel: React.FC<PermissionPanelProps> = ({ request, 
     });
     return result;
   }, [other, otherText, picked, questions]);
-  const submit = useCallback(() => onDecision(request.requestId, { allow: true, updatedInput: { ...input, answers: answers() } }), [answers, input, onDecision, request.requestId]);
+  const submit = useCallback(() => onDecision(request.requestId, { allow: true, updatedInput: { answers: answers() } }), [answers, onDecision, request.requestId]);
   const skip = useCallback(() => onDecision(request.requestId, { allow: false, message: 'User skipped the question' }), [onDecision, request.requestId]);
   const keyDown = useCallback((event: React.KeyboardEvent) => {
     if (event.target instanceof HTMLInputElement) return;

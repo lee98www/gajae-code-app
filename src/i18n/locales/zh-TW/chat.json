@@ -76,6 +76,7 @@
     "queue": {
       "sendNext": "佇列另一則訊息",
       "label": "已佇列",
+      "paused": "佇列已暫停",
       "willSend": "於當前執行結束後發送",
       "willFollow": "於上方訊息之後發送",
       "edit": "編輯佇列中的項目",

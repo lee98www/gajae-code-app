@@ -1,6 +1,6 @@
 import net from 'node:net';
 
-import { HERDR_OUTPUT_LINES, herdrPaneIdSchema, herdrTerminalIdSchema, type HerdrAgentStatus } from '../../shared/herdr-protocol.js';
+import { HERDR_OUTPUT_LINES, herdrPaneIdSchema, herdrTerminalIdSchema, type HerdrAgentStatus } from '../../../../shared/herdr-protocol.js';
 
 export const HERDR_RPC_TIMEOUT_MS = 5_000;
 export const HERDR_MAX_FRAME_BYTES = 2 * 1024 * 1024;
@@ -8,6 +8,25 @@ export const HERDR_MAX_OUTPUT_BYTES = 256 * 1024;
 
 export type HerdrConnector = (socketPath: string) => NodeJS.ReadWriteStream;
 export type HerdrDispatchGuard = { admit: () => Promise<void>; check: () => void };
+export type HerdrProvisionReceipt = Readonly<{ workspaceId: string; tabId: string; paneId: string; terminalId: string }>;
+export type HerdrReportAgentInput = Readonly<{
+  paneId: string;
+  source: string;
+  state: 'idle' | 'working' | 'blocked' | 'unknown';
+  seq: number;
+}>;
+export type HerdrReleaseAgentInput = Readonly<{ paneId: string; source: string; seq: number }>;
+export type HerdrReportMetadataTokenName =
+  | 'gajae_native_session_id'
+  | 'gajae_owner_generation'
+  | 'gajae_app_session_id';
+export type HerdrReportMetadataTokens = Readonly<Partial<Record<HerdrReportMetadataTokenName, string | null>>>;
+export type HerdrReportMetadataInput = Readonly<{
+  paneId: string;
+  source: string;
+  seq: number;
+  tokens: HerdrReportMetadataTokens;
+}>;
 
 export type HerdrWireWorkspace = {
   workspace_id: string;
@@ -39,7 +58,9 @@ export type HerdrWirePane = {
   cwd?: string;
   foreground_cwd?: string;
   agent?: string | null;
+  agent_session?: { source: string; agent: string; kind: 'id'; value: string };
   agent_status?: HerdrAgentStatus;
+  tokens?: Record<string, string>;
   label?: string | null;
 };
 
@@ -70,6 +91,88 @@ function status(value: unknown): HerdrAgentStatus {
 }
 
 const unsigned = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+
+function assertAgentInput(input: unknown, report: boolean): asserts input is HerdrReleaseAgentInput {
+  const fields = report ? ['paneId', 'source', 'state', 'seq'] : ['paneId', 'source', 'seq'];
+  if (!isObject(input) || Reflect.ownKeys(input).length !== fields.length ||
+    !fields.every((field) => Object.prototype.hasOwnProperty.call(input, field)) ||
+    !herdrPaneIdSchema.safeParse(input.paneId).success ||
+    typeof input.source !== 'string' || input.source.length > 80 || !/^[A-Za-z0-9]/.test(input.source) || /[^A-Za-z0-9._:-]/.test(input.source) ||
+    !unsigned(input.seq) ||
+    (report && (typeof input.state !== 'string' || !['idle', 'working', 'blocked', 'unknown'].includes(input.state)))) {
+    throw new HerdrError('HERDR_INVALID_REQUEST', 400, 'Invalid Herdr agent metadata.');
+  }
+}
+
+const HERDR_METADATA_TOKEN_NAMES = new Set<HerdrReportMetadataTokenName>([
+  'gajae_native_session_id',
+  'gajae_owner_generation',
+  'gajae_app_session_id',
+]);
+const HERDR_METADATA_TOKEN_KEY = /^[A-Za-z0-9_-]{1,32}$/;
+
+function assertReportMetadataInput(input: unknown): asserts input is HerdrReportMetadataInput {
+  const fields = ['paneId', 'source', 'seq', 'tokens'];
+  if (!isObject(input) || Reflect.ownKeys(input).length !== fields.length ||
+    !fields.every((field) => Object.prototype.hasOwnProperty.call(input, field)) ||
+    !herdrPaneIdSchema.safeParse(input.paneId).success ||
+    typeof input.source !== 'string' || input.source.length > 80 || !/^[A-Za-z0-9]/.test(input.source) || /[^A-Za-z0-9._:-]/.test(input.source) ||
+    !unsigned(input.seq) || !isObject(input.tokens)) {
+    throw new HerdrError('HERDR_INVALID_REQUEST', 400, 'Invalid Herdr pane metadata.');
+  }
+
+  const tokenKeys = Reflect.ownKeys(input.tokens);
+  if (tokenKeys.length < 1 || tokenKeys.length > HERDR_METADATA_TOKEN_NAMES.size ||
+    tokenKeys.some((key) => typeof key !== 'string' || !HERDR_METADATA_TOKEN_KEY.test(key) || !HERDR_METADATA_TOKEN_NAMES.has(key as HerdrReportMetadataTokenName))) {
+    throw new HerdrError('HERDR_INVALID_REQUEST', 400, 'Invalid Herdr pane metadata tokens.');
+  }
+  for (const key of tokenKeys) {
+    const token = input.tokens[key as keyof typeof input.tokens];
+    if (token !== null && (typeof token !== 'string' || token.length < 1 || [...token].length > 80
+      || token.trim() !== token || /[\u0000-\u001f\u007f-\u009f]/.test(token))) {
+      throw new HerdrError('HERDR_INVALID_REQUEST', 400, 'Invalid Herdr pane metadata token value.');
+    }
+  }
+
+  const hasNativeId = Object.prototype.hasOwnProperty.call(input.tokens, 'gajae_native_session_id');
+  const hasGeneration = Object.prototype.hasOwnProperty.call(input.tokens, 'gajae_owner_generation');
+  const hasAppSessionId = Object.prototype.hasOwnProperty.call(input.tokens, 'gajae_app_session_id');
+  if (hasNativeId !== hasGeneration) {
+    throw new HerdrError('HERDR_INVALID_REQUEST', 400, 'Native session identity requires an owner generation.');
+  }
+  if (!hasNativeId && hasAppSessionId) {
+    throw new HerdrError('HERDR_INVALID_REQUEST', 400, 'Application session identity requires a native session identity.');
+  }
+  if (hasNativeId) {
+    const nativeId = input.tokens.gajae_native_session_id;
+    const generation = input.tokens.gajae_owner_generation;
+    if ((nativeId === null) !== (generation === null)) {
+      throw new HerdrError('HERDR_INVALID_REQUEST', 400, 'Native session identity must be published or removed together.');
+    }
+    if (hasAppSessionId && (input.tokens.gajae_app_session_id === null) !== (nativeId === null)) {
+      throw new HerdrError('HERDR_INVALID_REQUEST', 400, 'Application correlation must share the identity patch operation.');
+    }
+  }
+}
+
+function metadataTokens(value: unknown): Record<string, string> {
+  // The request limit is 16, but multiple sources may contribute up to 32
+  // resource tokens. Preserve foreign keys rather than rejecting valid panes.
+  if (!isObject(value) || Reflect.ownKeys(value).length > 32) throw new Error('herdr session.snapshot: invalid pane tokens');
+  const tokens = Object.fromEntries(Reflect.ownKeys(value).map((key) => {
+    if (typeof key !== 'string' || !HERDR_METADATA_TOKEN_KEY.test(key) || typeof value[key] !== 'string') {
+      throw new Error('herdr session.snapshot: invalid pane tokens');
+    }
+    return [key, value[key] as string];
+  }));
+  return tokens;
+}
+
+function assertAgentAcknowledgement(value: unknown): void {
+  if (!isObject(value) || value.type !== 'ok' || Object.keys(value).length !== 1) {
+    throw new Error('Invalid Herdr agent acknowledgement.');
+  }
+}
 
 function assertSnapshot(value: unknown): HerdrWireSnapshot {
   if (!isObject(value) || value.type !== 'session_snapshot') throw new Error('herdr session.snapshot: invalid result type');
@@ -115,6 +218,13 @@ function assertSnapshot(value: unknown): HerdrWireSnapshot {
       if (!isObject(raw) || typeof raw.pane_id !== 'string' || typeof raw.terminal_id !== 'string' || typeof raw.workspace_id !== 'string' || typeof raw.tab_id !== 'string' || typeof raw.focused !== 'boolean') {
         throw new Error('herdr session.snapshot: invalid pane');
       }
+      const agentSession = raw.agent_session;
+      if (agentSession !== undefined && agentSession !== null && (!isObject(agentSession)
+        || typeof agentSession.source !== 'string' || typeof agentSession.agent !== 'string'
+        || !['id', 'path'].includes(String(agentSession.kind)) || typeof agentSession.value !== 'string')) {
+        throw new Error('herdr session.snapshot: invalid agent session');
+      }
+      const tokens = raw.tokens === undefined ? undefined : metadataTokens(raw.tokens);
       return {
         pane_id: herdrPaneIdSchema.parse(raw.pane_id),
         terminal_id: herdrTerminalIdSchema.parse(raw.terminal_id),
@@ -124,7 +234,11 @@ function assertSnapshot(value: unknown): HerdrWireSnapshot {
         cwd: typeof raw.cwd === 'string' ? raw.cwd : '',
         foreground_cwd: typeof raw.foreground_cwd === 'string' ? raw.foreground_cwd : undefined,
         agent: typeof raw.agent === 'string' ? raw.agent : null,
+        ...(isObject(agentSession) && agentSession.kind === 'id' ? {
+          agent_session: { source: agentSession.source as string, agent: agentSession.agent as string, kind: 'id' as const, value: agentSession.value as string },
+        } : {}),
         agent_status: status(raw.agent_status),
+        ...(tokens === undefined ? {} : { tokens }),
         label: typeof raw.label === 'string' ? raw.label : undefined,
       };
     }),
@@ -266,8 +380,83 @@ export class HerdrClient {
     });
   }
 
-  snapshot(signal?: AbortSignal): Promise<HerdrWireSnapshot> {
-    return this.request('session.snapshot', {}, assertSnapshot, signal);
+  snapshot(signal?: AbortSignal, guard?: HerdrDispatchGuard): Promise<HerdrWireSnapshot> {
+    return this.request('session.snapshot', {}, assertSnapshot, signal, guard);
+  }
+
+  async reportAgent(input: HerdrReportAgentInput, signal?: AbortSignal, guard?: HerdrDispatchGuard): Promise<void> {
+    assertAgentInput(input, true);
+    await this.request('pane.report_agent', {
+      pane_id: input.paneId, source: input.source, agent: 'gjc', state: input.state,
+      seq: input.seq,
+    }, assertAgentAcknowledgement, signal, guard);
+  }
+
+  async reportMetadata(input: HerdrReportMetadataInput, signal?: AbortSignal, guard?: HerdrDispatchGuard): Promise<void> {
+    assertReportMetadataInput(input);
+    await this.request('pane.report_metadata', {
+      pane_id: input.paneId, source: input.source, tokens: Object.fromEntries(
+        Object.entries(input.tokens),
+      ), seq: input.seq,
+    }, assertAgentAcknowledgement, signal, guard);
+  }
+
+  async releaseAgent(input: HerdrReleaseAgentInput, signal?: AbortSignal, guard?: HerdrDispatchGuard): Promise<void> {
+    assertAgentInput(input, false);
+    await this.request('pane.release_agent', {
+      pane_id: input.paneId, source: input.source, agent: 'gjc', seq: input.seq,
+    }, assertAgentAcknowledgement, signal, guard);
+  }
+
+  createWorkspace(cwd: string, label: string, signal?: AbortSignal, guard?: HerdrDispatchGuard): Promise<HerdrProvisionReceipt> {
+    return this.request('workspace.create', { cwd, label, env: {}, focus: false }, (value) => {
+      if (!isObject(value) || value.type !== 'workspace_created') throw new Error('Invalid workspace creation receipt.');
+      const snapshot = assertSnapshot({ type: 'session_snapshot', snapshot: {
+        version: '', protocol: 0, layouts: [], agents: [],
+        workspaces: [value.workspace], tabs: [value.tab], panes: [value.root_pane],
+      } });
+      const workspace = snapshot.workspaces[0]!;
+      const tab = snapshot.tabs[0]!;
+      const pane = snapshot.panes[0]!;
+      const workspaceId = herdrPaneIdSchema.parse(workspace.workspace_id);
+      const tabId = herdrPaneIdSchema.parse(tab.tab_id);
+      if (tab.workspace_id !== workspaceId || pane.workspace_id !== workspaceId || pane.tab_id !== tabId || workspace.active_tab_id !== tabId ||
+        !tabId.startsWith(`${workspaceId}:t`) || !pane.pane_id.startsWith(`${workspaceId}:p`)) throw new Error('Workspace receipt mapping mismatch.');
+      return Object.freeze({ workspaceId, tabId, paneId: pane.pane_id, terminalId: pane.terminal_id });
+    }, signal, guard);
+  }
+
+  async applyLayout(workspaceId: string, argv: readonly string[], cwd: string, signal?: AbortSignal, guard?: HerdrDispatchGuard): Promise<HerdrProvisionReceipt> {
+    herdrPaneIdSchema.parse(workspaceId);
+    if (!argv.length || argv.some((arg) => typeof arg !== 'string' || arg.includes('\0')) || !argv[0]) {
+      throw new HerdrError('HERDR_INVALID_REQUEST', 400, 'Invalid managed host argv.');
+    }
+    const receipt = await this.request('layout.apply', {
+      workspace_id: workspaceId, focus: false, root: { type: 'pane', command: [...argv], cwd, env: {} },
+    }, (value) => {
+      if (!isObject(value) || value.type !== 'layout_apply' || !isObject(value.layout)) throw new Error('Invalid layout receipt.');
+      const layout = value.layout;
+      if (layout.workspace_id !== workspaceId || typeof layout.zoomed !== 'boolean' || !isObject(layout.root) || layout.root.type !== 'pane') throw new Error('Invalid layout mapping.');
+      const root = layout.root;
+      if ((root.command !== undefined && root.command !== null && (!Array.isArray(root.command) || root.command.some((arg) => typeof arg !== 'string'))) ||
+        (root.cwd !== undefined && root.cwd !== null && typeof root.cwd !== 'string') ||
+        (root.label !== undefined && root.label !== null && typeof root.label !== 'string') ||
+        (root.env !== undefined && (!isObject(root.env) || Object.values(root.env).some((value) => typeof value !== 'string')))) throw new Error('Invalid layout node.');
+      const tabId = herdrPaneIdSchema.parse(layout.tab_id);
+      const paneId = herdrPaneIdSchema.parse(layout.root.pane_id);
+      if (!tabId.startsWith(`${workspaceId}:t`) || !paneId.startsWith(`${workspaceId}:p`) || layout.focused_pane_id !== paneId) throw new Error('Invalid layout pane mapping.');
+      return { tabId, paneId };
+    }, signal, guard);
+    // LayoutDescription has no terminal id. Resolve only its exact IDs, never focus.
+    const snapshot = await this.snapshot(signal, guard);
+    const workspaces = snapshot.workspaces.filter((w) => w.workspace_id === workspaceId);
+    const tabs = snapshot.tabs.filter((t) => t.tab_id === receipt.tabId);
+    const panes = snapshot.panes.filter((p) => p.pane_id === receipt.paneId);
+    if (workspaces.length !== 1 || tabs.length !== 1 || tabs[0]!.workspace_id !== workspaceId || panes.length !== 1 ||
+      panes[0]!.workspace_id !== workspaceId || panes[0]!.tab_id !== receipt.tabId) {
+      throw new HerdrError('HERDR_INVALID_RESPONSE', 502, 'Herdr layout mapping is unknown.');
+    }
+    return Object.freeze({ workspaceId, ...receipt, terminalId: panes[0]!.terminal_id });
   }
 
   readPane(paneId: string, lines: number, signal?: AbortSignal): Promise<HerdrPaneRead> {

@@ -1,0 +1,407 @@
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+import {
+  parseManagedChildOutput,
+  parseManagedChildRequest,
+  type ManagedChildOutput,
+  type ManagedChildEvent,
+  type ManagedChildResponse,
+} from '../shared/herdr-managed-child-protocol.js';
+
+/** This script is test-owned and imported, never a production bootstrap option. */
+function launcherSource(disposalFile: string) {
+  return `
+import assert from 'node:assert/strict';
+import { writeFile } from 'node:fs/promises';
+import { runManagedChild } from ${JSON.stringify(fileURLToPath(new URL('./gjc-herdr-managed-child.ts', import.meta.url)))};
+import { GjcBunSdkAdapter } from ${JSON.stringify(fileURLToPath(new URL('./gjc-bun-sdk-adapter.ts', import.meta.url)))};
+let creations = 0;
+const authStorage = {
+  exportSnapshot: () => ({ credentials: [] }),
+  setRuntimeApiKey() {}, removeRuntimeApiKey() {},
+};
+const model = { id: 'managed-model', provider: 'managed-provider' };
+const modelRegistry = { authStorage, getAll: () => [model], getAvailable: () => [model] };
+const settings = { cloneForCwd: async () => ({ override() {} }) };
+const createSessionFactory = async (input) => {
+  assert.equal(++creations, 1, 'one retained SDK object');
+  assert.equal(input.sdkHostModeSupported, false);
+  assert.equal(input.notificationHostModeSupported, false);
+  let ui;
+  let turns = 0;
+  let steers = 0;
+  let resolveAbort;
+  let permissionMode = 'allow';
+  let permissionProvider;
+  let permissionRegistrations = 0;
+  const listeners = new Set();
+  const emit = (event) => { for (const listener of listeners) listener(event); };
+  const session = {
+    isStreaming: false,
+    model,
+    thinkingLevel: 'high',
+    setSdkPermissionMode(mode) { permissionMode = mode; },
+    setSdkPermissionProvider(provider) { permissionProvider = provider; permissionRegistrations++; },
+    getContextUsage: () => ({ tokens: 15, contextWindow: 100, source: 'exact' }),
+    setModelTemporary: async () => {},
+    setConfiguredModelChain() {}, seedDefaultFallbackResolution() {},
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    async prompt(text, options) {
+      if (options?.streamingBehavior === 'steer') {
+        assert.equal(this.isStreaming, true);
+        emit({ type: 'notice', level: 'info', message: 'steer:' + (++steers) + ':' + text });
+        return;
+      }
+      assert.equal(this.isStreaming, false);
+      this.isStreaming = true;
+      turns += 1;
+      assert.equal(permissionRegistrations, turns + 1, 'permission cache resets at every retained turn boundary');
+      assert.equal(permissionMode, 'prompt', 'managed gate is mandatory without config.permissions');
+      assert.equal(typeof permissionProvider, 'function');
+      if (text === 'permissions') {
+        const permissionOptions = [
+          { optionId: 'once', kind: 'allow_once', name: 'Allow once' },
+          { optionId: 'always', kind: 'allow_always', name: 'Always allow' },
+          { optionId: 'deny', kind: 'reject_once', name: 'Reject' },
+          { optionId: 'deny-rest', kind: 'reject_always', name: 'Deny remaining' },
+        ];
+        for (let gate = 1; gate <= 2; gate += 1) {
+          const outcome = await permissionProvider({ toolCallId: 'gate:' + gate, toolName: 'bash', title: 'command', rawInput: { command: 'pwd' } }, permissionOptions);
+          assert.equal(outcome.kind, gate === 1 ? 'allow_once' : 'reject_always');
+          emit({ type: 'notice', level: 'info', message: 'gate:' + gate + ':' + outcome.kind });
+        }
+        this.isStreaming = false;
+        return;
+      }
+      if (text === 'overflow') {
+        for (let index = 0; index < 129; index += 1) emit({ type: 'thinking_end', content: 'burst:' + index });
+      }
+      emit({ type: 'thinking_end', content: 'thinking:' + turns });
+      emit({ type: 'tool_execution_start', toolCallId: 'tool:' + turns, toolName: 'read', args: { path: 'file' } });
+      emit({ type: 'tool_execution_update', toolCallId: 'tool:' + turns, partialResult: { content: [{ type: 'text', text: 'partial' }] } });
+      const aborted = new Promise((resolve) => { resolveAbort = resolve; });
+      const answer = await Promise.race([ui.select('Continue turn ' + turns, ['yes', 'no']), aborted]);
+      emit({ type: 'tool_execution_end', toolCallId: 'tool:' + turns, toolName: 'read', result: { content: [{ type: 'text', text: String(answer) }], details: { turn: turns } }, isError: false });
+      emit({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'answer:' + turns }], stopReason: text === 'fail' ? 'error' : 'stop', ...(text === 'fail' ? { errorMessage: 'first failure' } : {}), usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 } } });
+      this.isStreaming = false;
+    },
+    async abort() { resolveAbort?.('aborted'); },
+    async dispose() { resolveAbort?.('disposed'); await writeFile(${JSON.stringify(disposalFile)}, JSON.stringify({ creations, turns, steers })); },
+  };
+  return { session, setToolUIContext(value) { ui = value; } };
+};
+await runManagedChild({ createAdapter: async () => new GjcBunSdkAdapter(authStorage, modelRegistry, { settings, createSessionFactory }) });
+`;
+}
+
+async function harness() {
+  const root = await mkdtemp(join(tmpdir(), 'herdr-child-'));
+  const script = join(root, 'launcher.ts');
+  const disposalFile = join(root, 'disposed.json');
+  await writeFile(script, launcherSource(disposalFile));
+  const child = spawn(process.execPath, [script], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, GJC_RUNTIME_API_KEY: 'test-only-not-a-provider-key' },
+  });
+  const frames: ManagedChildOutput[] = [];
+  let stderr = '';
+  let buffer = '';
+  let parseError: unknown;
+  child.stdin.on('error', (error: NodeJS.ErrnoException) => {
+    // Fail-closed child shutdown may race automatic acks already queued by stdout.
+    if (error.code !== 'EPIPE') parseError = error;
+  });
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const send = (frame: Record<string, unknown>) => child.stdin.write(`${JSON.stringify({ version: 1, generation: 'generation:1', runId: 'owner', ...frame })}\n`);
+  let ackCounter = 0;
+  const ack = (frame: ManagedChildEvent) => send({ type: 'ack', requestId: `ack:${++ackCounter}`, runId: frame.runId, eventSeq: frame.eventSeq });
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    buffer += chunk;
+    for (;;) {
+      const newline = buffer.indexOf('\n');
+      if (newline < 0) break;
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      try {
+        const frame = parseManagedChildOutput(line);
+        frames.push(frame);
+        // Withhold only terminal acks to prove the prompt response is not early.
+        if (frame.type === 'event' && frame.event.kind !== 'complete') ack(frame);
+      } catch (error) { parseError = error; }
+    }
+  });
+  const exited = new Promise<number | null>((resolve) => { child.once('exit', resolve); });
+  async function wait<T>(read: () => T | undefined): Promise<T> {
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      if (parseError) throw parseError;
+      const value = read();
+      if (value !== undefined) return value;
+      if (child.exitCode !== null) throw new Error(`Child exited ${child.exitCode}: ${stderr}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new Error(`Child frame timed out: ${stderr}`);
+  }
+  const response = (requestId: string) => wait(() => frames.find((f): f is ManagedChildResponse => f.type === 'response' && f.requestId === requestId));
+  const event = (runId: string, kind: string) => wait(() => frames.find((f): f is ManagedChildEvent => f.type === 'event' && f.runId === runId && f.event.kind === kind));
+  async function init() {
+    send({ type: 'init', requestId: 'init', agentDir: root, appSessionId: 'app:1', runConfig: {
+      cwd: root, sessionRoot: root, credential: { kind: 'runtime-env', envVar: 'GJC_RUNTIME_API_KEY' }, modelId: 'managed-model', toolNames: [], spawns: 'deny', bashPolicy: { allowedPrefixes: [] },
+    } });
+    assert.equal((await response('init')).ok, true);
+    assert.equal(frames.some((f) => f.type === 'event' && f.event.kind === 'thinking'), false, 'initialize never prompts');
+  }
+  async function cleanup() {
+    if (child.exitCode === null) child.kill('SIGKILL');
+    await exited;
+    await rm(root, { recursive: true, force: true });
+  }
+  return { child, frames, send, ack, response, event, init, cleanup, disposalFile, exited };
+}
+
+test('private Bun child streams real adapter mapping, accepts concurrent controls, retains two turns and waits for durable terminal ack', { timeout: 30_000 }, async () => {
+  const h = await harness();
+  try {
+    await h.init();
+    for (const [turn, text, exitCode] of [[1, 'fail', 1], [2, 'success', 0]] as const) {
+      const runId = `turn:${turn}`;
+      const requestId = `prompt:${turn}`;
+      h.send({ type: 'prompt', runId, requestId, actionId: requestId, text });
+      const ask = await h.event(runId, 'permission_request');
+      assert.equal(ask.requestId, requestId);
+      assert.equal(h.frames.some((f) => f.type === 'response' && f.requestId === requestId), false);
+      assert.equal((await h.event(runId, 'thinking')).event.content, `thinking:${turn}`);
+      assert.equal((await h.event(runId, 'tool_use')).event.toolId, `tool:${turn}`);
+      if (turn === 1) {
+        h.send({ type: 'steer', runId, requestId: 'steer:1', actionId: 'steer-action:1', text: 'same text' });
+        assert.equal((await h.response('steer:1')).ok, true);
+        h.send({ type: 'steer', runId, requestId: 'steer:retry', actionId: 'steer-action:1', text: 'same text' });
+        assert.equal((await h.response('steer:retry')).ok, true);
+        h.send({ type: 'steer', runId, requestId: 'steer:conflict', actionId: 'steer-action:1', text: 'different' });
+        assert.equal((await h.response('steer:conflict')).error, 'conflict');
+        h.send({ type: 'steer', runId, requestId: 'steer:2', actionId: 'steer-action:2', text: 'same text' });
+        assert.equal((await h.response('steer:2')).ok, true);
+      }
+      h.send({ type: 'approval', runId, requestId: `bad:${turn}`, actionId: `bad:${turn}`, askId: ask.event.requestId, decision: { allow: true } });
+      assert.equal((await h.response(`bad:${turn}`)).ok, false, 'invalid answer must not consume genuine pending ask');
+      for (const [index, decision] of [
+        { allow: true, message: 'not-an-option' },
+        { allow: true, message: 'yes', extra: true },
+        { allow: true, updatedInput: { answers: { first: 'yes', second: 'no' } } },
+      ].entries()) {
+        const invalidId = `invalid:${turn}:${index}`;
+        h.send({ type: 'validate-approval', runId, requestId: invalidId, actionId: invalidId, askId: ask.event.requestId, decision });
+        assert.equal((await h.response(invalidId)).ok, false);
+      }
+      h.send({ type: 'validate-approval', runId, requestId: `validate:${turn}`, actionId: `validate:${turn}`, askId: ask.event.requestId, decision: { allow: true, message: 'yes' } });
+      assert.equal((await h.response(`validate:${turn}`)).ok, true);
+      assert.equal(h.frames.some((f) => f.type === 'event' && f.runId === runId && f.event.kind === 'complete'), false, 'validation does not consume the pending ask');
+      h.send({ type: 'approval', runId, requestId: `answer:${turn}`, actionId: `answer:${turn}`, askId: ask.event.requestId, decision: { allow: true, message: 'yes' } });
+      assert.equal((await h.response(`answer:${turn}`)).ok, true);
+      const terminal = await h.event(runId, 'complete');
+      assert.equal(terminal.event.exitCode, exitCode);
+      // A separate correlated response proves input is still serviced while the terminal is unacked.
+      h.send({ type: 'prompt', runId: 'busy-turn', requestId: `barrier:${turn}`, actionId: `barrier:${turn}`, text: 'must not start' });
+      assert.equal((await h.response(`barrier:${turn}`)).error, 'busy');
+      assert.equal(h.frames.some((f) => f.type === 'response' && f.requestId === requestId), false);
+      h.ack(terminal);
+      await h.response(requestId);
+      const finalTool = h.frames.find((f) => f.type === 'event' && f.runId === runId && f.event.kind === 'tool_result' && f.event.isFinal === true) as ManagedChildEvent;
+      assert.deepEqual(finalTool.event.toolUseResult, { turn });
+      if (turn === 2) {
+        assert.equal((await h.event(runId, 'stream_end')).event.content, 'answer:2');
+        assert.ok(h.frames.some((f) => f.type === 'event' && f.runId === runId && f.event.text === 'session_state'));
+      }
+    }
+    const sequences = h.frames.filter((f): f is ManagedChildEvent => f.type === 'event').map((f) => f.eventSeq);
+    assert.deepEqual(sequences, sequences.map((_, index) => index + 1));
+    h.send({ type: 'close', requestId: 'close', actionId: 'close' });
+    assert.equal((await h.response('close')).ok, true);
+    assert.equal(await h.exited, 0);
+    assert.deepEqual(JSON.parse(await readFile(h.disposalFile, 'utf8')), { creations: 1, turns: 2, steers: 2 });
+  } finally { await h.cleanup(); }
+});
+
+test('managed Always remains host-owned and a later changed policy is consulted through another SDK gate', { timeout: 20_000 }, async () => {
+  const h = await harness();
+  try {
+    await h.init();
+    h.send({ type: 'prompt', runId: 'permissions', requestId: 'permissions', actionId: 'permissions', text: 'permissions' });
+    const first = await h.event('permissions', 'permission_request');
+    h.send({ type: 'approval', runId: 'permissions', requestId: 'grant', actionId: 'grant', askId: first.event.requestId, decision: { allow: true, always: true } });
+    assert.equal((await h.response('grant')).ok, true);
+    // The simulated trusted host changes its policy after the first durable grant.
+    // A cached SDK Always would bypass this second request entirely.
+    const deadline = Date.now() + 10_000;
+    let second: ManagedChildEvent | undefined;
+    while (!second && Date.now() < deadline) {
+      second = h.frames.find((f): f is ManagedChildEvent => f.type === 'event' && f.runId === 'permissions'
+        && f.event.kind === 'permission_request' && f.event.requestId !== first.event.requestId);
+      if (!second) await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(second, 'changed host policy must receive a fresh gate after Always');
+    h.send({ type: 'approval', runId: 'permissions', requestId: 'deny', actionId: 'deny', askId: second.event.requestId, decision: { allow: false, always: true } });
+    assert.equal((await h.response('deny')).ok, true);
+    const terminal = await h.event('permissions', 'complete');
+    assert.equal(terminal.event.exitCode, 0, 'SDK observed allow_once then turn-scoped reject_always');
+    h.ack(terminal);
+    await h.response('permissions');
+    h.child.stdin.end();
+    assert.equal(await h.exited, 0);
+  } finally { await h.cleanup(); }
+});
+
+test('actual owner stdin death disposes the retained SDK during a pending ask', { timeout: 20_000 }, async () => {
+  const h = await harness();
+  try {
+    await h.init();
+    h.send({ type: 'prompt', runId: 'pending', requestId: 'pending', actionId: 'pending', text: 'success' });
+    await h.event('pending', 'permission_request');
+    h.child.stdin.end();
+    assert.equal(await h.exited, 0);
+    assert.deepEqual(JSON.parse(await readFile(h.disposalFile, 'utf8')), { creations: 1, turns: 1, steers: 0 });
+  } finally { await h.cleanup(); }
+});
+
+test('concurrent abort preserves the retained session and refreshes ask state for the next turn', { timeout: 20_000 }, async () => {
+  const h = await harness();
+  try {
+    await h.init();
+    h.send({ type: 'prompt', runId: 'aborting', requestId: 'prompt-abort', actionId: 'prompt-abort', text: 'success' });
+    const oldAsk = await h.event('aborting', 'permission_request');
+    h.send({ type: 'validate-approval', runId: 'aborting', requestId: 'validate-old', actionId: 'validate-old', askId: oldAsk.event.requestId, decision: { allow: true, message: 'yes' } });
+    assert.equal((await h.response('validate-old')).ok, true);
+    h.send({ type: 'abort', runId: 'aborting', requestId: 'abort', actionId: 'abort' });
+    assert.equal((await h.response('abort')).ok, true);
+    await h.response('prompt-abort');
+    h.send({ type: 'prompt', runId: 'recovered', requestId: 'recovered', actionId: 'recovered', text: 'success' });
+    const ask = await h.event('recovered', 'permission_request');
+    h.send({ type: 'approval', runId: 'recovered', requestId: 'cancelled-old', actionId: 'cancelled-old', askId: oldAsk.event.requestId, decision: { allow: true, message: 'yes' } });
+    assert.equal((await h.response('cancelled-old')).ok, false, 'prior validation is not a reservation');
+    h.send({ type: 'approval', runId: 'recovered', requestId: 'answer', actionId: 'answer', askId: ask.event.requestId, decision: { allow: true, message: 'yes' } });
+    assert.equal((await h.response('answer')).ok, true);
+    const terminal = await h.event('recovered', 'complete');
+    assert.equal(terminal.event.exitCode, 0);
+    h.ack(terminal);
+    await h.response('recovered');
+    h.child.stdin.end();
+    assert.equal(await h.exited, 0);
+    assert.equal(JSON.parse(await readFile(h.disposalFile, 'utf8')).turns, 2);
+  } finally { await h.cleanup(); }
+});
+
+test('unacknowledged synchronous SDK event burst fails closed rather than retaining an unbounded backlog', { timeout: 20_000 }, async () => {
+  const h = await harness();
+  try {
+    await h.init();
+    h.send({ type: 'prompt', runId: 'overflow', requestId: 'overflow', actionId: 'overflow', text: 'overflow' });
+    assert.equal(await h.exited, 0);
+    assert.ok(h.frames.filter((f) => f.type === 'event' && f.runId === 'overflow').length <= 128);
+    assert.equal(JSON.parse(await readFile(h.disposalFile, 'utf8')).turns, 1);
+  } finally { await h.cleanup(); }
+});
+
+test('private IPC rejects unknown fields, invalid identity, wrong version and unsafe sequence', () => {
+  const base = { version: 1, generation: 'g:1', requestId: 'r:1', runId: 'run:1', type: 'ack', eventSeq: 1 };
+  for (const extra of [{ version: 2 }, { generation: '' }, { requestId: 'x'.repeat(161) }, { eventSeq: 1.5 }, { bootstrapModule: '/tmp/code.ts' }]) {
+    assert.throws(() => parseManagedChildRequest(JSON.stringify({ ...base, ...extra })));
+  }
+  assert.throws(() => parseManagedChildRequest(' '.repeat(262_145)));
+});
+
+test('managed adapter consumes builtins, contains exports and titles only the first native turn on its retained object', async () => {
+  const { GjcBunSdkAdapter } = await import('./gjc-bun-sdk-adapter.js');
+  const root = await mkdtemp(join(tmpdir(), 'managed-parity-'));
+  const previousKey = process.env.GJC_RUNTIME_API_KEY;
+  const previousTitle = process.env.GJC_NO_TITLE;
+  const previousPiTitle = process.env.PI_NO_TITLE;
+  process.env.GJC_RUNTIME_API_KEY = 'test-only';
+  delete process.env.GJC_NO_TITLE;
+  delete process.env.PI_NO_TITLE;
+  const models = [
+    { id: 'first', provider: 'test', reasoning: true, thinking: { minLevel: 'low', maxLevel: 'high', levels: ['low', 'high'] } },
+    { id: 'second', provider: 'test', reasoning: true, thinking: { minLevel: 'low', maxLevel: 'high', levels: ['low', 'high'] } },
+  ];
+  const events: any[] = [];
+  const prompts: any[] = [];
+  const commands: string[] = [];
+  let creations = 0;
+  let titles = 0;
+  let manager: any;
+  let session: any;
+  const authStorage: any = { exportSnapshot: () => ({ credentials: [] }), setRuntimeApiKey() {}, removeRuntimeApiKey() {} };
+  const registry: any = { authStorage, getAll: () => models };
+  const adapter = new GjcBunSdkAdapter(authStorage, registry, {
+    settings: { cloneForCwd: async () => ({ override() {} }) } as any,
+    generateSessionTitle: async () => { titles++; return 'Generated native title'; },
+    executeBuiltinCommand: (async (message: string, context: any) => {
+      commands.push(message);
+      if (message === '/compact expand') return { prompt: 'expanded command prompt' };
+      context.output('local command output');
+      return { consumed: true };
+    }) as any,
+    createSessionFactory: (async (input: any) => {
+      creations++;
+      manager = input.sessionManager;
+      session = {
+        model: input.model,
+        thinkingLevel: input.thinkingLevel,
+        setModelTemporary: async (model: any) => { session.model = model; },
+        setThinkingLevel: (effort: any) => { session.thinkingLevel = effort; },
+        setConfiguredModelChain() {}, seedDefaultFallbackResolution() {},
+        setSdkPermissionMode() {}, setSdkPermissionProvider() {},
+        subscribe: () => () => {},
+        prompt: async (text: string) => {
+          prompts.push({ text, model: session.model.id, effort: session.thinkingLevel });
+          manager.appendMessage({ role: 'user', content: text, timestamp: Date.now() });
+          manager.appendMessage({ role: 'assistant', content: [{ type: 'text', text: 'fixture response' }], timestamp: Date.now() });
+          await manager.flush();
+        },
+        abort: async () => {}, dispose: async () => { await manager.flushAndCloseStrict(); },
+      };
+      return { session, setToolUIContext() {} };
+    }) as any,
+  });
+  let retained: Awaited<ReturnType<typeof adapter.initializeManagedGjcSession>> | undefined;
+  try {
+    retained = await adapter.initializeManagedGjcSession('parity', {
+      cwd: root, sessionRoot: root, credential: { kind: 'runtime-env', envVar: 'GJC_RUNTIME_API_KEY' },
+      modelId: 'first', toolNames: [], spawns: 'deny', bashPolicy: { allowedPrefixes: [] },
+    }, { send: (event: unknown) => events.push(event) } as any);
+    assert.equal(prompts.length, 0);
+    await retained.prompt('/compact');
+    await retained.prompt('/export ../outside.html');
+    assert.equal(prompts.length, 0);
+    assert.deepEqual(commands, ['/compact'], 'escaped export never reaches the handler');
+    assert.equal(titles, 0);
+    assert.ok(events.some(event => event.isLocalCommandStdout === true));
+    await retained.prompt('/compact expand', { modelId: 'first', effort: 'low' });
+    await retained.prompt('second native message', { modelId: 'second', effort: 'high' });
+    assert.deepEqual(prompts, [
+      { text: 'expanded command prompt', model: 'first', effort: 'low' },
+      { text: 'second native message', model: 'second', effort: 'high' },
+    ]);
+    assert.equal(creations, 1);
+    assert.equal(titles, 1);
+    assert.equal(manager.getSessionName(), 'Generated native title');
+    assert.equal(events.filter(event => event.kind === 'session_title').length, 1);
+    const history = events.filter(event => event.kind === 'managed.nativehistory').at(-1);
+    assert.equal(history.jsonlPath, manager.getSessionFile());
+    assert.match(await readFile(history.jsonlPath, 'utf8'), /Generated native title/);
+  } finally {
+    await retained?.dispose();
+    for (const [key, value] of [['GJC_RUNTIME_API_KEY', previousKey], ['GJC_NO_TITLE', previousTitle], ['PI_NO_TITLE', previousPiTitle]]) {
+      if (value === undefined) delete process.env[key!];
+      else process.env[key!] = value;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});

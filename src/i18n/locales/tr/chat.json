@@ -76,6 +76,7 @@
     "queue": {
       "sendNext": "Başka bir mesajı sıraya koy",
       "label": "Sıraya alındı",
+      "paused": "Kuyruk duraklatıldı",
       "willSend": "Geçerli çalıştırma bittiğinde gönderilir",
       "willFollow": "Yukarıdaki mesajlardan sonra gönderilir",
       "edit": "Sıraya alınmış öğeyi düzenle",

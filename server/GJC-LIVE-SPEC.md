@@ -1,12 +1,69 @@
 # GJC live provider specification
 
-Status: Production Bun SDK worker, native host/watcher, durable jobs, and native
-PTY slices implemented (updated 2026-09-01)
+Status: Bun SDK worker, native host/watcher, durable jobs, native PTY, and
+managed Herdr chat source contracts (updated 2026-09-06).
+Installed/copied-package acceptance for the managed changes remains pending.
 
 GJC is the only provider routed through an isolated provider worker. Claude,
 Codex, Cursor, and OpenCode retain their existing execution paths.
 
-## Headless GJC contract
+## Managed normal-chat ownership
+
+New managed GJC chat uses `herdr-managed-workspaces.ts` and
+`herdr-managed-chat.ts`: inline first-use selection chooses an admitted existing
+Herdr, then provisions App-owned placement without a second App server, a
+focused-pane guess, or mutation/adoption of imported non-managed tasks.
+A selected unavailable endpoint blocks; no local-spawn fallback is permitted.
+CAS reservations and endpoint/placement identity checks prevent duplicate
+owners. Lost RPC outcomes stay unknown and cannot automatically replay
+workspace/layout creation.
+
+The pane's independent Node `gjc-herdr-task-host.ts` owns one pinned Bun
+`gjc-herdr-managed-child.ts` SDK session. Readiness requires the real provider
+session ID; only then may the App project the mapping and submit a prompt.
+The App owns schema initialization, mapping/projection CAS and project
+permission revisions, not this process lifetime. Its quit or browser
+disconnect detaches clients. Ordinary coding, files, commands, asks, and
+permissions continue with the same native callbacks through Herdr/Collie.
+Explicit lifecycle operations (including delete/archive) remain fenced against
+active owners and pending work; UI disconnection is not a lifecycle command.
+
+Herdr publication is host-owned: `pane.report_agent` carries `agent: gjc` and
+idle/working/blocked/unknown status; `pane.report_metadata` carries the
+namespaced `gajae_native_session_id`, `gajae_owner_generation` and
+`gajae_app_session_id` correlation tokens. The actual SDK ID is published only
+after readiness and verified owned placement. A fresh snapshot must show the
+expected tokens and label/status before publication is reported as confirmed.
+Reserved `agent_session` fields are neither sent nor required. Generic tokens
+do not authorize commands or enable native Herdr/Collie resume/history.
+Cleanup checks physical target and matching token values before clearing only
+those keys, then releases the same owner-specific source after native closure.
+Foreign values are never adopted; guards do not claim atomic compare-and-send.
+
+Native history and rich ordered events, with immutable bounded paginated
+snapshot recovery, are chat authority—not a terminal scrape. Request resolution
+is bound to app session, owner generation, provider session, turn, and request,
+plus current policy/capability revisions. The concrete R2 grammar, bounded
+paste/no-echo rules, and ACK troubleshooting are in
+[SELF-HOST.md](../docs/SELF-HOST.md#r2-console-and-uncertain-outcomes);
+`gjc-herdr-task-console.ts` is the parser authority.
+
+App-dependent automation waits on the original SDK callback while disconnected.
+Renewal binds the actual browser/application target and requires explicit
+resume approval. Only authoritative completed receipts or fenced
+not-dispatched outcomes permit recovery; an existing reservation with unknown
+outcome is not replayable. Missing command replies require status/ACK lookup,
+not restart, a new action ID, or a replacement task.
+
+The latest required managed `launch_app` contract uses an exact installed
+bundle ID, a private canonical-path/identity binding and predispatch
+revalidation, never an arbitrary name. That requirement is not an
+executed/verified installed-app claim. Bootstrap/attach secrets and private
+paths are protected server-side; prompts/tokens are not command-line arguments
+or browser/log payloads (the host receives a protected bootstrap file locator).
+The App exposure guard defaults to loopback and fails closed.
+
+## Non-managed headless GJC contract
 
 Production starts the pinned Bun runtime and `server/gjc-bun-worker.ts` behind
 the native core. The worker creates `@gajae-code/coding-agent` sessions through
@@ -28,8 +85,9 @@ the native core. The worker creates `@gajae-code/coding-agent` sessions through
 
 ### Application process
 
-`server/gjc-worker-client.ts` is the only production GJC execution facade used
-by `server/index.js` and `server/routes/agent.js`. It owns:
+For the non-managed execution path, `server/gjc-worker-client.ts` is the
+production GJC execution facade used by `server/index.js` and
+`server/routes/agent.js`. It owns:
 
 - one lazily started, long-lived native-core and worker generation;
 - application session scope and immutable run IDs;
@@ -216,7 +274,7 @@ method or frame changes; the policy travels inside existing payloads:
   persists it to the project's allow-list before forwarding the reply.
 - `ask` questions keep their `sdk-ask:` prefix and answer semantics.
 
-## Process and terminal lifecycle
+## Non-managed process and terminal lifecycle
 
 - On POSIX (Linux and macOS), the application starts the Rust core as a detached
   process-group leader. The Node worker and GJC children inherit that group;
@@ -246,6 +304,12 @@ method or frame changes; the policy travels inside existing payloads:
   then terminates the owned worker tree.
 
 ## Verification contract
+
+Managed verification is tracked separately in
+[DESKTOP-TAURI-VERIFICATION.md](../docs/DESKTOP-TAURI-VERIFICATION.md#managed-herdr-chat--current-source-acceptance-pending).
+Its PTY/imported-fixture lifetime harness is not a production Herdr CLI probe,
+default SDK readiness is not DOM verification, and earlier packaged release
+records do not verify these current managed changes.
 
 Focused coverage is in:
 

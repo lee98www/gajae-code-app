@@ -10,6 +10,8 @@ import {
   BrowserNdjsonDecoder,
   serializeBrowserFrame,
   type BrowserCommand,
+  type BrowserExpectedTarget,
+  type BrowserExpectedOpenTarget,
   type BrowserEventFrame,
   type BrowserInput,
   type BrowserRequestFrame,
@@ -80,8 +82,8 @@ export class BrowserSidecarClient {
     return this.request('status', undefined, {});
   }
 
-  open(sessionId: string, payload: { url?: string; allowDownload?: boolean; waitUntil?: string }, signal?: AbortSignal): Promise<unknown> {
-    return this.request('session.open', sessionId, payload, 45_000, signal);
+  open(sessionId: string, payload: { url?: string; allowDownload?: boolean; waitUntil?: string }, signal?: AbortSignal, expectedTarget?: BrowserExpectedOpenTarget): Promise<unknown> {
+    return this.request('session.open', sessionId, { ...payload, ...(expectedTarget === undefined ? {} : { expectedTarget }) }, 45_000, signal);
   }
 
   state(sessionId: string, signal?: AbortSignal): Promise<unknown> {
@@ -92,8 +94,8 @@ export class BrowserSidecarClient {
     return this.request('session.close', sessionId, {}, 10_000, signal);
   }
 
-  command(sessionId: string, command: BrowserCommand, signal?: AbortSignal): Promise<unknown> {
-    return this.request('browser.command', sessionId, { command }, command.action === 'run' ? 305_000 : 45_000, signal);
+  command(sessionId: string, command: BrowserCommand, signal?: AbortSignal, expectedTarget?: BrowserExpectedTarget): Promise<unknown> {
+    return this.request('browser.command', sessionId, { command, ...(expectedTarget === undefined ? {} : { expectedTarget }) }, command.action === 'run' ? 305_000 : 45_000, signal);
   }
 
   input(sessionId: string, input: BrowserInput): Promise<unknown> {

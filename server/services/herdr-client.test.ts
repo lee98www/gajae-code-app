@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { Duplex } from 'node:stream';
 
-import { HerdrClient, HERDR_MAX_OUTPUT_BYTES, HerdrRpcError } from './herdr-client.js';
+import { HerdrClient, HERDR_MAX_OUTPUT_BYTES, HerdrError, HerdrRpcError, type HerdrReportAgentInput, type HerdrReleaseAgentInput, type HerdrReportMetadataInput } from '../modules/herdr/index.js';
 
 class FakeSocket extends Duplex {
   writes: string[] = [];
@@ -17,6 +17,307 @@ class FakeSocket extends Duplex {
 }
 
 describe('HerdrClient', () => {
+  const agentReport: HerdrReportAgentInput = {
+    paneId: 'w1:p1', source: 'gjc:owner-generation', state: 'idle', seq: 0,
+  };
+
+  it('reports only agent status and releases only the exact owner metadata', async () => {
+    const calls: { method: string; params: unknown }[] = [];
+    const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+      const request = JSON.parse(line);
+      calls.push({ method: request.method, params: request.params });
+      socket.reply({ id: request.id, result: { type: 'ok' } });
+    }));
+    for (const [seq, state] of (['idle', 'blocked', 'working', 'unknown'] as const).entries()) {
+      await client.reportAgent({ ...agentReport, seq, state });
+      assert.deepEqual(calls[seq], { method: 'pane.report_agent', params: {
+        pane_id: 'w1:p1', source: 'gjc:owner-generation', agent: 'gjc', state, seq,
+      } });
+    }
+    await client.releaseAgent({ paneId: agentReport.paneId, source: agentReport.source, seq: 4 });
+    assert.deepEqual(calls[4], { method: 'pane.release_agent', params: {
+      pane_id: 'w1:p1', source: 'gjc:owner-generation', agent: 'gjc', seq: 4,
+    } });
+    assert.equal(calls.length, 5);
+    assert.doesNotMatch(JSON.stringify(calls), /path|prompt|token|session/);
+  });
+
+  it('reports native identity through pane metadata with a strict acknowledgement', async () => {
+    const calls: { method: string; params: unknown }[] = [];
+    const metadata: HerdrReportMetadataInput = {
+      paneId: 'w1:p1',
+      source: 'gajae-owner:generation',
+      seq: 3,
+      tokens: {
+        gajae_native_session_id: 'native-session-123',
+        gajae_owner_generation: 'owner-generation',
+        gajae_app_session_id: 'app-session',
+      },
+    };
+    const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+      const request = JSON.parse(line);
+      calls.push({ method: request.method, params: request.params });
+      socket.reply({ id: request.id, result: { type: 'ok' } });
+    }));
+
+    await client.reportMetadata(metadata);
+    assert.deepEqual(calls, [{ method: 'pane.report_metadata', params: {
+      pane_id: 'w1:p1',
+      source: 'gajae-owner:generation',
+      tokens: metadata.tokens,
+      seq: 3,
+    } }]);
+  });
+
+  it('accepts an all-null metadata removal without claiming reporter ownership', async () => {
+    let writes = 0;
+    const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+      writes++;
+      const request = JSON.parse(line);
+      socket.reply({ id: request.id, result: { type: 'ok' } });
+    }));
+
+    await client.reportMetadata({
+      paneId: 'w1:p1',
+      source: 'gajae-owner:generation',
+      seq: 4,
+      tokens: {
+        gajae_native_session_id: null,
+        gajae_owner_generation: null,
+        gajae_app_session_id: null,
+      },
+    });
+    assert.equal(writes, 1);
+  });
+
+  it('rejects invalid metadata and extra identity or private fields before connecting', async () => {
+    let connects = 0;
+    const client = new HerdrClient('/unused', () => { connects++; throw new Error('must not connect'); });
+    for (const patch of [
+      { seq: -1 }, { seq: 0.5 }, { seq: Number.MAX_SAFE_INTEGER + 1 }, { seq: NaN }, { seq: Infinity },
+      { source: '' }, { source: 'owner\n' }, { source: 'owner\0' }, { source: 'owner name' },
+      { source: '한' }, { source: 'x'.repeat(129) }, { paneId: '' },
+    ]) {
+      await assert.rejects(client.reportAgent({ ...agentReport, ...patch }), { code: 'HERDR_INVALID_REQUEST' });
+      await assert.rejects(client.releaseAgent({ paneId: 'w1:p1', source: 'gjc:owner', seq: 0, ...patch }), { code: 'HERDR_INVALID_REQUEST' });
+    }
+    for (const patch of [
+      { state: 'done' }, { providerSessionId: undefined }, { providerSessionId: '' },
+      { providerSessionId: 'native\nid' }, { providerSessionId: 'native id' }, { providerSessionId: 'x'.repeat(257) },
+      { agent: 'pi' }, { agent_session_id: 'other' }, { agent_session_path: '/private/session' },
+      { prompt: 'private' }, { token: 'private' },
+    ]) {
+      await assert.rejects(client.reportAgent({ ...agentReport, ...patch } as HerdrReportAgentInput), { code: 'HERDR_INVALID_REQUEST' });
+    }
+    await assert.rejects(client.releaseAgent({ paneId: 'w1:p1', source: 'gjc:owner', seq: 0, providerSessionId: 'native' } as HerdrReleaseAgentInput), { code: 'HERDR_INVALID_REQUEST' });
+    assert.equal(connects, 0);
+  });
+
+  it('rejects malformed metadata identity reports before connecting', async () => {
+    let connects = 0;
+    const client = new HerdrClient('/unused', () => { connects++; throw new Error('must not connect'); });
+    const base: HerdrReportMetadataInput = {
+      paneId: 'w1:p1',
+      source: 'gajae-owner:generation',
+      seq: 0,
+      tokens: {
+        gajae_native_session_id: 'native',
+        gajae_owner_generation: 'generation',
+        gajae_app_session_id: 'app',
+      },
+    };
+    for (const patch of [
+      { seq: -1 }, { seq: 0.5 }, { seq: Number.MAX_SAFE_INTEGER + 1 }, { seq: NaN }, { seq: Infinity },
+      { source: '' }, { source: 'owner\n' }, { source: 'owner\0' }, { source: 'owner name' },
+      { source: '한' }, { source: 'x'.repeat(81) }, { paneId: '' },
+      { tokens: {} },
+      { tokens: { unknown: 'value' } },
+      { tokens: { gajae_native_session_id: 'native', gajae_owner_generation: 'generation', gajae_app_session_id: 'app', extra: 'value' } },
+      { tokens: { ['gajae_native_session_id'.repeat(2)]: 'native' } },
+      { tokens: { gajae_native_session_id: 123, gajae_owner_generation: 'generation' } },
+      { tokens: { gajae_native_session_id: 'n'.repeat(81), gajae_owner_generation: 'generation' } },
+      { tokens: { gajae_native_session_id: ' native ', gajae_owner_generation: 'generation' } },
+      { tokens: { gajae_native_session_id: 'native', gajae_owner_generation: null } },
+      { tokens: { gajae_native_session_id: null, gajae_owner_generation: null, gajae_app_session_id: 'app' } },
+      { tokens: { gajae_native_session_id: 'native', gajae_owner_generation: 'generation', gajae_app_session_id: null } },
+      { tokens: { gajae_app_session_id: 'app' } },
+      { agent_session_path: '/private/session' },
+      { token: 'private' },
+    ]) {
+      await assert.rejects(client.reportMetadata({ ...base, ...patch } as HerdrReportMetadataInput), { code: 'HERDR_INVALID_REQUEST' });
+    }
+    assert.equal(connects, 0);
+  });
+
+  it('never treats malformed, non-ok, or RPC error metadata replies as success', async () => {
+    for (const response of [
+      { result: null }, { result: {} }, { result: { type: 'accepted' } },
+      { result: { type: 'ok', extra: true } }, { result: { type: 'ok', error: 'failed' } },
+      { error: { code: 'invalid_request', message: 'rejected' } },
+    ]) {
+      const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+        socket.reply({ id: JSON.parse(line).id, ...response });
+      }));
+      const code = 'error' in response ? 'HERDR_RPC_ERROR' : 'HERDR_INVALID_RESPONSE';
+      await assert.rejects(client.reportAgent(agentReport), { code });
+      await assert.rejects(client.releaseAgent({ paneId: 'w1:p1', source: 'gjc:owner', seq: 1 }), { code });
+    }
+  });
+
+  it('checks metadata ownership after admission and refuses dispatch when ownership changes', async () => {
+    for (const report of [true, false]) {
+      const events: string[] = [];
+      const socket = new FakeSocket(() => { events.push('write'); });
+      const client = new HerdrClient('/unused', () => socket);
+      let owned = true;
+      const guard = {
+        admit: async () => { events.push('admit'); await Promise.resolve(); owned = false; },
+        check: () => {
+          events.push('check');
+          if (!owned) throw new HerdrError('HERDR_CANCELLED', 499, 'Ownership changed.');
+        },
+      };
+      await assert.rejects(report
+        ? client.reportAgent(agentReport, undefined, guard)
+        : client.releaseAgent({ paneId: 'w1:p1', source: 'gjc:owner', seq: 1 }, undefined, guard),
+      { code: 'HERDR_CANCELLED' });
+      assert.deepEqual(events, ['admit', 'check']);
+      assert.equal(socket.writes.length, 0);
+      assert.equal(socket.destroyed, true);
+    }
+  });
+
+  it('decodes Herdr agent_session ID records and never exposes path records', async () => {
+    const idRecord = { source: 'gajae-owner:generation', agent: 'gjc', kind: 'id', value: 'native-id' };
+    const pathRecord = { source: 'foreign', agent: 'pi', kind: 'path', value: '/private/session' };
+    for (const record of [idRecord, pathRecord, null, undefined, 123, {}, { ...idRecord, value: 123 }]) {
+      const snapshot = managedSnapshot();
+      const pane = { ...snapshot.panes[0], agent_session: record };
+      const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+        socket.reply({ id: JSON.parse(line).id, result: { type: 'session_snapshot', snapshot: { ...snapshot, panes: [pane] } } });
+      }));
+      if (record === idRecord || record === pathRecord || record == null) {
+        const decoded = await client.snapshot();
+        assert.deepEqual(decoded.panes[0]?.agent_session, record === idRecord ? idRecord : undefined);
+        assert.equal('agent_session_path' in decoded.panes[0]!, false);
+        assert.equal(JSON.stringify(decoded).includes('/private/session'), false);
+      } else await assert.rejects(client.snapshot(), { code: 'HERDR_INVALID_RESPONSE' });
+    }
+  });
+
+  it('decodes pane metadata tokens without requiring an agent_session and retains foreign keys', async () => {
+    const snapshot = managedSnapshot();
+    const tokens = {
+      ...Object.fromEntries(Array.from({ length: 28 }, (_, index) => [`foreign_${index}`, 'untouched'])),
+      gajae_native_session_id: 'native-session-123',
+      gajae_owner_generation: 'owner-generation',
+      gajae_app_session_id: 'app-session',
+      foreign_agent_token: 'preserved',
+    };
+    const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+      const request = JSON.parse(line);
+      socket.reply({ id: request.id, result: {
+        type: 'session_snapshot',
+        snapshot: { ...snapshot, panes: [{ ...snapshot.panes[0], tokens }] },
+      } });
+    }));
+
+    const decoded = await client.snapshot();
+    assert.deepEqual(decoded.panes[0]?.tokens, tokens);
+    assert.equal('agent_session' in decoded.panes[0]!, false);
+  });
+
+  it('rejects malformed pane metadata token snapshots', async () => {
+    for (const tokens of [
+      null,
+      { gajae_native_session_id: null },
+      { gajae_native_session_id: 'native', gajae_owner_generation: 123 },
+      { ['invalid key']: 'value' },
+      Object.fromEntries(Array.from({ length: 33 }, (_, index) => [`key_${index}`, 'value'])),
+    ]) {
+      const snapshot = managedSnapshot();
+      const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => socket.reply({
+        id: JSON.parse(line).id,
+        result: { type: 'session_snapshot', snapshot: { ...snapshot, panes: [{ ...snapshot.panes[0], tokens }] } },
+      })));
+      await assert.rejects(client.snapshot(), { code: 'HERDR_INVALID_RESPONSE' });
+    }
+  });
+
+  const managedSnapshot = () => ({
+    version: 'test', protocol: 19, layouts: [], agents: [],
+    workspaces: [{ workspace_id: 'w1', number: 1, label: 'Owned', focused: false, pane_count: 1, tab_count: 1, active_tab_id: 'w1:t1', agent_status: 'idle' }],
+    tabs: [{ tab_id: 'w1:t1', workspace_id: 'w1', number: 1, label: '1', focused: false, pane_count: 1, agent_status: 'idle' }],
+    panes: [{ pane_id: 'w1:p1', terminal_id: 'term1', workspace_id: 'w1', tab_id: 'w1:t1', focused: false, agent_status: 'idle' }],
+  });
+
+  it('creates only unfocused workspaces and validates frozen mapped receipts', async () => {
+    const snap = managedSnapshot();
+    const result = { type: 'workspace_created', workspace: snap.workspaces[0], tab: snap.tabs[0], root_pane: snap.panes[0] };
+    const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+      const request = JSON.parse(line);
+      assert.equal(request.method, 'workspace.create');
+      assert.deepEqual(request.params, { cwd: '/repo', label: 'Owned', env: {}, focus: false });
+      socket.reply({ id: request.id, result });
+    }));
+    const receipt = await client.createWorkspace('/repo', 'Owned');
+    assert.deepEqual(receipt, { workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term1' });
+    assert.ok(Object.isFrozen(receipt));
+    for (const bad of [{ ...result, type: 'ok' }, { ...result, root_pane: {} }, { ...result, tab: { ...result.tab, workspace_id: 'foreign' } }]) {
+      const malformed = new HerdrClient('/unused', () => new FakeSocket((line, socket) => socket.reply({ id: JSON.parse(line).id, result: bad })));
+      await assert.rejects(malformed.createWorkspace('/repo', 'Owned'), { code: 'HERDR_INVALID_RESPONSE' });
+    }
+  });
+
+  it('appends layout without tab_id, preserves argv, and resolves exact terminal mapping', async () => {
+    const argv = ['/path with spaces/bun', 'host.ts', '--value', 'quotes " $ ; 한'];
+    const methods: string[] = [];
+    const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+      const request = JSON.parse(line);
+      methods.push(request.method);
+      if (request.method === 'layout.apply') {
+        assert.deepEqual(request.params, { workspace_id: 'w1', focus: false, root: { type: 'pane', command: argv, cwd: '/repo', env: {} } });
+        assert.equal('tab_id' in request.params, false);
+        socket.reply({ id: request.id, result: { type: 'layout_apply', layout: { workspace_id: 'w1', tab_id: 'w1:t1', zoomed: false, focused_pane_id: 'w1:p1', root: { type: 'pane', pane_id: 'w1:p1' } } } });
+      } else socket.reply({ id: request.id, result: { type: 'session_snapshot', snapshot: managedSnapshot() } });
+    }));
+    const receipt = await client.applyLayout('w1', argv, '/repo');
+    assert.equal(receipt.terminalId, 'term1');
+    assert.ok(Object.isFrozen(receipt));
+    assert.deepEqual(methods, ['layout.apply', 'session.snapshot']);
+  });
+
+  it('rejects malformed layout receipts without retries or snapshot guesses', async () => {
+    for (const layout of [
+      { workspace_id: 'foreign', tab_id: 'w1:t1', zoomed: false, focused_pane_id: 'w1:p1', root: { type: 'pane', pane_id: 'w1:p1' } },
+      { workspace_id: 'w1', tab_id: 'foreign:t1', zoomed: false, focused_pane_id: 'w1:p1', root: { type: 'pane', pane_id: 'w1:p1' } },
+      { workspace_id: 'w1', tab_id: 'w1:t1', zoomed: false, focused_pane_id: 'w1:p1', root: { type: 'pane' } },
+    ]) {
+      let writes = 0;
+      const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+        writes++;
+        socket.reply({ id: JSON.parse(line).id, result: { type: 'layout_apply', layout } });
+      }));
+      await assert.rejects(client.applyLayout('w1', ['bun'], '/repo'), { code: 'HERDR_INVALID_RESPONSE' });
+      assert.equal(writes, 1);
+    }
+  });
+
+  it('keeps layout outcome unknown when the follow-up snapshot maps the pane elsewhere', async () => {
+    let writes = 0;
+    const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+      const request = JSON.parse(line);
+      writes++;
+      const snap = managedSnapshot();
+      snap.panes[0]!.tab_id = 'w1:foreign';
+      socket.reply({ id: request.id, result: request.method === 'layout.apply'
+        ? { type: 'layout_apply', layout: { workspace_id: 'w1', tab_id: 'w1:t1', zoomed: false, focused_pane_id: 'w1:p1', root: { type: 'pane', pane_id: 'w1:p1' } } }
+        : { type: 'session_snapshot', snapshot: snap } });
+    }));
+    await assert.rejects(client.applyLayout('w1', ['bun'], '/repo'), { code: 'HERDR_INVALID_RESPONSE' });
+    assert.equal(writes, 2);
+  });
+
   it('uses one string-id JSON RPC and decodes session snapshots', async () => {
     let socket!: FakeSocket;
     const client = new HerdrClient('/tmp/herdr.sock', () => {

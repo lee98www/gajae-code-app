@@ -76,6 +76,7 @@
     "queue": {
       "sendNext": "Metti in coda un altro messaggio",
       "label": "In coda",
+      "paused": "Coda in pausa",
       "willSend": "Invia al termine dell'esecuzione corrente",
       "willFollow": "Invia dopo i messaggi sopra",
       "edit": "Modifica elemento in coda",

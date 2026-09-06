@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 
 import { act, cleanup, renderHook } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import type { PropsWithChildren } from 'react';
 
 import type { Project, ProjectSession } from '../../../types/app';
-import { draftInputKey } from '../utils/chatStorage';
+import { draftInputKey, readQueuedMessages, writeQueuedMessages } from '../utils/chatStorage';
 
 import { useChatComposerState } from './useChatComposerState';
 
@@ -26,6 +28,7 @@ const project: Project = {
 const session = (id: string): ProjectSession => ({ id, summary: `Session ${id}` } as ProjectSession);
 
 const baseArgs = {
+  managedSession: false,
   selectedProject: project,
   selectedSession: null as ProjectSession | null,
   currentSessionId: null as string | null,
@@ -33,18 +36,20 @@ const baseArgs = {
   isLoading: false,
   canAbortSession: false,
   tokenBudget: null,
-  sendMessage: () => undefined,
+  sendMessage: (_message: unknown): void => undefined,
   scrollToBottom: () => undefined,
-  addMessage: () => undefined,
+  addMessage: (_message: unknown): void => undefined,
   setIsUserScrolledUp: () => undefined,
   setPendingPermissionRequests: () => undefined,
 };
 
-const composer = (overrides: Partial<typeof baseArgs> = {}) =>
-  renderHook(
+const composer = (overrides: Partial<typeof baseArgs> = {}) => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return renderHook(
     (props: Partial<typeof baseArgs>) => useChatComposerState({ ...baseArgs, ...props } as never),
-    { initialProps: overrides },
+    { initialProps: overrides, wrapper: ({ children }: PropsWithChildren) => <QueryClientProvider client={client}>{children}</QueryClientProvider> },
   );
+};
 
 // The composer fetches slash commands and mentionable files on mount. There is
 // no server here, and a real socket error is noise that has nothing to do with
@@ -126,4 +131,55 @@ test('clearing the composer removes the stored draft rather than storing an empt
   act(() => { view.result.current.setInput(''); });
 
   assert.equal(localStorage.getItem(draftInputKey('proj-1', 'session-a')), null);
+});
+
+for (const isLoading of [true, false]) {
+  test(`managed submit is host authoritative when loading=${isLoading}`, async () => {
+    const sent: unknown[] = [];
+    const added: unknown[] = [];
+    writeQueuedMessages('managed-a', [{ content: 'stale local queue' }]);
+    const props = {
+      managedSession: true,
+      selectedSession: session('managed-a'),
+      isLoading,
+      sendMessage: (message: unknown) => { sent.push(message); },
+      addMessage: (message: unknown) => { added.push(message); },
+    };
+    const view = composer(props);
+    act(() => { view.result.current.handleVoiceTranscript('host queued prompt'); });
+    await act(async () => {
+      await Promise.all([
+        view.result.current.handleSubmit({ preventDefault() {} } as never),
+        view.result.current.handleSubmit({ preventDefault() {} } as never),
+      ]);
+    });
+    view.rerender({ ...props, isLoading: false });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 850)); });
+    assert.equal(sent.length, 1);
+    assert.equal((sent[0] as { content: string }).content, 'host queued prompt');
+    assert.deepEqual(added, []);
+    assert.deepEqual(view.result.current.queuedDrafts, []);
+    assert.deepEqual(readQueuedMessages('managed-a'), []);
+  });
+}
+
+test('managed state arriving and switching sessions discard stale local queues without flushing', async () => {
+  const sent: unknown[] = [];
+  const props = {
+    selectedSession: session('session-a'),
+    isLoading: true,
+    sendMessage: (message: unknown) => { sent.push(message); },
+  };
+  writeQueuedMessages('session-a', [{ content: 'old A queue' }]);
+  writeQueuedMessages('session-b', [{ content: 'old B queue' }]);
+  const view = composer(props);
+  assert.equal(view.result.current.queuedDrafts.length, 1);
+  view.rerender({ ...props, managedSession: true, isLoading: false });
+  assert.deepEqual(view.result.current.queuedDrafts, []);
+  assert.deepEqual(readQueuedMessages('session-a'), []);
+  view.rerender({ ...props, selectedSession: session('session-b'), managedSession: true, isLoading: false });
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 850)); });
+  assert.deepEqual(view.result.current.queuedDrafts, []);
+  assert.deepEqual(readQueuedMessages('session-b'), []);
+  assert.deepEqual(sent, []);
 });

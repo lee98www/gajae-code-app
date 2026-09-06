@@ -1,13 +1,12 @@
-import path from 'node:path';
-
 import type { WebSocket } from 'ws';
 
-import { sessionsDb } from '@/modules/database/index.js';
+import { sessionsDb, getConnection, herdrManagedProvisionDb } from '@/modules/database/index.js';
+import type { HerdrManagedChatService } from '@/modules/herdr/index.js';
 import { grantProjectAlwaysAllow, resolveProjectRunPermissions } from '@/modules/projects/index.js';
 import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
 import { connectedClients, WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
 import type { GjcJobProjectionService } from '@/modules/websocket/services/gjc-job-projection.service.js';
-import { getGlobalImageAssetsDir, normalizeImageDescriptors } from '@/shared/image-attachments.js';
+import { filterImagesToUploadStore } from '@/shared/image-attachments.js';
 import type { AnyRecord, AuthenticatedWebSocketRequest, LLMProvider } from '@/shared/types.js';
 import { createNormalizedMessage, parseIncomingJsonObject } from '@/shared/utils.js';
 
@@ -30,6 +29,7 @@ type ChatWebSocketDependencies = {
   grantAlwaysAllow?: (projectPath: string, toolName: string) => unknown;
   gjcProjection?: GjcJobProjectionService;
   oauthSupervisor?: OAuthSupervisor;
+  managedChat?: Pick<HerdrManagedChatService, 'isManaged' | 'handle' | 'detach'>;
 };
 type OAuthAttemptOwner = { attemptId: string; userKey: string; };
 
@@ -40,19 +40,7 @@ const asRecord = (value: unknown): AnyRecord | null => value !== null && typeof 
 const oauthKey = (userId: string | number | null): string => `${typeof userId}:${String(userId)}`;
 const ownershipError = (): AnyRecord => ({ ok: false, error: { code: 'oauth_attempt_not_owner', message: 'OAuth request failed.' } });
 
-export function filterImagesToUploadStore(images: unknown, assetsRootOverride?: string): AnyRecord[] {
-  const assetRoot = path.resolve(assetsRootOverride ?? getGlobalImageAssetsDir());
-  return normalizeImageDescriptors(images).filter(({ path: imagePath }) => {
-    const relativePath = path.relative(assetRoot, path.resolve(assetRoot, imagePath));
-    const isStoredAsset = relativePath.length > 0
-      && !relativePath.startsWith('..')
-      && !path.isAbsolute(relativePath)
-      && !relativePath.includes(path.sep)
-      && !relativePath.includes('/');
-    if (!isStoredAsset) console.warn(`[Chat] Dropping image outside the upload store: ${imagePath}`);
-    return isStoredAsset;
-  });
-}
+export { filterImagesToUploadStore } from '@/shared/image-attachments.js';
 
 async function defaultResolveSessionModel(provider: LLMProvider, sessionId: string, requestedModel?: string | null, options?: { firstTurn?: boolean }): Promise<string | undefined> {
   const { providerModelsService } = await import('@/modules/providers/index.js');
@@ -226,12 +214,13 @@ async function abortChat(ws: WebSocket, data: AnyRecord, dependencies: ChatWebSo
   chatRunRegistry.completeRun(sessionId, { exitCode: succeeded ? 0 : 1, aborted: true });
 }
 
-function subscribeChat(ws: WebSocket, data: AnyRecord, dependencies: ChatWebSocketDependencies): void {
+async function subscribeChat(ws: WebSocket, data: AnyRecord, dependencies: ChatWebSocketDependencies, userId: string | number | null): Promise<void> {
   const subscriptions = Array.isArray(data.sessions) ? data.sessions : [];
   for (const subscription of subscriptions) {
     const request = asRecord(subscription);
     const sessionId = typeof request?.sessionId === 'string' ? request.sessionId.trim() : '';
     if (!request || !sessionId) continue;
+    if (await routeManagedChat(ws, { ...data, sessions: [request], sessionId }, userId, dependencies)) continue;
 
     const rawSequence = request.lastSeq;
     const lastSeq = typeof rawSequence === 'number' && Number.isFinite(rawSequence) ? Math.max(0, Math.floor(rawSequence)) : 0;
@@ -249,6 +238,33 @@ function subscribeChat(ws: WebSocket, data: AnyRecord, dependencies: ChatWebSock
       for (const event of chatRunRegistry.replayEvents(sessionId, lastSeq)) sendFrame(ws, event);
     }
   }
+}
+
+async function routeManagedChat(ws: WebSocket, data: AnyRecord, userId: string | number | null, dependencies: ChatWebSocketDependencies): Promise<boolean> {
+  let sessionId = requiredSessionId(data);
+  try {
+    if (dependencies.managedChat) {
+      if (await dependencies.managedChat.handle(ws, data, userId)) return true;
+      if (!sessionId || !dependencies.managedChat.isManaged(sessionId)) return false;
+    } else {
+      const requestOwner = data.type === 'chat.permission-response' && typeof data.requestId === 'string'
+        ? getConnection().prepare(`
+            SELECT app_session_id FROM herdr_managed_decisions WHERE request_id = ?
+            UNION ALL
+            SELECT state.app_session_id FROM herdr_managed_state AS state,
+              json_each(state.state_json, '$.automation') AS operation
+              WHERE json_extract(operation.value, '$.approvalRequestId') = ?
+            LIMIT 1
+          `).get(data.requestId, data.requestId) as { app_session_id: string } | undefined
+        : null;
+      if (!requestOwner && (!sessionId || herdrManagedProvisionDb.projectPath(sessionId) === null)) return false;
+      sessionId ??= requestOwner?.app_session_id ?? null;
+    }
+  } catch {
+    // A failed ownership check or managed command can never authorize a local run.
+  }
+  sendFrame(ws, { kind: 'managed_command_result', sessionId, actionId: typeof data.actionId === 'string' ? data.actionId : null, requestId: typeof data.requestId === 'string' ? data.requestId : null, result: { ok: false, status: 'unknown', error: 'Managed owner unavailable; no local command was started.' } });
+  return true;
 }
 
 function permissionResponse(data: AnyRecord, dependencies: ChatWebSocketDependencies): void {
@@ -334,7 +350,7 @@ export function handleChatConnection(ws: WebSocket, request: AuthenticatedWebSoc
     'chat.send': (data) => sendChat(ws, userId, data, dependencies),
     'chat.abort': (data) => abortChat(ws, data, dependencies),
     'chat.steer': (data) => steerChat(ws, data, dependencies),
-    'chat.subscribe': (data) => subscribeChat(ws, data, dependencies),
+    'chat.subscribe': (data) => subscribeChat(ws, data, dependencies, userId),
     'chat.permission-response': (data) => permissionResponse(data, dependencies),
   };
 
@@ -353,6 +369,7 @@ export function handleChatConnection(ws: WebSocket, request: AuthenticatedWebSoc
       }
 
       const handler = chatHandlers[type];
+      if (type.startsWith('chat.') && type !== 'chat.subscribe' && await routeManagedChat(ws, data, userId, dependencies)) return;
       if (handler) await handler(data);
       else protocolFailure(ws, 'UNKNOWN_MESSAGE_TYPE', `Unknown message type "${type}".`);
     } catch (error) {
@@ -364,6 +381,7 @@ export function handleChatConnection(ws: WebSocket, request: AuthenticatedWebSoc
   ws.on('close', () => {
     console.log('[INFO] Chat client disconnected');
     unsubscribe();
+    dependencies.managedChat?.detach(ws);
     connectedClients.delete(ws);
     chatRunRegistry.detachConnection(ws);
   });

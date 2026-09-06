@@ -49,7 +49,9 @@ function normalizeLocalMessage(message: ChatMessage, sessionId: string): Normali
     : typeof message.timestamp === 'number'
       ? new Date(message.timestamp).toISOString()
       : String(message.timestamp);
-  const common = { id, sessionId, timestamp, provider: 'gjc' as LLMProvider };
+  const common = { id, sessionId, timestamp, provider: 'gjc' as LLMProvider,
+    ...(typeof message.actionId === 'string' ? { actionId: message.actionId } : {}),
+  };
 
   if (message.isToolUse) {
     return { ...common, kind: 'tool_use', toolName: message.toolName, toolInput: message.toolInput, toolId: message.toolId || id };

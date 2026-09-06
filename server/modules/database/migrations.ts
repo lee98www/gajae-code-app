@@ -221,6 +221,7 @@ function mergeLegacySessionNames(database: Database): void {
 
 function addProviderMapping(database: Database): void {
   const names = new Set(columnsOf(database, 'sessions').map(({ name }) => name));
+  if (names.has('provider_session_id')) return;
   addMissingColumn(database, 'sessions', names, 'provider_session_id', 'TEXT');
   database.exec('UPDATE sessions SET provider_session_id = session_id WHERE provider_session_id IS NULL');
 }

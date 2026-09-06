@@ -6,6 +6,7 @@ import { act, cleanup, render } from '@testing-library/react';
 import { createElement } from 'react';
 
 import { useLastTurnChanges, type LastTurnFile } from '../components/workspace/hooks/useLastTurnChanges';
+import type { ManagedChatRecord } from '../../shared/herdr-managed-chat';
 
 import { useSessionStore, type SessionSlot, type SessionStore } from './useSessionStore';
 
@@ -37,6 +38,38 @@ function createStore(): SessionStore {
 }
 
 afterEach(cleanup);
+
+test('managed windows exceed the realtime cap without duplicating fetched tools or accepted optimistic prompts', () => {
+  const { store, queryClient } = createHarness();
+  const records: ManagedChatRecord[] = Array.from({ length: 601 }, (_, index) => ({
+    id: `g:${index}`, sessionId: 'managed', ownerGeneration: 'g', providerSessionId: 'p', turnId: 'turn',
+    timestamp: '', provider: 'gjc', kind: 'text', role: 'assistant', content: `answer ${index}`,
+  }));
+  records.push({ ...records[0], id: 'g:tool', kind: 'tool_use', toolId: 'tool', toolName: 'write', toolInput: { path: 'a' } });
+  queryClient.setQueryData(['messages', 'managed'], {
+    messages: [{ ...records.at(-1), id: 'disk-tool', ownerGeneration: undefined },
+      { ...records[0], id: 'disk-answer', ownerGeneration: undefined },
+      { ...records[0], id: 'old-history', ownerGeneration: undefined, content: 'older history' }],
+    total: 3, hasMore: false, offset: 3,
+  });
+  act(() => {
+    store.appendRealtime('managed', { id: 'local_prompt', sessionId: 'managed', provider: 'gjc', kind: 'text', role: 'user',
+      timestamp: '', content: 'prompt', actionId: 'action' });
+    store.appendRealtime('other', { id: 'other', sessionId: 'other', provider: 'gjc', kind: 'text', timestamp: '', content: 'untouched' });
+    store.replaceManagedProjection('managed', records);
+  });
+  assert.equal(store.getMessages('managed').length, 604);
+  assert.equal(store.getMessages('managed').filter(r => r.toolId === 'tool').length, 1);
+  assert.equal(store.getMessages('managed').filter(r => r.content === 'answer 0').length, 2); // text and tool input record
+  assert.equal(store.getMessages('other')[0].content, 'untouched');
+  act(() => store.replaceManagedProjection('managed', [...records, { ...records[0], id: 'g:user', role: 'user', content: 'prompt', actionId: 'action' }]));
+  assert.equal(store.getMessages('managed').filter(r => r.content === 'prompt').length, 1);
+  const stable = store.getMessages('managed');
+  assert.equal(store.getMessages('managed'), stable);
+  act(() => store.replaceManagedProjection('managed', [{ ...records[0], ownerGeneration: 'next', id: 'next:1', content: 'replacement' }]));
+  assert.equal(store.getMessages('managed').some(r => r.id === 'g:600'), false);
+  assert.equal(store.getMessages('managed').some(r => r.id === 'old-history'), true);
+});
 
 test('a shared session store exposes completed mutations to the Last turn hook', () => {
   let store: SessionStore | undefined;

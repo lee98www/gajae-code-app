@@ -22,6 +22,8 @@
     "server/gjc-cli.js",
     "server/gjc-command-surface.generated.ts",
     "server/gjc-export-path.ts",
+    "server/gjc-herdr-automation-broker.ts",
+    "server/gjc-herdr-managed-child.ts",
     "server/gjc-model-resolution.ts",
     "server/gjc-permission-policy.ts",
     "server/gjc-runtime-manifest.ts",
@@ -65,6 +67,21 @@
     "server/gjc-engine-manifest.test.ts": "Keeps this manifest honest against the tree. It describes the split rather than either side of it.",
     "server/gjc-live-session-root.test.ts": "Asserts where the application looks for live session transcripts, not how the engine writes them.",
     "server/gjc-worker-client.test.ts": "Covers the application-side client above.",
-    "server/gjc-worker-protocol-spec.test.ts": "Checks the published protocol specification against the codec. Travels with whichever repository publishes the specification; listed here so the choice is deliberate."
+    "server/gjc-worker-protocol-spec.test.ts": "Checks the published protocol specification against the codec. Travels with whichever repository publishes the specification; listed here so the choice is deliberate.",
+    "server/gjc-herdr-automation-store.ts": "Application-owned protected SQLite persistence for managed automation; it depends on the App storage and is not part of the Bun SDK engine.",
+    "server/gjc-herdr-automation.bun.test.ts": "Cross-process managed automation integration exercises the App bridge ledger as well as the SDK; this application contract test stays with the App.",
+    "server/gjc-herdr-bootstrap.test.ts": "Tests App database compatibility and protected launch descriptors before constructing a managed SDK owner.",
+    "server/gjc-herdr-child-client.ts": "The Node application's private transport to the managed Bun child; owns App persistence acknowledgements, not SDK execution.",
+    "server/gjc-herdr-child-client.test.ts": "Verifies application transport correlation, bounded framing and persistence barriers across the managed child boundary.",
+    "server/gjc-herdr-host-evidence.test.ts": "Exercises App-owned protected storage and the automation bridge ledger while retaining a managed SDK continuation.",
+    "server/gjc-herdr-host-foundations.test.ts": "Covers managed application host queue, policy, client attachment and snapshot persistence using the App database.",
+    "server/gjc-herdr-installed-launch.test.ts": "Verifies the App's installed-application authorization, dispatch and reconciliation with a retained host callback.",
+    "server/gjc-herdr-managed-child.bun.test.ts": "Application integration harness for the managed child protocol and retained SDK lifecycle, including App-side admission expectations.",
+    "server/gjc-herdr-offline-init.bun.test.ts": "Tests the App's fixed managed Bun entrypoint and offline stored-credential startup contract rather than the runtime package in isolation.",
+    "server/gjc-herdr-task-console.ts": "Human terminal frontend to App-owned host commands and receipts; remains separate from private engine event transport.",
+    "server/gjc-herdr-task-console.test.ts": "Tests the managed App console grammar, bounded input and safe presentation independent of the SDK engine.",
+    "server/gjc-herdr-task-console-pty.test.ts": "Verifies the App-owned physical terminal line discipline and independent host/private SDK lifetime through a real PTY.",
+    "server/gjc-herdr-task-host.ts": "Independent Node App host entrypoint owns SQLite, attach clients and launch lifecycle; only its private Bun child belongs to the SDK engine.",
+    "server/gjc-herdr-task-host.test.ts": "Tests App host claims, durable commands and connection lifetime against private child execution."
   }
 }

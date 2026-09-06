@@ -7,9 +7,9 @@ import test from 'node:test';
 
 import { WebSocket, WebSocketServer } from 'ws';
 
-import { closeConnection, initializeDatabase, projectPermissionsDb, sessionsDb } from '@/modules/database/index.js';
+import { closeConnection, initializeDatabase, projectPermissionsDb, sessionsDb, herdrManagedProvisionDb } from '@/modules/database/index.js';
 import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
-import { handleChatConnection } from '@/modules/websocket/services/chat-websocket.service.js';
+import { handleChatConnection as connectChat } from '@/modules/websocket/services/chat-websocket.service.js';
 import { connectedClients } from '@/modules/websocket/services/websocket-state.service.js';
 
 type OutboundFrame = {
@@ -45,6 +45,137 @@ class FakeWebSocket extends EventEmitter {
 }
 
 const flushMessages = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+function handleChatConnection(...[socket, request, dependencies]: Parameters<typeof connectChat>): void {
+  connectChat(socket, request, {
+    managedChat: { isManaged: () => false, handle: async () => false, detach() {} },
+    ...dependencies,
+  });
+}
+
+test('managed normal chat routes send, controls and sessionless permissions without local runtime or grants', async () => {
+  await withIsolatedDatabase(async () => {
+    sessionsDb.createAppSession('managed-chat', 'gjc', '/workspace/managed');
+    herdrManagedProvisionDb.registerNewSession('managed-chat', '/workspace/managed');
+    const socket = new FakeWebSocket();
+    const calls: string[] = [];
+    let detached = 0;
+    const unexpected = () => { assert.fail('Managed chat must not enter the local runtime'); };
+    connectChat(socket as unknown as WebSocket, { user: { id: 'user-1' } } as never, {
+      spawnFns: { gjc: unexpected },
+      abortFns: { gjc: unexpected },
+      steerFns: { gjc: unexpected },
+      resolveToolApproval: unexpected,
+      grantAlwaysAllow: unexpected,
+      getPendingApprovalsForSession: unexpected,
+      managedChat: {
+        isManaged: id => id === 'managed-chat',
+        async handle(connection, data, userId) {
+          assert.equal(userId, 'user-1');
+          calls.push(String(data.type));
+          connection.send(JSON.stringify({ kind: 'managed_command_result', sessionId: 'managed-chat', actionId: data.actionId ?? null, requestId: data.requestId ?? null, result: { ok: false, status: data.type === 'chat.send' ? 'missing_selected' : 'unknown' } }));
+          return true;
+        },
+        detach() { detached++; },
+      },
+    });
+    for (const data of [
+      { type: 'chat.send', sessionId: 'managed-chat', content: 'first' },
+      { type: 'chat.send', sessionId: 'managed-chat', content: 'busy followup' },
+      { type: 'chat.steer', sessionId: 'managed-chat', content: 'change' },
+      { type: 'chat.abort', sessionId: 'managed-chat' },
+      { type: 'chat.permission-response', requestId: 'durable-request', allow: true, always: true },
+    ]) {
+      socket.emit('message', JSON.stringify(data));
+      await flushMessages();
+    }
+    assert.deepEqual(calls, ['chat.send', 'chat.send', 'chat.steer', 'chat.abort', 'chat.permission-response']);
+    assert.equal(chatRunRegistry.getRun('managed-chat'), undefined);
+    assert.equal(socket.sent.length, 5);
+    assert.ok(socket.sent.every(frame => frame.kind === 'managed_command_result'));
+    for (const [index, frame] of socket.sent.entries()) {
+      assert.equal(frame.ok, undefined);
+      assert.deepEqual(frame.result, { ok: false, status: index < 2 ? 'missing_selected' : 'unknown' });
+    }
+    socket.emit('close');
+    assert.equal(detached, 1);
+  });
+});
+
+test('managed subscriptions recover without a local run and do not skip mixed legacy subscriptions', async () => {
+  const socket = new FakeWebSocket();
+  const managedSubscriptions: string[] = [];
+  handleChatConnection(socket as unknown as WebSocket, {} as never, {
+    spawnFns: {} as never, abortFns: {} as never,
+    resolveToolApproval() {}, getPendingApprovalsForSession: () => [],
+    managedChat: {
+      isManaged: id => id.startsWith('managed-'),
+      async handle(connection, data) {
+        const id = String(data.sessionId);
+        if (!id.startsWith('managed-')) return false;
+        managedSubscriptions.push(id);
+        connection.send(JSON.stringify({ kind: 'managed_ui_status', sessionId: id, status: 'running' }));
+        return true;
+      },
+      detach() {},
+    },
+  });
+  socket.emit('message', JSON.stringify({ type: 'chat.subscribe', sessions: [
+    { sessionId: 'managed-first', lastSeq: 9 }, { sessionId: 'legacy-imported' }, { sessionId: 'managed-last' },
+  ] }));
+  await flushMessages();
+  assert.deepEqual(managedSubscriptions, ['managed-first', 'managed-last']);
+  assert.deepEqual(socket.sent.map(frame => [frame.kind, frame.sessionId]), [
+    ['managed_ui_status', 'managed-first'], ['chat_subscribed', 'legacy-imported'], ['managed_ui_status', 'managed-last'],
+  ]);
+  socket.emit('close');
+});
+
+test('managed registrations fail closed without the coordinator while imported GJC still spawns', async () => {
+  await withIsolatedDatabase(async () => {
+    sessionsDb.createAppSession('registered', 'gjc', '/workspace/managed');
+    herdrManagedProvisionDb.registerNewSession('registered', '/workspace/managed');
+    sessionsDb.createAppSession('imported', 'gjc', '/workspace/imported');
+    sessionsDb.assignProviderSessionId('imported', 'gjc', 'native-imported');
+    const socket = new FakeWebSocket();
+    const spawns: string[] = [];
+    connectChat(socket as unknown as WebSocket, {} as never, {
+      spawnFns: { gjc: async (content) => { spawns.push(content); } },
+      abortFns: { gjc: () => false }, resolveToolApproval() {},
+      getPendingApprovalsForSession: () => [], resolveSessionModel: async () => undefined,
+      resolveRunPermissions: () => ({}),
+    });
+    socket.emit('message', JSON.stringify({ type: 'chat.send', sessionId: 'registered', content: 'managed' }));
+    await flushMessages();
+    assert.equal(socket.sent[0]?.kind, 'managed_command_result');
+    assert.deepEqual(socket.sent[0]?.result, { ok: false, status: 'unknown', error: 'Managed owner unavailable; no local command was started.' });
+    assert.deepEqual(spawns, []);
+    socket.emit('message', JSON.stringify({ type: 'chat.send', sessionId: 'imported', content: 'legacy' }));
+    await flushMessages();
+    assert.deepEqual(spawns, ['legacy']);
+    socket.emit('close');
+  });
+});
+
+test('a managed coordinator failure never becomes protocol_error or local spawn', async () => {
+  const socket = new FakeWebSocket();
+  handleChatConnection(socket as unknown as WebSocket, {} as never, {
+    spawnFns: { gjc: async () => { assert.fail('Unexpected spawn'); } },
+    abortFns: {} as never, resolveToolApproval() {}, getPendingApprovalsForSession: () => [],
+    managedChat: {
+      isManaged: () => true,
+      async handle() { throw new Error('private socket secret'); },
+      detach() {},
+    },
+  });
+  socket.emit('message', JSON.stringify({ type: 'chat.send', sessionId: 'managed', content: 'hello' }));
+  await flushMessages();
+  assert.equal(socket.sent.length, 1);
+  assert.equal(socket.sent[0]?.kind, 'managed_command_result');
+  assert.deepEqual(socket.sent[0]?.result, { ok: false, status: 'unknown', error: 'Managed owner unavailable; no local command was started.' });
+  assert.ok(!JSON.stringify(socket.sent).includes('private socket secret'));
+  socket.emit('close');
+});
 
 test('chat.subscribe recovers GJC approvals from the app session scope', async () => {
   const originalConnection = new FakeWebSocket();

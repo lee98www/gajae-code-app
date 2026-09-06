@@ -10,6 +10,7 @@ import { credentialsDb as credentials } from '@/modules/database/repositories/cr
 import {
   gjcTerminalNotificationDispatchesDb as terminalNotificationDispatches,
 } from '@/modules/database/repositories/gjc-terminal-notification-dispatches.js';
+import { herdrManagedDb as managedHerdr } from '@/modules/database/repositories/herdr-managed.db.js';
 import { githubTokensDb as githubTokens } from '@/modules/database/repositories/github-tokens.js';
 import {
   notificationChannelEndpointsDb as notificationChannelEndpoints,
@@ -37,6 +38,7 @@ export {
   databasePath as getDatabasePath,
   disconnect as closeConnection,
   githubTokens as githubTokensDb,
+  managedHerdr as herdrManagedDb,
   initialize as initializeDatabase,
   managedWorktreePath as isManagedWorktreePath,
   notificationChannelEndpoints as notificationChannelEndpointsDb,
@@ -49,3 +51,10 @@ export {
   terminalNotificationDispatches as gjcTerminalNotificationDispatchesDb,
   users as userDb,
 };
+
+// Managed host ownership and App projection are database contracts shared by
+// provider allocation, websocket routing and the Herdr orchestration module.
+export { herdrManagedProvisionDb } from './repositories/herdr-managed-provision.db.js';
+export type { ProvisionRecord } from './repositories/herdr-managed-provision.db.js';
+export { herdrManagedSnapshotsDb, createHerdrManagedSnapshotsDb } from './repositories/herdr-managed-snapshots.db.js';
+export type { ManagedRequestIdentity, ManagedSdkRequest, ManagedDecision, ManagedPendingRequest } from './repositories/herdr-managed.db.js';

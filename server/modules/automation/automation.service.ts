@@ -1,9 +1,14 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { chmod, mkdir, rm } from 'node:fs/promises';
 import net, { type Server as NetServer, type Socket } from 'node:net';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 
+import { canonicalManagedInvocation, herdrManagedBridgeRequestSchema, verifyManagedBridgeInvocation, type HerdrManagedBridgeRequest, type HerdrManagedBridgeResponse } from '../../../shared/herdr-managed-bridge.js';
+import { herdrManagedTargetBindingSchema, managedInstalledBundleIdSchema, type HerdrManagedAutomationIdentity, type HerdrManagedTargetBinding } from '../../../shared/herdr-managed-protocol.js';
+
+import { ManagedBridgeLedger } from './managed-bridge-ledger.js';
+import { InstalledAppResolver } from './installed-app-resolver.js';
 import { AutomationGrantStore, type AutomationGrant } from './automation-grants.js';
 import { BrowserSidecarClient, type BrowserEventListener } from './browser-sidecar-client.js';
 import type { BrowserCommand, BrowserInput, BrowserSessionState } from './browser-protocol.js';
@@ -122,6 +127,14 @@ export class AutomationService {
     ?? join(tmpdir(), `gajae-automation-${process.pid}.sock`);
   private bridge?: NetServer;
   private readonly cuaSessionLabels = new Map<string, string>();
+  private readonly bridgeInstanceId = randomUUID();
+  private managedLedger?: ManagedBridgeLedger;
+  private readonly managedBindings = new Map<string, HerdrManagedTargetBinding>();
+
+  constructor(
+    private readonly managedHome = process.env.DATABASE_PATH ? dirname(process.env.DATABASE_PATH) : join(homedir(), '.gajae-app'),
+    private readonly installedApps: Pick<InstalledAppResolver, 'resolve' | 'revalidate'> = new InstalledAppResolver(),
+  ) {}
 
   async status() {
     const [browser, cua] = await Promise.all([
@@ -310,6 +323,12 @@ export class AutomationService {
     process.env.GJC_AUTOMATION_TOKEN = this.bridgeToken;
   }
 
+  /** Server-only capability. Never include it in HTTP/WebSocket status responses. */
+  managedBridgeCapability(): { socketPath: string; token: string; bridgeInstanceId: string } | null {
+    if (!this.supported || !this.bridge?.listening) return null;
+    return { socketPath: this.bridgePath, token: this.bridgeToken, bridgeInstanceId: this.bridgeInstanceId };
+  }
+
   async shutdown(): Promise<void> {
     const computerSessions = [...this.cuaSessionLabels.keys()];
     await Promise.allSettled([
@@ -320,6 +339,9 @@ export class AutomationService {
     const bridge = this.bridge;
     this.bridge = undefined;
     if (bridge) await new Promise<void>((resolve) => bridge.close(() => resolve()));
+    this.managedLedger?.close();
+    this.managedLedger = undefined;
+    this.managedBindings.clear();
     if (process.platform !== 'win32') await rm(this.bridgePath, { force: true }).catch(() => {});
     delete process.env.GJC_AUTOMATION_SOCKET;
     delete process.env.GJC_AUTOMATION_TOKEN;
@@ -335,24 +357,15 @@ export class AutomationService {
     signal?: AbortSignal,
   ): Promise<{ label: string; result: unknown }> {
     let label = this.cuaSessionLabels.get(sessionId);
-    const hadLabel = Boolean(label);
     if (!label) {
       label = this.newComputerSessionLabel();
       this.cuaSessionLabels.set(sessionId, label);
     }
-    let result = await this.cua.call('start_session', { ...args, session: label }, signal);
-    let error = cuaToolError(result);
-    if (error && hadLabel) {
-      // Named sessions belong to one MCP transport lease. If cua-driver or the
-      // app server restarted, rotate the private label instead of exposing a
-      // dead public name to the coding agent.
-      label = this.newComputerSessionLabel();
-      this.cuaSessionLabels.set(sessionId, label);
-      result = await this.cua.call('start_session', { ...args, session: label }, signal);
-      error = cuaToolError(result);
-    }
+    const result = await this.cua.call('start_session', { ...args, session: label }, signal);
+    const error = cuaToolError(result);
     if (error) {
-      this.cuaSessionLabels.delete(sessionId);
+      // Retain this identity. A revocation or suspension must not be converted
+      // into a newly named session with fresh authority on the next call.
       throw new Error(error);
     }
     return { label, result };
@@ -367,6 +380,211 @@ export class AutomationService {
 
   private requireSupported(): void {
     if (!this.supported) throw new Error('Automation is available on Apple Silicon macOS in this preview.');
+  }
+
+  private managedInvocation(value: unknown): BridgeRequest {
+    const request = object(value);
+    if (!safeBridgeId(request.sessionId) || !['browser', 'computer'].includes(String(request.surface))
+      || Object.keys(request).some(key => !['surface', 'sessionId', 'operation', 'payload', 'tool', 'arguments'].includes(key))) {
+      throw new Error('Invalid managed invocation.');
+    }
+    if (request.surface === 'computer') {
+      if (request.operation !== undefined && request.operation !== 'authorize') throw new Error('Unsupported managed computer operation.');
+      const args = object(request.arguments);
+      const target = object(args.target);
+      for (const key of ['pid', 'window_id']) {
+        if ((args[key] !== undefined && (!Number.isSafeInteger(args[key]) || Number(args[key]) <= 0))
+          || (target[key] !== undefined && (!Number.isSafeInteger(target[key]) || Number(target[key]) <= 0))
+          || (args[key] !== undefined && target[key] !== undefined && args[key] !== target[key])) throw new Error('Ambiguous managed computer selector.');
+      }
+    }
+    return request as BridgeRequest;
+  }
+
+  private managedBindingKey(identity: HerdrManagedAutomationIdentity, sourceOperationId: string): string {
+    const { operationId: _operationId, targetContext: _targetContext, ...owner } = identity;
+    return canonicalManagedInvocation({ ...owner, sourceOperationId });
+  }
+
+  private async resolveManagedTarget(request: BridgeRequest, signal: AbortSignal): Promise<HerdrManagedTargetBinding> {
+    if (request.surface === 'browser') {
+      if (!['open', 'close', 'authorize', 'command'].includes(String(request.operation))) throw new Error('Unsupported managed browser operation.');
+      if (request.operation === 'close') return { kind: 'session-management', operation: 'close', sessionId: request.sessionId };
+      const payload = object(request.payload);
+      const command = object(payload.command);
+      if (['selectTab', 'newTab', 'closeTab'].includes(String(command.action))) throw new Error('Managed tab management requires a new target binding.');
+      const rawUrl = request.operation === 'command' ? command.url : payload.url;
+      let state: BrowserSessionState;
+      try { state = await this.browser.state(request.sessionId, signal) as BrowserSessionState; }
+      catch (error) {
+        // A new session has no tab yet. Only the exact sidecar absence result
+        // authorizes that narrow binding; transport failures are not absence.
+        if (!(error instanceof Error) || !error.message.startsWith('session_not_found:')
+          || (request.operation !== 'open' && !(request.operation === 'authorize' && typeof rawUrl === 'string'))) throw error;
+        state = { sessionId: request.sessionId, activeTabId: null, tabs: [] };
+      }
+      const tab = state.tabs.find(candidate => candidate.id === state.activeTabId);
+      if (rawUrl !== undefined) {
+        const origin = typeof rawUrl === 'string' ? automationOrigin(rawUrl) : null;
+        if (!origin) throw new Error('Managed browser target requires a concrete origin.');
+        return { kind: 'browser-origin', origin, tabId: tab?.id ?? 'no-active-tab' };
+      }
+      if (!tab && request.operation === 'open') return { kind: 'session-management', operation: 'open', sessionId: request.sessionId };
+      const origin = tab && automationOrigin(tab.url);
+      if (!tab || !origin) throw new Error('Managed browser target is unresolved.');
+      return { kind: 'browser-origin', origin, tabId: tab.id };
+    }
+    if (!isCuaSafeTool(request.tool)) throw new Error('Unsupported managed computer operation.');
+    const args = object(request.arguments);
+    if (request.tool === 'launch_app') {
+      const payload = object(request.payload);
+      // Managed launch accepts only an exact bundle identifier, never display names or overrides.
+      if (!managedInstalledBundleIdSchema.safeParse(args.bundle_id).success
+        || Object.keys(args).some(key => key !== 'bundle_id')
+        || Object.keys(payload).some(key => key !== 'scope' && key !== 'application')
+        || (payload.application !== undefined && payload.application !== args.bundle_id)
+        || (payload.scope !== undefined && !['session', 'always'].includes(String(payload.scope)))
+        || (request.operation !== 'authorize' && Object.keys(payload).length > 0)) {
+        throw new Error('Managed launch requires only an exact bundle_id selector.');
+      }
+      return this.installedApps.resolve(args.bundle_id as string, signal);
+    }
+    let pid = requestedPid(args);
+    const windowId = requestedWindowId(args);
+    if (windowId !== undefined) {
+      const window = windowRecords(await this.cua.call('list_windows', {}, signal)).find(candidate => candidate.window_id === windowId);
+      if (!window || typeof window.pid !== 'number' || (pid !== undefined && pid !== window.pid)) throw new Error('Managed window target is unresolved.');
+      pid = window.pid;
+    }
+    if (pid === undefined && windowId === undefined && ['start_session', 'end_session'].includes(request.tool)) {
+      return { kind: 'session-management', operation: request.tool, sessionId: request.sessionId };
+    }
+    if (pid === undefined && windowId === undefined && ['list_apps', 'list_windows'].includes(request.tool)) return { kind: 'discovery', operation: request.tool };
+    const apps = applicationRecords(await this.cua.call('list_apps', {}, signal));
+    const match = apps.find(app => pid !== undefined ? app.pid === pid
+      : (typeof args.bundle_id === 'string' && app.bundle_id === args.bundle_id)
+        || (typeof args.name === 'string' && typeof app.name === 'string' && app.name.toLocaleLowerCase() === args.name.toLocaleLowerCase()));
+    if (pid === undefined && typeof match?.pid === 'number') pid = match.pid;
+    const bundleId = pid !== undefined && pid === this.browser.browserPid ? WORKSPACE_BROWSER_APPLICATION_ID
+      : typeof match?.bundle_id === 'string' ? match.bundle_id.trim() : '';
+    if (!pid || !Number.isSafeInteger(pid) || !bundleId) throw new Error('Managed computer target is unresolved.');
+    return { kind: 'cua-application', pid, windowId: windowId ?? null, bundleId };
+  }
+
+  private async executeManaged(request: BridgeRequest, binding: HerdrManagedTargetBinding, signal: AbortSignal, computerSessionLabel?: string): Promise<unknown> {
+    if (request.surface === 'browser') {
+      if (request.operation === 'open') return this.browser.open(request.sessionId, object(request.payload), signal, {
+        tabId: binding.kind === 'browser-origin' && binding.tabId !== 'no-active-tab' ? binding.tabId : null,
+        ...(binding.kind === 'browser-origin' ? { origin: binding.origin } : {}),
+      });
+      if (request.operation === 'close') return this.stopSession(request.sessionId);
+      if (request.operation === 'authorize') return this.authorizeBrowser(request.sessionId, {
+        ...object(request.payload),
+        ...(binding.kind === 'browser-origin' ? { url: binding.origin } : {}),
+      }, signal);
+      if (binding.kind !== 'browser-origin' || binding.tabId === 'no-active-tab') throw new Error('Managed browser command requires a bound tab.');
+      return this.browser.command(request.sessionId, object(request.payload?.command) as BrowserCommand, signal, {
+        tabId: binding.tabId, origin: binding.origin,
+      });
+    }
+    if (!isCuaSafeTool(request.tool)) throw new Error('Unsupported CUA tool.');
+    if (request.operation === 'authorize') {
+      return this.authorizeComputer(request.sessionId, {
+        tool: request.tool, arguments: request.arguments,
+        scope: object(request.payload).scope,
+        ...(binding.kind === 'cua-application' || binding.kind === 'cua-installed-application' ? { application: binding.bundleId } : {}),
+      }, signal);
+    }
+    if (binding.kind === 'cua-installed-application') {
+      if (request.tool !== 'launch_app') throw new Error('Invalid installed application operation.');
+      if (!this.grants.has('application', binding.bundleId, request.sessionId)) {
+        throw new Error('Installed application access requires approval.');
+      }
+      try {
+        // handleManaged revalidates immediately before its synchronous durable
+        // reservation. Do not add an awaited lookup after reservation: a changed
+        // identity must still be fenceable as not-dispatched and require renewal.
+        signal.throwIfAborted();
+        if (!computerSessionLabel) throw new Error('Managed computer session is unavailable.');
+        const result = await this.cua.call('launch_app', { bundle_id: binding.bundleId, session: computerSessionLabel }, signal);
+        const error = cuaToolError(result);
+        if (error) throw new Error(error);
+        return { bundleId: binding.bundleId, launchRequested: true };
+      } catch {
+        throw new Error('Installed application launch failed.');
+      }
+    }
+    const args = { ...object(request.arguments) };
+    if (binding.kind === 'cua-application') {
+      // Never execute through a caller name or an ambient selector after inventory resolution.
+      delete args.name;
+      delete args.bundle_id;
+      args.pid = binding.pid;
+      if (binding.windowId !== null) args.window_id = binding.windowId;
+      if (args.target !== undefined) {
+        args.target = { ...object(args.target), pid: binding.pid, ...(binding.windowId !== null ? { window_id: binding.windowId } : {}) };
+      }
+
+    }
+    if (binding.kind === 'cua-application' && !computerSessionLabel) throw new Error('Managed computer session is unavailable.');
+    const result = binding.kind === 'cua-application'
+      ? await this.cua.call(request.tool, { ...args, session: computerSessionLabel! }, signal)
+      : await this.callComputer(request.sessionId, request.tool, args, signal);
+    const error = cuaToolError(result);
+    if (error) throw new Error(error);
+    return result;
+  }
+
+  private async handleManaged(request: HerdrManagedBridgeRequest, signal: AbortSignal): Promise<unknown> {
+    this.requireSupported();
+    if (!this.managedLedger) {
+      try { this.managedLedger = new ManagedBridgeLedger(this.managedHome); }
+      catch { throw new Error('Managed bridge protected ledger is unavailable.'); }
+    }
+    const ledger = this.managedLedger;
+    if (request.type === 'managed-lookup') return ledger.lookupOutcome(request.attempt);
+    if (request.type === 'managed-fence') return ledger.fenceUndispatched(request.attempt);
+    const identity = request.type === 'managed-resolve-target' ? request.identity : request.attempt.identity;
+    await verifyManagedBridgeInvocation(identity, request.invocation);
+    const invocation = this.managedInvocation(request.invocation);
+    if (request.type === 'managed-resolve-target') {
+      if (request.bridgeInstanceId !== this.bridgeInstanceId) throw new Error('Managed bridge instance changed.');
+      const targetBinding = herdrManagedTargetBindingSchema.parse(await this.resolveManagedTarget(invocation, signal));
+      const key = this.managedBindingKey(identity, request.sourceOperationId);
+      if (!this.managedBindings.has(key) && this.managedBindings.size >= 8192) throw new Error('Managed target binding limit exceeded.');
+      this.managedBindings.set(key, targetBinding);
+      return { type: 'managed-target', requestId: request.requestId, identity, sourceOperationId: request.sourceOperationId, bridgeInstanceId: this.bridgeInstanceId, invocationHash: identity.argumentsHash, targetBinding };
+    }
+    const attempt = request.attempt;
+    // Lookup old instances before demanding a live binding: completed responses survive restart.
+    const existing = ledger.lookupOutcome(attempt);
+    if (existing.status !== 'unknown') return existing;
+    const binding = this.managedBindings.get(this.managedBindingKey(identity, attempt.sourceOperationId));
+    if (attempt.bridgeInstanceId !== this.bridgeInstanceId || !binding
+      || identity.targetContext !== canonicalManagedInvocation(binding)
+      || canonicalManagedInvocation(binding) !== canonicalManagedInvocation(attempt.targetBinding)) throw new Error('Managed target binding mismatch.');
+    // Session admission can await driver permission. Complete it before the
+    // final target check, never after reserving an externally visible action.
+    const computerSessionLabel = invocation.surface === 'computer' && invocation.operation !== 'authorize'
+      && (binding.kind === 'cua-application' || binding.kind === 'cua-installed-application')
+      ? (await this.ensureComputerSession(invocation.sessionId, {}, signal)).label : undefined;
+    if (binding.kind === 'cua-installed-application') {
+      try { await this.installedApps.revalidate(binding, signal); }
+      catch { throw new Error('Installed application binding unavailable or changed; new approval required.'); }
+    } else {
+      const current = await this.resolveManagedTarget(invocation, signal);
+      if (canonicalManagedInvocation(current) !== canonicalManagedInvocation(binding)) throw new Error('Managed target changed; new approval required.');
+    }
+    signal.throwIfAborted();
+    const reservation = ledger.reserveDispatch(attempt);
+    if (reservation.status === 'existing') return reservation.receipt;
+    let response: HerdrManagedBridgeResponse;
+    try {
+      response = { ok: true, result: await this.executeManaged(invocation, binding, signal, computerSessionLabel) ?? null };
+    } catch (error) {
+      response = { ok: false, error: error instanceof Error ? error.message.slice(0, 1000) : 'Managed automation failed.' };
+    }
+    return ledger.completeDispatch(attempt, reservation.reservationId, response);
   }
 
   private handleBridgeSocket(socket: Socket): void {
@@ -395,6 +613,15 @@ export class AutomationService {
     socket.once('close', abort);
     try {
       request = JSON.parse(line) as BridgeRequest;
+      if (typeof object(request).type === 'string' && String(object(request).type).startsWith('managed-')) {
+        const { id, token, ...body } = object(request);
+        if (token !== this.bridgeToken || !safeBridgeId(id)) throw new Error('Unauthorized automation bridge request.');
+        const managed = herdrManagedBridgeRequestSchema.parse(body);
+        if (id !== (managed.type === 'managed-resolve-target' ? managed.requestId : managed.attempt.requestId)) throw new Error('Managed request ID mismatch.');
+        const result = await this.handleManaged(managed, controller.signal);
+        socket.write(`${JSON.stringify({ id, ok: true, result })}\n`);
+        return;
+      }
       if (request.token !== this.bridgeToken || !safeBridgeId(request.id) || !safeBridgeId(request.sessionId)) {
         throw new Error('Unauthorized automation bridge request.');
       }

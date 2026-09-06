@@ -37,7 +37,7 @@ import {
 } from './gjc-worker-client.js';
 import { getProductionJobAuthority, getProductionJobOrchestrator } from './services/gjc-job-orchestrator.js';
 import { getProductionGjcJobGitService } from './services/gjc-job-git.service.js';
-import { getProductionHerdrSessionsService } from './services/herdr-sessions.js';
+import { getProductionHerdrSessionsService, getProductionHerdrManagedChatService } from './modules/herdr/index.js';
 import {
     stripAnsiSequences,
     normalizeDetectedUrl,
@@ -128,6 +128,7 @@ function steerGjcChatRun(runId, message) {
     return steerGjcRun(runId, message);
 }
 
+const managedChat = getProductionHerdrManagedChatService();
 const { app, server, wss } = createGjcAppFactory({
     authority: gjcJobAuthority,
     orchestrator: gjcJobOrchestrator,
@@ -141,6 +142,7 @@ const { app, server, wss } = createGjcAppFactory({
     authenticateGjcRoute: authenticateToken,
     validateApiKey,
     chat: {
+        managedChat,
         spawnFns: {
             gjc: gjcSpawn,
         },
@@ -1662,6 +1664,12 @@ async function startServer() {
             server.close();
             wss.close();
             server.closeAllConnections?.();
+
+            try {
+                managedChat.close();
+            } catch (err) {
+                console.error('[Managed Chat] Attach cleanup failed:', err?.message || err);
+            }
 
             try {
                 await shutdownGjcWorker();

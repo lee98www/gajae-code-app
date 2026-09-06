@@ -64,8 +64,7 @@ function write(projectPath: string, next: Omit<ProjectPermissionsRow, 'project_p
   const path = normalizeProjectPath(projectPath);
   const row: ProjectPermissionsRow = { project_path: path, updated_at: null, ...next, allow_always: [...new Set(next.allow_always)].sort() };
   if (isDefault(row)) {
-    getConnection().prepare('DELETE FROM project_permissions WHERE project_path = ?').run(path);
-    return defaultProjectPermissions(path);
+    return reset(path);
   }
   getConnection().prepare(`
     INSERT INTO project_permissions (project_path, mode, allow_always_json, bypass_acknowledged, updated_at)
@@ -101,8 +100,19 @@ function removeAllowAlways(projectPath: string, toolName: string): ProjectPermis
 }
 
 function reset(projectPath: string): ProjectPermissionsRow {
-  getConnection().prepare('DELETE FROM project_permissions WHERE project_path = ?').run(normalizeProjectPath(projectPath));
+  const path = normalizeProjectPath(projectPath);
+  const result = getConnection().prepare('DELETE FROM project_permissions WHERE project_path = ?').run(path);
+  if (result.changes === 0) {
+    getConnection().prepare(`INSERT INTO project_permission_revisions VALUES (?, 1)
+      ON CONFLICT(project_path) DO UPDATE SET revision = revision + 1`).run(path);
+  }
   return defaultProjectPermissions(projectPath);
+}
+
+function getRevision(projectPath: string): number {
+  const row = getConnection().prepare('SELECT revision FROM project_permission_revisions WHERE project_path = ?')
+    .get(normalizeProjectPath(projectPath)) as { revision: number } | undefined;
+  return row?.revision ?? 0;
 }
 
 function listConfigured(): ProjectPermissionsRow[] {
@@ -114,9 +124,10 @@ function listConfigured(): ProjectPermissionsRow[] {
 
 export const projectPermissionsDb = {
   get: read,
-  setMode,
-  addAllowAlways,
-  removeAllowAlways,
-  reset,
+  getRevision,
+  setMode: (...args: Parameters<typeof setMode>) => getConnection().transaction(() => setMode(...args)).immediate(),
+  addAllowAlways: (...args: Parameters<typeof addAllowAlways>) => getConnection().transaction(() => addAllowAlways(...args)).immediate(),
+  removeAllowAlways: (...args: Parameters<typeof removeAllowAlways>) => getConnection().transaction(() => removeAllowAlways(...args)).immediate(),
+  reset: (projectPath: string) => getConnection().transaction(() => reset(projectPath)).immediate(),
   listConfigured,
 };

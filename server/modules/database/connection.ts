@@ -21,17 +21,17 @@ function ensureDatabaseParent(filename: string): void {
   console.log('Created database directory:', directory);
 }
 
-function connect(): SqliteDatabase.Database {
+function connect(existingOnly = false): SqliteDatabase.Database {
   const filename = configuredDatabasePath();
-  ensureDatabaseParent(filename);
+  if (!existingOnly) ensureDatabaseParent(filename);
 
-  const db = new SqliteDatabase(filename);
-  db.exec(APP_CONFIG_TABLE_SCHEMA_SQL);
+  const db = new SqliteDatabase(filename, { fileMustExist: existingOnly });
+  if (!existingOnly) db.exec(APP_CONFIG_TABLE_SCHEMA_SQL);
   return db;
 }
 
-export function getConnection(): SqliteDatabase.Database {
-  if (connectionCache.database === null) connectionCache.database = connect();
+export function getConnection(options: { existingOnly?: boolean } = {}): SqliteDatabase.Database {
+  if (connectionCache.database === null) connectionCache.database = connect(options.existingOnly);
   return connectionCache.database;
 }
 

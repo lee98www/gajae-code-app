@@ -3,11 +3,17 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { herdrInputRequestSchema, HERDR_OUTPUT_LINES, type HerdrInputRequest, type HerdrInputResponse, type HerdrOutputResponse, type HerdrPane, type HerdrSessionSummary, type HerdrSnapshotResponse } from '../../shared/herdr-protocol.js';
+import { herdrInputRequestSchema, HERDR_OUTPUT_LINES, type HerdrInputRequest, type HerdrInputResponse, type HerdrOutputResponse, type HerdrPane, type HerdrSessionSummary, type HerdrSnapshotResponse } from '../../../../shared/herdr-protocol.js';
+import type { HerdrManagedEndpointIdentity, HerdrManagedPublicSelection } from '../../../../shared/herdr-managed-provision-protocol.js';
 
-import { checkHerdrAbort, HerdrClient, HerdrError, type HerdrConnector, type HerdrWirePane } from './herdr-client.js';
+import { checkHerdrAbort, HerdrClient, HerdrError, type HerdrConnector, type HerdrProvisionReceipt, type HerdrWirePane } from './herdr-client.js';
 
 const SESSION_NAME = /^[A-Za-z0-9._-]{1,80}$/;
+export type HerdrProvisioningHandle = Readonly<{
+  identity: HerdrManagedEndpointIdentity;
+  createWorkspace(cwd: string, label: string, signal?: AbortSignal): Promise<HerdrProvisionReceipt>;
+  applyLayout(workspaceId: string, argv: readonly string[], cwd: string, signal?: AbortSignal): Promise<HerdrProvisionReceipt>;
+}>;
 const SEND_KEYS = { text: [], 'text-enter': ['Enter'], enter: ['Enter'], escape: ['Escape'] };
 export type HerdrSessionEntry = {
   name: string; label: string; socketPath: string; generation: number;
@@ -54,6 +60,59 @@ export class HerdrSessionsService {
 
   async snapshot(name: string, signal?: AbortSignal): Promise<HerdrSnapshotResponse> {
     return this.#snapshot(name, signal, true);
+  }
+
+  async provisioningSelection(selectedSessionName: string | null, signal?: AbortSignal): Promise<HerdrManagedPublicSelection> {
+    if (selectedSessionName !== null && !SESSION_NAME.test(selectedSessionName)) throw new HerdrError('HERDR_INVALID_REQUEST', 400, 'Invalid Herdr session name.');
+    await this.listSessions(signal);
+    const admitted: string[] = [];
+    const instances = [];
+    for (const entry of this.#entries.values()) {
+      const identity = await this.#identity(entry.socketPath);
+      const available = identity.exists && !identity.changed(entry);
+      if (available) admitted.push(entry.name);
+      instances.push(Object.freeze({ name: entry.name, label: entry.label, status: available ? 'available' as const : 'unavailable' as const }));
+    }
+    checkHerdrAbort(signal);
+    const selected = selectedSessionName ?? (admitted.length === 1 ? admitted[0]! : null);
+    return Object.freeze({
+      selectedSessionName: selected,
+      instances: Object.freeze(instances.sort((a, b) => a.name.localeCompare(b.name))),
+      status: selected === null ? (admitted.length ? 'selection_required' : 'unavailable') : admitted.includes(selected) ? 'unknown' : 'unavailable',
+    });
+  }
+
+  async openProvisioningHandle(name: string, signal?: AbortSignal): Promise<HerdrProvisioningHandle> {
+    checkHerdrAbort(signal);
+    const entry = await this.#entry(name);
+    const generation = entry.generation;
+    const identity = Object.freeze({ name, canonicalPath: entry.socketPath, dev: entry.device!, inode: entry.inode! });
+    const check = () => {
+      if (this.#entries.get(name) !== entry || entry.generation !== generation || entry.socketPath !== identity.canonicalPath ||
+        entry.device !== identity.dev || entry.inode !== identity.inode) throw stale();
+    };
+    const admit = async () => {
+      check();
+      const current = await this.#identity(identity.canonicalPath);
+      check();
+      if (!current.exists || current.device !== identity.dev || current.inode !== identity.inode) throw stale();
+    };
+    const client = this.#client(entry);
+    const guarded = async (operation: () => Promise<HerdrProvisionReceipt>, operationSignal?: AbortSignal) => {
+      checkHerdrAbort(operationSignal);
+      await admit();
+      const receipt = await operation();
+      await admit();
+      checkHerdrAbort(operationSignal);
+      return receipt;
+    };
+    return Object.freeze({
+      identity,
+      createWorkspace: (cwd: string, label: string, operationSignal?: AbortSignal) =>
+        guarded(() => client.createWorkspace(cwd, label, operationSignal, { admit, check }), operationSignal),
+      applyLayout: (workspaceId: string, argv: readonly string[], cwd: string, operationSignal?: AbortSignal) =>
+        guarded(() => client.applyLayout(workspaceId, argv, cwd, operationSignal, { admit, check }), operationSignal),
+    });
   }
 
   async #snapshot(name: string, signal: AbortSignal | undefined, authoritative: boolean): Promise<HerdrSnapshotResponse> {

@@ -43,6 +43,18 @@ test('a discovered disk session is addressable through both provider and applica
   });
 });
 
+test('restarting before provider readiness preserves the pending application identity', async () => {
+  await inSessionStore(async () => {
+    sessionRepository.createAppSession('pending-managed', 'gjc', '/workspaces/gajae/client');
+    assert.equal(sessionRepository.getSessionById('pending-managed')?.provider_session_id, null);
+    releaseDatabaseConnection();
+    await initializeSessionSchema();
+    assert.equal(sessionRepository.getSessionById('pending-managed')?.provider_session_id, null);
+    sessionRepository.assignProviderSessionId('pending-managed', 'gjc', 'actual-native-session');
+    assert.equal(sessionRepository.getSessionById('pending-managed')?.provider_session_id, 'actual-native-session');
+  });
+});
+
 test('provider refresh updates an announced application session rather than creating a duplicate', async () => {
   await inSessionStore(() => {
     const appSessionId = 'app-gajae-announce-01';

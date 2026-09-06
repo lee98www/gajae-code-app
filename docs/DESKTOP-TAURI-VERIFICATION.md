@@ -19,6 +19,72 @@
 > now stands in for the removed package, and every packaged smoke runs from a
 > copy outside the checkout. The next signed build starts from that HEAD.
 
+## Managed Herdr chat — current source acceptance pending
+
+This section supersedes earlier **App-owned whole-tree quit** expectations
+only for managed normal GJC chat. Historical release/provider observations
+below remain historical evidence, not acceptance of the current changes.
+Managed chat automatically creates owned placement in a selected existing
+Herdr, resolves first-use ambiguity inline, and blocks unavailable selection
+without local fallback. Imported non-managed sessions are not adopted.
+See [SELF-HOST.md](SELF-HOST.md#managed-gjc-chat-in-an-existing-herdr) for R2
+grammar and unknown-outcome troubleshooting, and
+[GJC-LIVE-SPEC.md](../server/GJC-LIVE-SPEC.md#managed-normal-chat-ownership)
+for ownership and recovery boundaries.
+
+**Evidence scope:** parent verification report states the source lifetime
+harness passed three runs, plus 18 Bun tests, five release-unit tests and
+typecheck. These are parent-reported results, not checks executed during this
+documentation update. The lifetime harness kills an actual separate test App
+process with SIGTERM/SIGKILL and keeps a real PTY Node host/Bun SDK child alive;
+its imported fixture supplies placement and deterministic model transport.
+It does not run the production Herdr CLI, installed desktop, or live provider.
+
+Commands below are verification recipes, **not executed in this update**.
+Use the supported Node runtime and matching native `node-pty`; overrides
+`HERDR_LIFETIME_NODE`, `HERDR_LIFETIME_BUN`, and `HERDR_LIFETIME_PTY` must point
+to the intended runtime/ABI rather than mask a failed check.
+
+```sh
+TSX_TSCONFIG_PATH=server/tsconfig.json node --import tsx --test server/e2e/herdr-managed-lifetime.test.ts
+TSX_TSCONFIG_PATH=server/tsconfig.json node --import tsx --test server/modules/automation/installed-app-resolver.test.ts server/modules/automation/installed-app-launch.test.ts server/gjc-herdr-installed-launch.test.ts shared/herdr-managed-chat.test.ts
+dist-native/bun test server/gjc-herdr-offline-init.bun.test.ts server/gjc-herdr-managed-child.bun.test.ts server/gjc-herdr-automation.bun.test.ts
+node --test scripts/release/managed-host-smoke.test.mjs
+# Only after a current payload/app has been built:
+node scripts/release/smoke-packaged-server.mjs --tauri-app "/Applications/Gajae Code App.app" --from-copy
+```
+
+- [ ] Current copied packaged smoke **STILL NOT EXECUTED**: prove independent
+      host/child closure outside repository dependency resolution. Earlier
+      beta package passes below are not current managed proof.
+- [ ] Independently verify default production SDK/pinned Bun initialization
+      and clean shutdown; offline no-prompt readiness does not prove a real
+      provider prompt or DOM behavior.
+- [ ] Run production Herdr CLI provisioning probe against the selected
+      existing instance, distinguishing it from imported test placement.
+- [ ] Confirm the real native ID and owner generation in the owned pane's
+      `gajae_native_session_id` / `gajae_owner_generation` tokens, together with
+      `agent: gjc` and status, including after App detach and console followup.
+      This verifies official generic metadata correlation, not reserved
+      `agent_session` or native Herdr resume. Check matching-value cleanup and
+      preservation of foreign token keys. The prior live run/recovery receipts
+      are not rewritten as evidence for this new publication path.
+- [ ] Installed App/DOM: normal chat first-use selection, unavailable blocking,
+      provider-ready mapping, rich paginated recovery and two viewers; no
+      second owner/server or foreign/imported-task mutation.
+- [ ] Installed quit/reconnect: ordinary coding and R2 asks/permissions continue;
+      browser/screen callback waits, actual-target capability renewal and
+      explicit resume approval, with no reserved-unknown replay.
+- [ ] Latest product change: `launch_app` must use exact installed `bundle_id`,
+      private canonical bundle identity and predispatch revalidation, not an
+      arbitrary name. Verify installed resolution and identity-change rejection
+      separately from rendered browser and screen execution.
+- [ ] Verify protected bootstrap/tokens/private paths stay out of browser
+      payloads and logs, fail-closed loopback exposure, and delete/archive fences.
+
+No installed-App, live-Herdr, live-provider, or current packaged proof is claimed
+here. Unknown needs status/ACK and authoritative proof, not restart-and-retry.
+
 ## Build the artifacts (on the Mac)
 
 ```sh
@@ -400,7 +466,7 @@ Executed against the then-named DMG install `/Applications/Gajae App.app` at HEA
 - [x] **Window close keeps job alive**: red-button close hides the window; the
       sidecar tree survives and the running job completes while hidden; Dock
       reopen restores the window and timeline. (screenshot 12 + DB evidence)
-- [x] **Quit graceful → interrupted**: quitting with a running job drives the
+- [x] **Historical non-managed quit graceful → interrupted**: quitting with a running job drives the
       shutdown fence — whole tree exits, durable state `interrupted`, and the
       job resumes cleanly on next launch. Verified through the macOS Quit
       AppleEvent, the same `applicationShouldTerminate` path Cmd-Q takes

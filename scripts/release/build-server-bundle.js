@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describeDistributionExclusions, removeExcludedDistributionPackages } from './distribution-exclusions.mjs';
 import { withOutOfTreeCopy } from './out-of-tree.mjs';
+import { runManagedHostSmoke } from './managed-host-smoke.mjs';
 
 const TARGET_NODE_MAJOR = 22;
 const TARGET_NODE_VERSION = [22, 22, 2];
@@ -28,10 +29,13 @@ const rootDir = path.resolve(__dirname, '..', '..');
  * literal here would silently go stale on the next SDK bump and break the
  * release lane instead of catching real drift.
  */
+let GJC_RUNTIME_VERSIONS;
+let GJC_SDK_VERSION;
+function loadRuntimeVersions() {
 const runtimeManifest = JSON.parse(
   readUtf8File(path.join(rootDir, 'server', 'gjc-runtime-manifest.json'), 'utf8'),
 );
-const GJC_RUNTIME_VERSIONS = {
+GJC_RUNTIME_VERSIONS = {
   [GJC_SDK_PACKAGE]: runtimeManifest.gjcSdk,
   [GJC_NATIVES_PACKAGE]: runtimeManifest.natives,
 };
@@ -40,7 +44,8 @@ for (const [packageName, version] of Object.entries(GJC_RUNTIME_VERSIONS)) {
     throw new Error(`server/gjc-runtime-manifest.json does not pin an exact ${packageName} version.`);
   }
 }
-const GJC_SDK_VERSION = GJC_RUNTIME_VERSIONS[GJC_SDK_PACKAGE];
+GJC_SDK_VERSION = GJC_RUNTIME_VERSIONS[GJC_SDK_PACKAGE];
+}
 
 function versionParts(input) {
   const matched = /^(\d+)\.(\d+)(?:\.(\d+))?/u.exec(input ?? '');
@@ -316,7 +321,7 @@ function calculateSha256(filePath) {
   });
 }
 
-async function smokeNativeRuntime(stageDir) {
+export async function smokeServerBundle({ stageDir, nodePath = process.execPath }) {
   const smokeSource = `
     import { constants } from 'node:fs';
     import { access, mkdir } from 'node:fs/promises';
@@ -445,9 +450,10 @@ async function smokeNativeRuntime(stageDir) {
   // package the build removed (see distribution-exclusions.mjs) would pass
   // here and fail on the user's machine. The copy also keeps the smoke's
   // `.gjc-smoke-agent` scratch directory out of the archive.
-  await withOutOfTreeCopy(stageDir, 'server bundle stage', async (copyDir) => {
+  return withOutOfTreeCopy(stageDir, 'server bundle stage', async (copyDir) => {
     console.log(`Smoking the staged runtime from ${copyDir} (outside the repository tree).`);
-    await execute(process.execPath, ['--input-type=module', '--eval', smokeSource], { cwd: copyDir });
+    await execute(nodePath, ['--input-type=module', '--eval', smokeSource], { cwd: copyDir });
+    return runManagedHostSmoke({ runtimeRoot: copyDir, nodePath });
   });
 }
 
@@ -565,7 +571,7 @@ async function rebuildStageNatives(stageDir) {
   });
   await execute(process.execPath, ['scripts/fix-node-pty.js'], { cwd: stageDir });
   await auditGlibcRequirements(stageDir);
-  await smokeNativeRuntime(stageDir);
+  await smokeServerBundle({ stageDir, nodePath: process.execPath });
 }
 
 async function finalizeStageMetadata(stageDir, packageJson) {
@@ -614,8 +620,9 @@ async function assembleBundle(stageDir, packageJson, locations) {
 }
 
 
-async function buildServerBundle() {
+export async function buildServerBundle() {
   assertTargetEnvironment();
+  loadRuntimeVersions();
   const packageJson = await loadBundlePackageJson();
   const locations = bundleLocations(packageJson.version);
   await prepareBundleStage(locations);
@@ -632,4 +639,4 @@ async function buildServerBundle() {
   await reportBundleOutput(locations);
 }
 
-await buildServerBundle();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await buildServerBundle();

@@ -76,6 +76,7 @@
     "queue": {
       "sendNext": "Eine weitere Nachricht in die Warteschlange stellen",
       "label": "In der Warteschlange",
+      "paused": "Warteschlange pausiert",
       "willSend": "Wird gesendet, wenn der aktuelle Lauf beendet ist",
       "willFollow": "Wird nach den oben genannten Nachrichten gesendet",
       "edit": "Bearbeiten Sie das Element in der Warteschlange",

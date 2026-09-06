@@ -20,6 +20,7 @@ import { deriveLiveActivity } from '../utils/toolActivity';
 import OAuthLoginDialog from '../OAuthLoginDialog';
 
 import ChatComposer from './ChatComposer';
+import ManagedHerdrSelection from './ManagedHerdrSelection';
 import ChatMessagesPane from './ChatMessagesPane';
 import CommandResultModal from './CommandResultModal';
 import type { ReasoningEffort } from './reasoningEffort';
@@ -96,6 +97,7 @@ function ChatInterface({
   }, [onNavigateToSession, onSessionEstablished, setCurrentSessionId]);
 
   const composer = useChatComposerState({
+    managedSession: session.sessionState?.managed === true,
     selectedProject,
     selectedSession,
     currentSessionId: session.currentSessionId,
@@ -171,6 +173,7 @@ function ChatInterface({
     onSessionIdle,
     onWebSocketReconnect: reconnectChat,
     onSteerResult: composer.resolveSteerResult,
+    onManagedActionResult: composer.resolveManagedAction,
     sessionStore,
   });
 
@@ -208,7 +211,9 @@ function ChatInterface({
       activity: {
         running: session.isProcessing,
         statusText: typeof session.sessionActivity?.statusText === 'string' ? session.sessionActivity.statusText : null,
-        queued: composer.queuedDrafts.length,
+        queued: session.sessionState?.managed === true
+          ? Number((session.sessionState.managedQueue as { count?: number } | undefined)?.count ?? 0)
+          : composer.queuedDrafts.length,
       },
     };
   }, [
@@ -240,6 +245,8 @@ function ChatInterface({
   }
 
   const composerNode = (
+    <>
+    <ManagedHerdrSelection state={composer.managedSelection} />
     <ComposerSurface
       pendingPermissionRequests={pendingPermissionRequests}
       handlePermissionDecision={composer.handlePermissionDecision}
@@ -309,6 +316,7 @@ function ChatInterface({
       workspaceTarget={composer.workspaceTargetValue}
       onPickWorkspaceTarget={composer.pickWorkspaceTarget}
     />
+    </>
   );
 
   return (

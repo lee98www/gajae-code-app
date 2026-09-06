@@ -67,6 +67,14 @@ export {
 } from './gjc-permission-policy.js';
 export type { GjcPermissionMode, GjcRunPermissions } from './gjc-permission-policy.js';
 
+// Configuration crosses into the private managed Bun child; importing this
+// type does not load the Bun SDK into the Node application.
+export type { SdkRunConfig } from './gjc-bun-sdk-adapter.js';
+
+// The App host uses the same bounded private automation bridge transport as its
+// SDK child. This helper has no App-service or database dependencies.
+export { managedBridgeRequest } from './gjc-automation-tools.js';
+
 // Windows job-object launch, so a worker and its descendants die with the
 // application instead of outliving it.
 export {

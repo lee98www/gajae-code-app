@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import { createElement, type FormEvent } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 import type { Project } from '../../../types/app';
 import { useChatComposerState, type PendingCommandGate } from '../hooks/useChatComposerState';
@@ -63,7 +64,7 @@ function captureComposer(
     return null;
   }
 
-  renderToStaticMarkup(createElement(Capture));
+  renderToStaticMarkup(createElement(QueryClientProvider, { client: new QueryClient() }, createElement(Capture)));
   assert.ok(composer);
   return composer;
 }

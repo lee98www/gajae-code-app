@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 import { createAgentSession, discoverAuthStorage } from '@gajae-code/coding-agent/sdk/session';
 import { ModelRegistry } from '@gajae-code/coding-agent/config/model-registry';
 import { mergeModelProfiles, resolveProfileBindings } from '@gajae-code/coding-agent/config/model-profiles';
@@ -6,11 +8,15 @@ import { resolveModelRoleValue } from '@gajae-code/coding-agent/config/model-res
 import { Settings } from '@gajae-code/coding-agent/config/settings';
 import { AuthStorage } from '@gajae-code/coding-agent/session/auth-storage';
 import { SessionManager } from '@gajae-code/coding-agent/session/session-manager';
+import { resolveStartupAuthConfig } from '@gajae-code/coding-agent/session/startup-auth-config';
 import { executeAcpBuiltinSlashCommand } from '@gajae-code/coding-agent/slash-commands/acp-builtins';
 import { initTheme, theme } from '@gajae-code/coding-agent/modes/theme/theme';
 import { generateSessionTitle } from '@gajae-code/coding-agent/utils/title-generator';
 import { getSupportedEfforts } from '@gajae-code/ai/model-thinking';
 
+import type { HerdrManagedChildAutomationControl, ManagedChildTurnOptions } from '../shared/herdr-managed-child-protocol.js';
+
+import { GjcHerdrAutomationBroker } from './gjc-herdr-automation-broker.js';
 import { appendImagesInputTag } from './shared/image-attachments.js';
 import { GjcBunOAuthController, type GjcBunOAuthControllerOptions } from './gjc-bun-oauth-controller.js';
 import { GJC_APP_BUILTIN_COMMAND_NAMES } from './gjc-command-surface.generated.js';
@@ -74,6 +80,8 @@ export type GjcBunSdkAdapterOptions = {
   generateSessionTitle?: GjcSessionTitleGenerator;
   settings?: Settings;
   loadSettings?: () => Promise<Settings>;
+  offlineDiscovery?: boolean;
+  agentDir?: string;
   executeBuiltinCommand?: typeof executeAcpBuiltinSlashCommand;
   oauth?: GjcBunOAuthControllerOptions;
   automationBridge?: GjcAutomationBridgeTransport;
@@ -427,6 +435,392 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
     return Object.assign(task, { abortHandle: runId });
   }
 
+  async initializeManagedGjcSession(runId: string, options: Record<string, unknown>, writer: GjcWorkerWriter, managed?: { generation: string; flush(): Promise<void> }): Promise<{
+    automationControl(control: HerdrManagedChildAutomationControl): Promise<boolean>;
+    operationStatus(id: string): 'in_flight' | 'completed' | 'not_found';
+    setAutomationTurn(turn: string): void;
+    providerSessionId: string;
+    prompt(message: string, turnOptions?: ManagedChildTurnOptions): Promise<void>;
+    steer(message: string): Promise<boolean>;
+    abort(): Promise<boolean>;
+    validateApproval(requestId: string, decision: unknown): boolean;
+    resolveApproval(requestId: string, decision: unknown): boolean;
+    dispose(): Promise<void>;
+  }> {
+    const config = configFromOptions(options);
+    if (!runId || this.#runs.has(runId) || this.#starting.has(runId)) throw new Error(FAILURE);
+    this.#starting.set(runId, { abortRequested: false });
+    let active: ActiveRun | undefined;
+    let resolvedCredential: Awaited<ReturnType<typeof credentialFor>> | undefined;
+    let createdSession: ActiveRun['session'] | undefined;
+    let broker: GjcHerdrAutomationBroker | undefined;
+    let managedAsk: GjcBunAskController | undefined;
+    let resetAsk: (() => void) | undefined;
+    let configureTurn: (options: ManagedChildTurnOptions) => Promise<void> = async () => { throw new Error(FAILURE); };
+    let executeTurn: (message: string) => Promise<void> = async () => { throw new Error(FAILURE); };
+    const pendingAsks = new Map<string, Record<string, unknown>>();
+    const downstream = writer;
+    writer = {
+      ...downstream,
+      send: (event) => {
+        if (object(event) && typeof event.requestId === 'string') {
+          if (event.kind === 'permission_request') pendingAsks.set(event.requestId, event);
+          if (event.kind === 'permission_cancelled') pendingAsks.delete(event.requestId);
+        }
+        downstream.send(event);
+      },
+    };
+    try {
+      const resumedId = typeof options.sessionId === 'string' && options.sessionId ? options.sessionId : undefined;
+      const sessionManager = resumedId
+        ? await resumeManager(resumedId, config.sessionRoot)
+        : SessionManager.create(config.cwd, config.sessionRoot);
+      const globalSettings = this.options.settings
+        ?? await this.options.loadSettings?.()
+        ?? await Settings.init(
+          process.env.GJC_WORKER_AGENT_DIR ? { agentDir: process.env.GJC_WORKER_AGENT_DIR } : {},
+        );
+      const configuredModelId = config.modelId === 'default'
+        ? await (this.options.offlineDiscovery ? configuredDefaultModelId : configuredDefaultModelIdWithRefresh)(
+          globalSettings,
+          this.authStorage,
+          this.modelRegistry,
+          config.credential,
+          config.modelProfile,
+        )
+        : config.modelId;
+      const settings = await globalSettings.cloneForCwd(config.cwd);
+      applyGjcToolSettingsPolicy(settings);
+      if (this.options.offlineDiscovery) settings.override('startup.networkPrewarm', false);
+      const askController = new GjcBunAskController(writer);
+      managedAsk = askController;
+      // Automation tools retain this UI object across aborted turns too.
+      const managedUI = {
+        ...askController.uiContext,
+        select: (...args: Parameters<typeof askController.uiContext.select>) => managedAsk!.uiContext.select(...args),
+        editor: (...args: Parameters<typeof askController.uiContext.editor>) => managedAsk!.uiContext.editor(...args),
+      };
+      const model = this.options.offlineDiscovery
+        ? modelFor(this.modelRegistry, configuredModelId)
+        : await modelForWithRefresh(this.modelRegistry, configuredModelId);
+      resolvedCredential = await credentialFor(this.authStorage, config.credential, model);
+      broker = new GjcHerdrAutomationBroker({
+        generation: managed?.generation ?? runId.split(':')[0],
+        provider: resumedId ?? sessionManager.getSessionId(),
+        policyRevision: Number.isSafeInteger(options.automationPolicyRevision) && Number(options.automationPolicyRevision) >= 0 ? Number(options.automationPolicyRevision) : 0,
+        targetContext: typeof options.automationTargetContext === 'string' ? options.automationTargetContext : undefined,
+        emit: (event) => writer.send(event),
+        flush: managed?.flush ?? (() => Promise.reject(new Error('Managed automation requires durable acknowledgement.'))),
+      });
+      const createInput = {
+        systemPrompt: (defaults: string[]) => [...defaults, GAJAE_APP_ENV_NOTE],
+        cwd: config.cwd,
+        ...(this.options.agentDir ? { agentDir: this.options.agentDir } : {}),
+        sessionManager,
+        settings,
+        authStorage: this.authStorage,
+        modelRegistry: this.modelRegistry,
+        model,
+        ...(
+          config.effort && config.effort !== 'default' && config.effort !== 'inherit'
+            ? { thinkingLevel: config.effort }
+            : {}
+        ),
+        providerSessionId: resumedId ?? sessionManager.getSessionId(),
+        ...(resolvedCredential.credentialSelector
+          ? { credentialSelector: resolvedCredential.credentialSelector }
+          : {}),
+        toolNames: [...new Set([...config.toolNames, 'ask'])],
+        spawns: config.spawns,
+        bashAllowedPrefixes: config.bashPolicy.allowedPrefixes,
+        ...(config.bashPolicy.restrictionProfile ? { bashRestrictionProfile: config.bashPolicy.restrictionProfile } : {}),
+        hasUI: true,
+        sdkHostModeSupported: false,
+        notificationHostModeSupported: false,
+        ...(config.appSessionId ? {
+          automationTools: createGjcAutomationTools(
+            config.appSessionId,
+            managedUI,
+            this.options.automationBridge,
+            broker.dispatch,
+          ),
+        } : {}),
+      };
+      const result = await (this.options.createSessionFactory ?? createAgentSession)(createInput);
+      createdSession = result.session;
+      let credentialProvider = model.provider;
+      const bindModelCredential = async (nextModel: Model) => {
+        if (nextModel.provider === credentialProvider) return;
+        const credential = config.credential;
+        if (credential.kind === 'stored' && credential.credentialId !== undefined
+          && !this.authStorage.exportSnapshot().credentials.some((row: { id: number; provider: string }) =>
+            row.provider === nextModel.provider && row.id === credential.credentialId)) throw new Error(FAILURE);
+        // Resolve against the original assertion, never the previously selected row.
+        const nextCredential = await credentialFor(this.authStorage, config.credential, nextModel);
+        try {
+          if (nextCredential.credentialSelector) {
+            await result.session.setCredentialPin(nextModel.provider, nextCredential.credentialSelector.selector);
+          }
+        } catch (error) {
+          nextCredential.dispose();
+          throw error;
+        }
+        resolvedCredential?.dispose();
+        resolvedCredential = nextCredential;
+        credentialProvider = nextModel.provider;
+        if (nextCredential.credential) writer.setCredential?.(nextCredential.credential);
+      };
+      configureTurn = async turn => {
+        if (turn.modelProfile) {
+          const id = await configuredDefaultModelIdWithRefresh(settings, this.authStorage, this.modelRegistry, config.credential, turn.modelProfile);
+          await bindModelCredential(await modelForWithRefresh(this.modelRegistry, id));
+          await activateModelProfile({ session: result.session, modelRegistry: this.modelRegistry, settings, profileName: turn.modelProfile });
+        } else if (turn.modelId) {
+          const id = turn.modelId === 'default'
+            ? await configuredDefaultModelIdWithRefresh(settings, this.authStorage, this.modelRegistry, config.credential, undefined)
+            : turn.modelId;
+          const nextModel = await modelForWithRefresh(this.modelRegistry, id);
+          await bindModelCredential(nextModel);
+          await result.session.setModelTemporary(nextModel, undefined, { persistAsSessionDefault: true });
+          result.session.setConfiguredModelChain('default', [`${nextModel.provider}/${nextModel.id}`], 'startup-override', undefined, true);
+          result.session.seedDefaultFallbackResolution(0, []);
+        }
+        if (turn.effort) {
+          const effort = turn.effort === 'default' || turn.effort === 'inherit' ? undefined : turn.effort;
+          const currentModel = result.session.model;
+          if (effort && (!currentModel || !getSupportedEfforts(currentModel).includes(effort as never))) throw new Error('Unsupported managed effort.');
+          result.session.setThinkingLevel(effort as Parameters<typeof result.session.setThinkingLevel>[0], false);
+        }
+        if (result.session.model) writer.setModel?.(result.session.model.id);
+      };
+      if (config.modelProfile) {
+        await activateModelProfile({
+          session: result.session,
+          modelRegistry: this.modelRegistry,
+          settings,
+          profileName: config.modelProfile,
+        });
+      } else if (config.modelId !== 'default') {
+        const thinkingLevel = config.effort && config.effort !== 'default' && config.effort !== 'inherit'
+          ? config.effort
+          : undefined;
+        await result.session.setModelTemporary(model, thinkingLevel, {
+          persistAsSessionDefault: true,
+          cause: 'startup-override',
+        });
+        result.session.setConfiguredModelChain(
+          'default',
+          [`${model.provider}/${model.id}`],
+          'startup-override',
+          undefined,
+          true,
+        );
+        result.session.seedDefaultFallbackResolution(0, []);
+      }
+      if (resolvedCredential.credential) writer.setCredential?.(resolvedCredential.credential);
+      writer.setModel?.(model.id);
+      if (result.modelFallbackMessage) throw new Error(FAILURE);
+      result.setToolUIContext(askController.uiContext, true);
+      {
+        const session: ActiveRun['session'] = result.session;
+        if (typeof session.setSdkPermissionMode !== 'function' || typeof session.setSdkPermissionProvider !== 'function') {
+          throw new Error(FAILURE);
+        }
+        // The owner host evaluates current repository policy and durable grants
+        // on every call. Never capture startup policy or let the SDK cache grants.
+        session.setSdkPermissionMode('prompt');
+        session.setSdkPermissionProvider((toolCall, options, signal) =>
+          managedAsk!.requestPermission(toolCall, options, signal));
+      }
+      const state: SdkRunState = { abortRequested: false, abortPending: false, terminalEmitted: false, finalError: false };
+      const unsubscribe = result.session.subscribe((event: unknown) => forwardSdkEvent(
+        event,
+        writer,
+        state,
+        () => readSessionSnapshot(result.session, sessionManager),
+      ));
+      active = {
+        session: result.session,
+        sessionManager,
+        unsubscribe,
+        askController,
+        state,
+        abortState: 'idle',
+        ...(config.appSessionId ? { appSessionId: config.appSessionId } : {}),
+      };
+      this.#runs.set(runId, active);
+      resetAsk = () => {
+        active!.askController = new GjcBunAskController(writer);
+        managedAsk = active!.askController;
+        result.setToolUIContext(managedUI, true);
+      };
+      if (!resumedId) writer.setSessionId?.(sessionManager.getSessionId());
+      let titleStarted = Boolean(resumedId);
+      executeTurn = async message => {
+        let promptMessage: string | null = message;
+        const match = /^\/([^\s]+)(?:\s+(.*))?$/.exec(message.trim());
+        const commandName = match?.[1];
+        if (commandName && GJC_APP_BUILTIN_COMMAND_NAMES.has(commandName)) {
+          const requestedPath = commandName === 'export' ? match?.[2]?.trim() : '';
+          const output = (text: string) => {
+            const content = normalizeBuiltinCommandStdout(text);
+            writer.send({
+              kind: 'text', role: 'assistant', isLocalCommandStdout: true,
+              content: requestedPath && content.includes('\uFFFD')
+                ? `Failed to export "${requestedPath}"${content.includes('ENOENT') ? ': ENOENT' : ''}: the upstream export command returned a corrupted path.`
+                : content,
+            });
+          };
+          const exportPath = commandName === 'export'
+            ? resolveContainedExportCommand(message, config.cwd, sessionManager.getSessionFile())
+            : ({ kind: 'passthrough' } as const);
+          if (exportPath.kind === 'rejected') {
+            output(exportPath.reason);
+            promptMessage = null;
+          } else {
+            const commandResult = await (this.options.executeBuiltinCommand ?? executeAcpBuiltinSlashCommand)(
+              exportPath.kind === 'contained' ? exportPath.message : message,
+              { session: result.session, sessionManager, settings, cwd: config.cwd, output,
+                refreshCommands: () => {}, reloadPlugins: async () => {} },
+            );
+            if (commandResult && 'consumed' in commandResult) promptMessage = null;
+            else if (commandResult && 'prompt' in commandResult) promptMessage = commandResult.prompt;
+          }
+        }
+        if (promptMessage === null) return;
+        let titleTask: Promise<void> | undefined;
+        if (!titleStarted) {
+          titleStarted = true;
+          if (!sessionManager.getSessionName() && !sessionTitlesDisabled()) {
+            titleTask = Promise.resolve()
+              .then(() => (this.options.generateSessionTitle ?? runtimeSessionTitle)(message, this.modelRegistry, settings, result.session.model ?? model))
+              .then(async title => {
+                if (!title || !(await sessionManager.setSessionName(title, 'auto'))) return;
+                writer.send({ kind: 'session_title', title: sessionManager.getSessionName(), source: 'auto', sessionId: sessionManager.getSessionId() });
+              }).catch(() => {});
+          }
+        }
+        try {
+          await result.session.prompt(promptMessage);
+        } finally {
+          if (titleTask) {
+            let grace: ReturnType<typeof setTimeout> | undefined;
+            await Promise.race([titleTask, new Promise<void>(resolve => { grace = setTimeout(resolve, SESSION_TITLE_GRACE_MS); })]);
+            clearTimeout(grace);
+          }
+        }
+      };
+    } catch (error) {
+      active?.unsubscribe();
+      this.#runs.delete(runId);
+      try {
+        managedAsk?.dispose();
+      } finally {
+        try { await createdSession?.dispose(); } finally { resolvedCredential?.dispose(); }
+      }
+      throw error;
+    } finally {
+      this.#starting.delete(runId);
+    }
+    if (!active) throw new Error(FAILURE);
+    const retained = active;
+    let disposed = false;
+    let disposalTask: Promise<void> | undefined;
+    let prompting = false;
+    const validateApproval = (requestId: string, decision: unknown): boolean => {
+      const ask = pendingAsks.get(requestId);
+      if (disposed || !ask || !object(decision) || typeof decision.allow !== 'boolean'
+        || Object.keys(decision).some((key) => !['allow', 'always', 'message', 'updatedInput'].includes(key))
+        || (decision.always !== undefined && typeof decision.always !== 'boolean')
+        || (decision.message !== undefined && typeof decision.message !== 'string')) return false;
+      if (object(ask.context) && ask.context.source === 'sdk-permission') {
+        const options = ask.context.options;
+        const once = decision.allow ? 'allow_once' : 'reject_once';
+        return decision.message === undefined && decision.updatedInput === undefined
+          && Array.isArray(options) && options.includes(once);
+      }
+      if (decision.always !== undefined) return false;
+      if (!decision.allow) return decision.message === undefined && decision.updatedInput === undefined;
+      let answer = typeof decision.message === 'string' ? decision.message.trim() : undefined;
+      if (decision.updatedInput !== undefined) {
+        if (answer !== undefined || !object(decision.updatedInput)
+          || Object.keys(decision.updatedInput).some((key) => key !== 'answers')
+          || !object(decision.updatedInput.answers)) return false;
+        const answers = Object.values(decision.updatedInput.answers);
+        if (answers.length !== 1 || typeof answers[0] !== 'string') return false;
+        answer = answers[0].trim();
+      }
+      if (!answer || !object(ask.input) || !Array.isArray(ask.input.questions) || ask.input.questions.length !== 1) return false;
+      const question = ask.input.questions[0];
+      if (!object(question) || !Array.isArray(question.options)) return false;
+      return question.options.length === 0
+        || question.options.some((option) => object(option) && option.label === answer);
+    };
+    return {
+      automationControl: (control) => broker!.control(control),
+      operationStatus: (id) => broker!.status(id),
+      setAutomationTurn: (turn) => broker!.setTurn(turn),
+      providerSessionId: retained.sessionManager.getSessionId(),
+      prompt: async (nextMessage, turnOptions = {}) => {
+        if (disposed || prompting || isAppOAuthCommand(nextMessage)) throw new Error(FAILURE);
+        if (retained.abortState !== 'idle') resetAsk?.();
+        // Installed 0.15.6 clears its permission cache when the provider is set.
+        // A deny-remaining decision lasts this turn, not the retained session.
+        retained.session.setSdkPermissionProvider!((toolCall, options, signal) =>
+          managedAsk!.requestPermission(toolCall, options, signal));
+        retained.abortState = 'idle';
+        prompting = true;
+        retained.state.abortRequested = false;
+        retained.state.abortPending = false;
+        retained.state.terminalEmitted = false;
+        retained.state.finalError = false;
+        let promptError: unknown;
+        try {
+          await configureTurn(turnOptions);
+          await executeTurn(nextMessage);
+        } catch (error) {
+          promptError = error;
+        }
+        try {
+          const jsonlPath = retained.sessionManager.getSessionFile();
+          if (jsonlPath) writer.send({ kind: 'managed.nativehistory', providerSessionId: retained.sessionManager.getSessionId(), jsonlPath });
+          forwardPromptTerminal(writer, retained.state, promptError);
+          if (promptError !== undefined) throw promptError;
+        } finally {
+          prompting = false;
+        }
+      },
+      steer: (nextMessage) => this.steerGjcSession(runId, nextMessage),
+      abort: async () => { await broker!.abort(); return this.abortGjcSession(runId); },
+      validateApproval,
+      resolveApproval: (requestId, decision) => {
+        if (!validateApproval(requestId, decision)) return false;
+        const ask = pendingAsks.get(requestId);
+        const permission = object(ask?.context) && ask.context.source === 'sdk-permission';
+        const value = decision as Record<string, unknown>;
+        const accepted = retained.askController.resolve(requestId,
+          permission ? { ...value, always: value.allow === false && value.always === true } : decision);
+        if (accepted) pendingAsks.delete(requestId);
+        return accepted;
+      },
+      dispose: () => {
+        if (disposalTask) return disposalTask;
+        disposed = true;
+        disposalTask = (async () => {
+          await broker!.abort().catch(() => {});
+          retained.unsubscribe();
+          this.#runs.delete(runId);
+          try {
+            retained.askController.dispose();
+          } finally {
+            try { await retained.session.dispose(); } finally { resolvedCredential?.dispose(); }
+          }
+        })();
+        return disposalTask;
+      },
+    };
+  }
+
   /**
    * Delivers a message into the turn that is already running.
    *
@@ -778,19 +1172,36 @@ export async function ensureSdkThemeInitialized(): Promise<void> {
 }
 
 export async function createGjcBunSdkAdapter(agentDir: string = process.env.GJC_WORKER_AGENT_DIR ?? ''): Promise<GjcBunSdkAdapter> {
+  return createSdkAdapter(agentDir, false);
+}
+
+/** Managed readiness uses only bundled models and the owner's local catalogue. */
+export async function createManagedGjcBunSdkAdapter(agentDir: string): Promise<GjcBunSdkAdapter> {
+  return createSdkAdapter(agentDir, true);
+}
+
+async function createSdkAdapter(agentDir: string, offlineDiscovery: boolean): Promise<GjcBunSdkAdapter> {
   if (!agentDir) throw new Error(FAILURE);
   // Capture the app-owned bridge capability in trusted adapter memory, then
   // remove it before the SDK creates bash tools whose child processes inherit
   // the worker environment. The model can use the injected tools but cannot
   // print or reuse the bridge token through shell commands.
   const automationBridge = takeGjcAutomationBridgeTransport();
+  const startupAuth = offlineDiscovery ? await resolveStartupAuthConfig(agentDir) : undefined;
+  if (startupAuth?.broker) throw new Error('Managed offline initialization requires a local credential store.');
   const [authStorage] = await Promise.all([
-    discoverAuthStorage(agentDir),
+    discoverAuthStorage(agentDir, startupAuth),
     ensureSdkThemeInitialized(),
   ]);
-  const modelRegistry = new ModelRegistry(authStorage);
-  await modelRegistry.refresh();
+  const settings = offlineDiscovery ? await Settings.init({ agentDir }) : undefined;
+  const modelRegistry = offlineDiscovery
+    ? new ModelRegistry(authStorage, path.join(agentDir, 'models.yml'), settings, { agentDir, automaticRefresh: false })
+    : new ModelRegistry(authStorage);
+  await modelRegistry.refresh(offlineDiscovery ? 'offline' : 'online-if-uncached');
   return new GjcBunSdkAdapter(authStorage, modelRegistry, {
+    offlineDiscovery,
+    agentDir,
+    ...(settings ? { settings } : {}),
     loadSettings: () => Settings.init({ agentDir }),
     ...(automationBridge ? { automationBridge } : {}),
   });

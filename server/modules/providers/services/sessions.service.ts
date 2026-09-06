@@ -1,15 +1,17 @@
 import { randomUUID } from 'node:crypto';
-import fsp from 'node:fs/promises';
+import { unlinkSync } from 'node:fs';
 import path from 'node:path';
 
-import { projectsDb, sessionsDb } from '@/modules/database/index.js';
+import { getConnection, projectsDb, sessionsDb } from '@/modules/database/index.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import { chatRunRegistry } from '@/modules/websocket/index.js';
 import type { FetchHistoryOptions, FetchHistoryResult, LLMProvider, NormalizedMessage } from '@/shared/types.js';
 import { boundToolResultDetails, prepareMessagesForTransport } from '@/shared/tool-output-transport.js';
 import { AppError } from '@/shared/utils.js';
 
-type CreateAppSessionResult = { sessionId: string; provider: LLMProvider; projectPath: string };
+import { getProductionHerdrManagedWorkspacesService } from '../../herdr/index.js';
+
+type CreateAppSessionResult = { sessionId: string; provider: LLMProvider; projectPath: string; managed?: true };
 type ArchivedSessionListItem = { sessionId: string; provider: LLMProvider; projectId: string | null; projectPath: string | null; projectDisplayName: string; sessionTitle: string; createdAt: string | null; updatedAt: string | null; lastActivity: string | null; isStarred: boolean; isProjectArchived: boolean };
 
 function sessionNotFound(sessionId: string): AppError {
@@ -22,9 +24,9 @@ function archivedProjectName(projectPath: string | null, configuredName: string 
   return projectPath ? path.basename(projectPath) || projectPath : 'Unknown Project';
 }
 
-async function unlinkWhenPresent(filePath: string): Promise<boolean> {
+function unlinkWhenPresent(filePath: string): boolean {
   try {
-    await fsp.unlink(filePath);
+    unlinkSync(filePath);
     return true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
@@ -61,8 +63,14 @@ export const sessionsService = {
       throw new AppError('projectPath is required.', { code: 'PROJECT_PATH_REQUIRED', statusCode: 400 });
     }
     const sessionId = randomUUID();
-    sessionsDb.createAppSession(sessionId, provider, project);
-    return { sessionId, provider, projectPath: project };
+    return getConnection().transaction(() => {
+      sessionsDb.createAppSession(sessionId, provider, project);
+      const canonicalProject = requiredSession(sessionId).project_path!;
+      if (provider === 'gjc') {
+        getProductionHerdrManagedWorkspacesService().registerNewSession(sessionId, canonicalProject);
+      }
+      return { sessionId, provider, projectPath: provider === 'gjc' ? canonicalProject : project, ...(provider === 'gjc' ? { managed: true as const } : {}) };
+    }).immediate();
   },
 
   async fetchHistory(sessionId: string, options: Pick<FetchHistoryOptions, 'limit' | 'offset' | 'includeImages'> = {}): Promise<FetchHistoryResult> {
@@ -148,14 +156,32 @@ export const sessionsService = {
   },
 
   async deleteOrArchiveSessionById(sessionId: string, options: { force?: boolean; deletedFromDisk?: boolean } = {}): Promise<{ sessionId: string; action: 'archived' | 'deleted'; deletedFromDisk: boolean }> {
-    const row = requiredSession(sessionId);
+    requiredSession(sessionId);
     if (!options.force) {
       sessionsDb.updateSessionIsArchived(sessionId, true);
       return { sessionId, action: 'archived', deletedFromDisk: false };
     }
-    const deletedFromDisk = options.deletedFromDisk && row.jsonl_path ? await unlinkWhenPresent(row.jsonl_path) : false;
-    if (!sessionsDb.deleteSessionById(sessionId)) throw sessionNotFound(sessionId);
-    return { sessionId, action: 'deleted', deletedFromDisk };
+    // Hold the writer lock through unlink and deletion: no provision reservation
+    // may race an unbound registration's removal.
+    return getConnection().transaction(() => {
+      const db = getConnection();
+      const unsafeBinding = db.prepare(`SELECT 1 FROM herdr_managed_bindings
+        WHERE app_session_id = ? AND lifecycle <> 'closed'`).get(sessionId);
+      const uncertainProvision = db.prepare(`SELECT 1 FROM herdr_managed_provisions p
+        WHERE p.app_session_id = ? AND NOT EXISTS (
+          SELECT 1 FROM herdr_managed_bindings b WHERE b.app_session_id = p.app_session_id
+          AND b.owner_generation = p.owner_generation AND b.lifecycle = 'closed'
+        )`).get(sessionId);
+      if (unsafeBinding || uncertainProvision) {
+        throw new AppError('Managed session owner must be confirmed closed before deletion.', {
+          code: 'MANAGED_SESSION_NOT_CLOSED', statusCode: 409,
+        });
+      }
+      const current = requiredSession(sessionId);
+      const deletedFromDisk = options.deletedFromDisk && current.jsonl_path ? unlinkWhenPresent(current.jsonl_path) : false;
+      if (!sessionsDb.deleteSessionById(sessionId)) throw sessionNotFound(sessionId);
+      return { sessionId, action: 'deleted' as const, deletedFromDisk };
+    }).immediate();
   },
 
   restoreSessionById(sessionId: string): { sessionId: string; isArchived: false } {

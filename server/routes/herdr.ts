@@ -2,14 +2,14 @@ import express, { type Request, type Response } from 'express';
 import { ZodError } from 'zod';
 
 import { herdrInputRequestSchema, herdrPaneIdSchema, herdrSessionNameSchema } from '../../shared/herdr-protocol.js';
-import { HerdrError } from '../services/herdr-client.js';
-import { type HerdrSessionsService } from '../services/herdr-sessions.js';
+import { herdrManagedSelectionSchema, type HerdrManagedPublicSelection } from '../../shared/herdr-managed-provision-protocol.js';
+import { getProductionHerdrManagedWorkspacesService, HerdrError, type HerdrManagedWorkspacesService, type HerdrSessionsService } from '../modules/herdr/index.js';
 import { asyncHandler, createApiSuccessResponse } from '../shared/utils.js';
 
 const parseSession = (raw: unknown) => herdrSessionNameSchema.parse(String(raw ?? ''));
 const parsePane = (raw: unknown) => herdrPaneIdSchema.parse(String(raw ?? ''));
 
-export function createHerdrRouter(service: HerdrSessionsService) {
+export function createHerdrRouter(service: HerdrSessionsService, managed?: Pick<HerdrManagedWorkspacesService, 'selection' | 'select'>) {
   const router = express.Router();
   const handle = (operation: (req: Request, signal: AbortSignal) => Promise<unknown>) => asyncHandler(async (req: Request, res: Response) => {
     const controller = new AbortController();
@@ -36,6 +36,16 @@ export function createHerdrRouter(service: HerdrSessionsService) {
     }
   });
 
+  const publicSelection = (selection: HerdrManagedPublicSelection): HerdrManagedPublicSelection => ({
+    selectedSessionName: selection.selectedSessionName,
+    status: selection.status,
+    instances: selection.instances.map(({ name, label, status }) => ({ name, label, status })),
+  });
+  router.get('/managed/selection', handle(async () => publicSelection(await (managed ?? getProductionHerdrManagedWorkspacesService()).selection())));
+  router.put('/managed/selection', handle(async (req) => {
+    const { selectedSessionName } = herdrManagedSelectionSchema.parse(req.body);
+    return publicSelection(await (managed ?? getProductionHerdrManagedWorkspacesService()).select(selectedSessionName));
+  }));
   router.get('/sessions', handle(async (_req, signal) => ({ sessions: await service.listSessions(signal) })));
   router.get('/sessions/:sessionName/snapshot', handle((req, signal) => service.snapshot(parseSession(req.params.sessionName), signal)));
   router.get('/sessions/:sessionName/panes/:paneId/output', handle((req, signal) => service.output(parseSession(req.params.sessionName), parsePane(req.params.paneId), signal)));

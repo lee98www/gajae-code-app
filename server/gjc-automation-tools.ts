@@ -1,9 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import net from 'node:net';
 
+
 import type { AutomationTools } from '@gajae-code/coding-agent/sdk/session';
 import type { ExtensionUIContext } from '@gajae-code/coding-agent/extensibility/extensions/types';
 import * as z from 'zod/v4';
+
+import { HERDR_MANAGED_MAX_FRAME_BYTES } from '../shared/herdr-managed-protocol.js';
+import { herdrManagedBridgeRequestSchema, type HerdrManagedBridgeRequest } from '../shared/herdr-managed-bridge.js';
 
 const browserActionSchema = z.object({
   verb: z.enum(['navigate', 'back', 'forward', 'reload', 'click', 'type', 'fill', 'select', 'press', 'scroll', 'wait', 'observe', 'extract', 'screenshot']),
@@ -42,6 +46,8 @@ const computerSchema = z.object({
 });
 
 type BridgeResponse = { id: string; ok: boolean; result?: unknown; error?: string };
+/** A matching bridge receipt, as distinct from transport uncertainty. */
+export class GjcAutomationResponseError extends Error {}
 type BrowserAuthorization = { granted: boolean; origin: string | null };
 type ComputerAuthorization = { granted: boolean; application: string | null; label: string | null };
 
@@ -72,14 +78,17 @@ export function takeGjcAutomationBridgeTransport(
   return { socketPath, token: token! };
 }
 
-function bridgeRequest(
+export function bridgeRequest(
   transport: GjcAutomationBridgeTransport | undefined,
   request: Record<string, unknown>,
   signal?: AbortSignal,
   timeoutMs = 310_000,
+  receipt?: (response: string) => void,
+  fixedId?: string,
 ): Promise<unknown> {
   if (!transport) return Promise.reject(new Error('App automation bridge is unavailable.'));
-  const id = `tool-${randomUUID()}`;
+  if (signal?.aborted) return Promise.reject(new Error('Automation request was cancelled.'));
+  const id = fixedId ?? `tool-${randomUUID()}`;
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(transport.socketPath);
     let buffer = '';
@@ -100,12 +109,20 @@ function bridgeRequest(
     });
     socket.on('data', (chunk) => {
       buffer += chunk.toString();
+      if (fixedId && Buffer.byteLength(buffer) > HERDR_MANAGED_MAX_FRAME_BYTES + 1024) {
+        finish(new Error('Managed automation response exceeded the frame limit.'));
+        return;
+      }
       const newline = buffer.indexOf('\n');
       if (newline < 0) return;
       try {
         const response = JSON.parse(buffer.slice(0, newline)) as BridgeResponse;
         if (response.id !== id) throw new Error('Automation bridge returned a mismatched response.');
-        if (!response.ok) throw new Error(response.error || 'Automation request failed.');
+        if (typeof response.ok !== 'boolean') throw new Error('Automation bridge returned an invalid response.');
+        if (fixedId && (Object.keys(response).some(key => !['id', 'ok', response.ok ? 'result' : 'error'].includes(key))
+          || (response.ok ? !Object.hasOwn(response, 'result') : typeof response.error !== 'string' || !response.error))) throw new Error('Automation bridge returned an invalid response.');
+        receipt?.(buffer.slice(0, newline));
+        if (!response.ok) throw new GjcAutomationResponseError(response.error || 'Automation request failed.');
         finish(undefined, response.result);
       } catch (error) {
         finish(error instanceof Error ? error : new Error('Automation response was invalid.'));
@@ -114,6 +131,13 @@ function bridgeRequest(
     socket.on('error', (error) => finish(error));
     socket.on('close', () => finish(new Error('Automation bridge disconnected.')));
   });
+}
+
+/** Private managed RPC: retain the durable attempt ID and never impose an App-absence timeout. */
+export function managedBridgeRequest(transport: GjcAutomationBridgeTransport, request: HerdrManagedBridgeRequest, signal?: AbortSignal): Promise<unknown> {
+  const parsed = herdrManagedBridgeRequestSchema.parse(request);
+  const id = parsed.type === 'managed-resolve-target' ? parsed.requestId : parsed.attempt.requestId;
+  return bridgeRequest(transport, parsed, signal, 0, undefined, id);
 }
 
 export async function closeGjcAutomationSession(
@@ -210,13 +234,23 @@ function browserCommand(action: z.infer<typeof browserActionSchema>): Record<str
   };
 }
 
+export type ManagedAutomationDispatcher = (input: { toolCallId: string; index: number; request: Record<string, unknown>; signal?: AbortSignal }) => Promise<unknown>;
+type RequestContext = (request: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
+
 export function createGjcAutomationTools(
   appSessionId: string,
   ui: Pick<ExtensionUIContext, 'select'>,
   transport?: GjcAutomationBridgeTransport,
+  managedDispatcher?: ManagedAutomationDispatcher,
 ): AutomationTools {
-  const ensureBrowserAccess = async (url: string | undefined, signal?: AbortSignal): Promise<void> => {
-    const check = await bridgeRequest(transport, {
+  const context = (toolCallId: string): RequestContext => {
+    let index = 0;
+    return (request, signal) => managedDispatcher
+      ? managedDispatcher({ toolCallId, index: index++, request, signal })
+      : bridgeRequest(transport, request, signal);
+  };
+  const ensureBrowserAccess = async (dispatch: RequestContext, url: string | undefined, signal?: AbortSignal): Promise<void> => {
+    const check = await dispatch({
       surface: 'browser',
       sessionId: appSessionId,
       operation: 'authorize',
@@ -226,13 +260,13 @@ export function createGjcAutomationTools(
 
     const choice = await ui.select(
       `Allow the agent to use ${check.origin}?`,
-      [ALLOW_ONCE, ALLOW_ALWAYS, DENY],
+      managedDispatcher ? [ALLOW_ONCE, DENY] : [ALLOW_ONCE, ALLOW_ALWAYS, DENY],
       { signal },
     );
     if (choice !== ALLOW_ONCE && choice !== ALLOW_ALWAYS) {
       throw new Error(`Browser access to ${check.origin} was denied.`);
     }
-    const granted = await bridgeRequest(transport, {
+    const granted = await dispatch({
       surface: 'browser',
       sessionId: appSessionId,
       operation: 'authorize',
@@ -250,8 +284,8 @@ export function createGjcAutomationTools(
    * check uses - and downloads on a yes; on a no the agent hears where the
    * person can do it later.
    */
-  const openBrowser = async (url: string | undefined, signal?: AbortSignal): Promise<unknown> => {
-    const request = (allowDownload: boolean) => bridgeRequest(transport, {
+  const openBrowser = async (dispatch: RequestContext, url: string | undefined, signal?: AbortSignal): Promise<unknown> => {
+    const request = (allowDownload: boolean) => dispatch({
       surface: 'browser', sessionId: appSessionId, operation: 'open',
       payload: { ...(url ? { url } : {}), allowDownload },
     }, signal);
@@ -274,18 +308,19 @@ export function createGjcAutomationTools(
     parameters: browserSchema as any,
     concurrency: 'exclusive',
     async execute(_toolCallId: string, rawParams: unknown, signal?: AbortSignal) {
+      const dispatch = context(_toolCallId);
       const params = browserSchema.parse(rawParams);
       if (params.action === 'open') {
-        if (params.url) await ensureBrowserAccess(params.url, signal);
-        return textResult(await openBrowser(params.url, signal));
+        if (params.url) await ensureBrowserAccess(dispatch, params.url, signal);
+        return textResult(await openBrowser(dispatch, params.url, signal));
       }
       if (params.action === 'close') {
-        return textResult(await bridgeRequest(transport, { surface: 'browser', sessionId: appSessionId, operation: 'close' }, signal));
+        return textResult(await dispatch({ surface: 'browser', sessionId: appSessionId, operation: 'close' }, signal));
       }
       if (params.action === 'run') {
         if (!params.code) throw new Error('browser run requires code.');
-        await ensureBrowserAccess(undefined, signal);
-        return textResult(await bridgeRequest(transport, {
+        await ensureBrowserAccess(dispatch, undefined, signal);
+        return textResult(await dispatch({
           surface: 'browser', sessionId: appSessionId, operation: 'command',
           payload: { command: { action: 'run', code: params.code, timeoutMs: params.timeout } },
         }, signal));
@@ -293,8 +328,8 @@ export function createGjcAutomationTools(
       if (!params.actions?.length) throw new Error('browser act requires one or more actions.');
       const results = [];
       for (const action of params.actions) {
-        await ensureBrowserAccess(action.verb === 'navigate' ? action.url : undefined, signal);
-        results.push(await bridgeRequest(transport, {
+        await ensureBrowserAccess(dispatch, action.verb === 'navigate' ? action.url : undefined, signal);
+        results.push(await dispatch({
           surface: 'browser', sessionId: appSessionId, operation: 'command',
           payload: { command: browserCommand(action) },
         }, signal));
@@ -304,11 +339,12 @@ export function createGjcAutomationTools(
   };
 
   const ensureComputerAccess = async (
+    dispatch: RequestContext,
     tool: z.infer<typeof computerSchema>['action'],
     args: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<void> => {
-    const check = await bridgeRequest(transport, {
+    const check = await dispatch({
       surface: 'computer',
       sessionId: appSessionId,
       operation: 'authorize',
@@ -319,13 +355,13 @@ export function createGjcAutomationTools(
 
     const choice = await ui.select(
       `Allow the agent to control ${check.label ?? check.application}?`,
-      [ALLOW_ONCE, ALLOW_ALWAYS, DENY],
+      managedDispatcher ? [ALLOW_ONCE, DENY] : [ALLOW_ONCE, ALLOW_ALWAYS, DENY],
       { signal },
     );
     if (choice !== ALLOW_ONCE && choice !== ALLOW_ALWAYS) {
       throw new Error(`Computer access to ${check.label ?? check.application} was denied.`);
     }
-    const granted = await bridgeRequest(transport, {
+    const granted = await dispatch({
       surface: 'computer',
       sessionId: appSessionId,
       operation: 'authorize',
@@ -342,13 +378,15 @@ export function createGjcAutomationTools(
   const computer: NonNullable<AutomationTools['computer']> = {
     name: 'computer',
     label: 'Computer',
-    description: 'Control a reviewed native macOS application through CUA Driver. Inspect apps/windows before acting and verify mutations with a fresh get_window_state call. Input tools default to background delivery (no focus steal), but invoke_menu must briefly front the target app because the macOS menu bar only exists for the active application. Browser pages belong in the browser tool.',
+    description: 'Control a reviewed native macOS application through CUA Driver. Inspect apps/windows before acting and verify mutations with a fresh get_window_state call. Input tools default to background delivery (no focus steal), but invoke_menu must briefly front the target app because the macOS menu bar only exists for the active application. Browser pages belong in the browser tool.'
+      + (managedDispatcher ? ' For launch_app, supply only arguments.bundle_id with the exact installed bundle identifier; names, paths, PIDs and other overrides are rejected. The App resolves and revalidates the installation before an approved exact-path LaunchServices request. launchRequested means the request was accepted, not that a window or PID has been verified.' : ''),
     parameters: computerSchema as any,
     concurrency: 'exclusive',
     async execute(_toolCallId: string, rawParams: unknown, signal?: AbortSignal) {
+      const dispatch = context(_toolCallId);
       const params = computerSchema.parse(rawParams);
-      await ensureComputerAccess(params.action, params.arguments, signal);
-      return cuaResult(await bridgeRequest(transport, {
+      await ensureComputerAccess(dispatch, params.action, params.arguments, signal);
+      return cuaResult(await dispatch({
         surface: 'computer', sessionId: appSessionId, tool: params.action, arguments: params.arguments,
       }, signal));
     },

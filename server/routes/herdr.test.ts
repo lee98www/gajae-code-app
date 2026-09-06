@@ -8,16 +8,15 @@ import path from 'node:path';
 
 import express from 'express';
 
-import { HerdrError, HerdrRpcError } from '../services/herdr-client.js';
-import { HerdrSessionsService } from '../services/herdr-sessions.js';
+import { HerdrError, HerdrRpcError, HerdrSessionsService } from '../modules/herdr/index.js';
 
 import { createHerdrRouter } from './herdr.js';
 
-const serve = async (service: any, beforeRoute?: express.RequestHandler) => {
+const serve = async (service: any, beforeRoute?: express.RequestHandler, managed?: Parameters<typeof createHerdrRouter>[1]) => {
   const app = express();
   app.use(express.json());
   if (beforeRoute) app.use(beforeRoute);
-  app.use('/api/herdr', createHerdrRouter(service));
+  app.use('/api/herdr', createHerdrRouter(service, managed));
   const server = createServer(app);
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -30,6 +29,59 @@ const serve = async (service: any, beforeRoute?: express.RequestHandler) => {
     },
   };
 };
+
+test('managed selection is narrow, validated, and preserves unavailable responses', async () => {
+  const selected: string[] = [];
+  const selection = {
+    selectedSessionName: 'offline', status: 'unavailable' as const,
+    instances: [{ name: 'offline', label: 'Offline', status: 'unavailable' as const, endpoint: '/private/socket' }],
+    endpoint: '/private/socket',
+  };
+  const server = await serve({}, undefined, {
+    selection: async () => selection,
+    select: async (name) => { selected.push(name); return selection; },
+  });
+  try {
+    for (const method of ['GET', 'PUT']) {
+      const response = await server.request('/api/herdr/managed/selection', {
+        method, ...(method === 'PUT' ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify({ selectedSessionName: 'offline' }) } : {}),
+      });
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('cache-control'), 'no-store');
+      assert.deepEqual((await response.json() as any).data, {
+        selectedSessionName: 'offline', status: 'unavailable',
+        instances: [{ name: 'offline', label: 'Offline', status: 'unavailable' }],
+      });
+    }
+    for (const body of [{ selectedSessionName: '../socket' }, { selectedSessionName: '/tmp/socket' }, { selectedSessionName: '' }, { selectedSessionName: 'ok', endpoint: '/tmp/socket' }]) {
+      const response = await server.request('/api/herdr/managed/selection', {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      assert.equal(response.status, 400);
+      assert.equal((await response.json() as any).error.code, 'HERDR_INVALID_REQUEST');
+    }
+    assert.deepEqual(selected, ['offline']);
+  } finally { await server.close(); }
+});
+
+test('managed selection respects upstream guards and sanitizes failures', async () => {
+  let calls = 0;
+  const managed = {
+    selection: async (): Promise<never> => { calls++; throw new Error('/private/socket'); },
+    select: async (): Promise<never> => { calls++; throw new Error('/private/socket'); },
+  };
+  const denied = await serve({}, (_req, res) => { res.sendStatus(403); }, managed);
+  try {
+    assert.equal((await denied.request('/api/herdr/managed/selection')).status, 403);
+    assert.equal(calls, 0);
+  } finally { await denied.close(); }
+  const server = await serve({}, undefined, managed);
+  try {
+    const response = await server.request('/api/herdr/managed/selection');
+    assert.equal(response.status, 502);
+    assert.equal(JSON.stringify(await response.json()).includes('/private/socket'), false);
+  } finally { await server.close(); }
+});
 
 test('Herdr route lists sessions and emits no-store protected payloads', async () => {
   const service = { listSessions: async () => [{ name: 'default', label: 'Default', status: 'unknown', generation: 1 }] };

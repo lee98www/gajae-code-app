@@ -33,6 +33,8 @@ import {
 import {
   BROWSER_PROTOCOL_VERSION,
   BrowserNdjsonDecoder,
+  assertBrowserExpectedTarget,
+  parseBrowserExpectedTarget,
   safeSessionId,
   serializeBrowserFrame,
   type BrowserCommand,
@@ -131,20 +133,33 @@ class BrowserRuntime {
   }
 
   async open(sessionId: string, payload: Record<string, unknown>): Promise<BrowserSessionState> {
+    const expected = parseBrowserExpectedTarget(payload.expectedTarget, true);
     const browser = await this.ensureBrowser(payload.allowDownload === true, sessionId);
     const session = this.session(sessionId);
     let tab = session.activeTabId ? session.tabs.get(session.activeTabId) : undefined;
+    const url = typeof payload.url === 'string' ? normalizeAutomationUrl(payload.url) : undefined;
+    if (expected) {
+      assertBrowserExpectedTarget(expected, session.activeTabId, tab?.id ?? null, tab?.page.url(), url);
+      if (tab?.page.isClosed()) throw new Error('target_changed: Browser tab closed.');
+    }
     if (!tab || tab.page.isClosed()) {
       const page = await browser.newPage();
+      if (expected && session.activeTabId !== null) {
+        await page.close();
+        throw new Error('target_changed: Browser tab changed.');
+      }
       tab = await this.registerPage(session, page);
     }
-    const url = typeof payload.url === 'string' ? normalizeAutomationUrl(payload.url) : undefined;
+    if (expected) {
+      // A no-active-tab open pins only the page this call created.
+      assertBrowserExpectedTarget({ ...expected, tabId: expected.tabId ?? tab.id }, session.activeTabId, tab.id, tab.page.url(), url);
+    }
     if (url && tab.page.url() !== url) {
       tab.loading = true;
       this.emitState(session);
       await tab.page.goto(url, { waitUntil: waitUntil(payload.waitUntil), timeout: 30_000 });
     }
-    session.activeTabId = tab.id;
+    if (!expected) session.activeTabId = tab.id;
     if (session.subscribed) await this.ensureScreencast(session);
     return this.state(session);
   }
@@ -182,9 +197,13 @@ class BrowserRuntime {
     return { subscribed: false };
   }
 
-  async command(sessionId: string, command: BrowserCommand): Promise<unknown> {
+  async command(sessionId: string, command: BrowserCommand, expectedTarget?: unknown): Promise<unknown> {
+    const expected = parseBrowserExpectedTarget(expectedTarget);
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error('session_not_found: Open the browser session first.');
+    if (expected && ['selectTab', 'newTab', 'closeTab'].includes(command.action)) {
+      throw new Error('managed_tab_operation: Managed commands cannot change tabs.');
+    }
     if (command.action === 'selectTab') {
       if (!session.tabs.has(command.tabId)) throw new Error('tab_not_found: Browser tab was not found.');
       session.activeTabId = command.tabId;
@@ -213,8 +232,11 @@ class BrowserRuntime {
       this.emitState(session);
       return this.state(session);
     }
-    const tab = this.activeTab(session);
+    const tab = expected ? session.tabs.get(expected.tabId!) : this.activeTab(session);
+    if (!tab || tab.page.isClosed()) throw new Error('target_changed: Browser tab closed.');
     const page = tab.page;
+    if (expected) assertBrowserExpectedTarget(expected, session.activeTabId, tab.id, page.url(),
+      command.action === 'navigate' ? normalizeAutomationUrl(command.url) : undefined);
 
     switch (command.action) {
       case 'navigate':
@@ -698,7 +720,7 @@ async function handle(frame: BrowserRequestFrame): Promise<void> {
         result = await runtime.close(frame.sessionId!);
         break;
       case 'browser.command':
-        result = await runtime.command(frame.sessionId!, object(frame.payload.command) as BrowserCommand);
+        result = await runtime.command(frame.sessionId!, object(frame.payload.command) as BrowserCommand, frame.payload.expectedTarget);
         break;
       case 'browser.input':
         result = await runtime.input(frame.sessionId!, object(frame.payload.input) as BrowserInput);

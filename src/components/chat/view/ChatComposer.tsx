@@ -32,6 +32,7 @@ import {
   PromptInputSubmit,
   Tooltip,
 } from '../../../shared/view/ui';
+import type { ManagedUIStatus } from '../../../../shared/herdr-managed-chat';
 
 import CommandMenu from './CommandMenu';
 import ImageAttachment from './ImageAttachment';
@@ -213,6 +214,8 @@ export default function ChatComposer({
   onPickWorkspaceTarget = () => {},
 }: ChatComposerProps) {
   const { t } = useTranslation('chat');
+  const managed = sessionState?.managed === true;
+  const managedQueue = sessionState?.managedQueue as ManagedUIStatus['queue'] | undefined;
   const commandMenuPosition = useMemo(() => {
     if (!isCommandMenuOpen) {
       return { top: 0, left: 16, bottom: 90 };
@@ -303,7 +306,19 @@ export default function ChatComposer({
         />
       )}
 
-      {queuedDrafts.map((draft, index) => (
+      {managed && managedQueue && (managedQueue.count > 0 || managedQueue.paused) && (
+        <div role="status" data-managed-queue className="mx-auto mb-1.5 max-w-chat rounded-xl border border-dashed border-primary/25 bg-primary/4 px-3 py-2">
+          <div className="flex items-center gap-1.5 text-xs font-medium text-primary/70">
+            <span>{t('input.queue.label')}</span>
+            <span>{managedQueue.count}</span>
+            <span className="text-muted-foreground">
+              · {managedQueue.paused ? t('input.queue.paused') : t('input.queue.willSend')}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {!managed && queuedDrafts.map((draft, index) => (
         <QueuedMessageCard
           key={`${index}:${draft.content}`}
           content={draft.content}

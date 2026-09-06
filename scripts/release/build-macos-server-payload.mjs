@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describeDistributionExclusions, removeExcludedDistributionPackages, removeNonAsciiPaths } from './distribution-exclusions.mjs';
 import { withOutOfTreeCopy } from './out-of-tree.mjs';
+import { runManagedHostSmoke } from './managed-host-smoke.mjs';
 
 const NODE_VERSION = '22.22.2';
 const NODE_ARCHIVE_SHA256 = 'db4b275b83736df67533529a18cc55de2549a8329ace6c7bcc68f8d22d3c9000';
@@ -165,7 +166,7 @@ async function verifyManifest() {
   }
 }
 
-async function smoke(payloadNode) {
+export async function smokeMacosServerPayload({ payloadDir: inputDir = payloadDir, nodePath = sidecarPath } = {}) {
   const smoke = `
     import { createRequire } from 'node:module';
     import { spawn, spawnSync } from 'node:child_process';
@@ -208,13 +209,18 @@ async function smoke(payloadNode) {
   // for anything the payload lacks and the run would prove nothing about the
   // shipped tree - that is how the `elkjs` exclusion broke the worker in a
   // notarized DMG while every in-tree smoke passed.
-  const buildOnlyNode = path.join(payloadDir, 'node');
-  await withOutOfTreeCopy(payloadDir, 'macOS server payload', async (copyDir) => {
+  const buildOnlyNode = path.join(inputDir, 'node');
+  return withOutOfTreeCopy(inputDir, 'macOS server payload', async (copyDir) => {
     console.log(`Smoking the payload from ${copyDir} (outside the repository tree).`);
+    const payloadNode = path.join(copyDir, 'gajae-app-server-aarch64-apple-darwin');
+    await fs.copyFile(nodePath, payloadNode);
+    await fs.chmod(payloadNode, 0o755);
     await run(payloadNode, ['--input-type=module', '--eval', smoke], { cwd: copyDir, env: { ...process.env, PATH: `${path.dirname(payloadNode)}:/usr/bin:/bin` } });
+    return runManagedHostSmoke({ runtimeRoot: copyDir, nodePath: payloadNode });
   }, { filter: (source) => source !== buildOnlyNode && !source.startsWith(`${buildOnlyNode}${path.sep}`) });
 }
 
+export async function buildMacosServerPayload() {
 if (process.platform !== 'darwin' || process.arch !== 'arm64') throw new Error(`macOS payload requires darwin-arm64; received ${process.platform}-${process.arch}.`);
 await required(['dist', 'dist-server', 'shared', 'public', 'package.json', 'package-lock.json', 'server/gjc-runtime-manifest.json', 'scripts/fix-node-pty.js', 'dist-native/gajae-core', 'dist-native/bun', 'LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md']);
 await fs.rm(payloadDir, { recursive: true, force: true });
@@ -253,7 +259,7 @@ try {
   await stageSidecar(payloadNode);
   await fs.rm(path.join(payloadDir, 'package-lock.json'), { force: true });
   await fs.rm(path.join(payloadDir, 'scripts', 'fix-node-pty.js'), { force: true });
-  await smoke(sidecarPath);
+  await smokeMacosServerPayload();
   await fs.rm(path.join(payloadDir, 'node'), { recursive: true, force: true });
   console.log(`Built and verified macOS server payload at ${path.relative(rootDir, payloadDir)}; pruned ${prunedMetadataFiles} non-runtime metadata files.`);
 } catch (error) {
@@ -261,3 +267,5 @@ try {
   await fs.rm(sidecarPath, { force: true });
   throw error;
 }
+}
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await buildMacosServerPayload();

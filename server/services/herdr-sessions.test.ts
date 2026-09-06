@@ -8,8 +8,7 @@ import net from 'node:net';
 import { once } from 'node:events';
 
 import { HERDR_INPUT_MAX_BYTES, herdrInputRequestSchema } from '../../shared/herdr-protocol.js';
-
-import { HerdrSessionsService } from './herdr-sessions.js';
+import { HerdrSessionsService } from '../modules/herdr/index.js';
 
 type Reply = (request: any) => unknown;
 
@@ -57,6 +56,48 @@ describe('HerdrSessionsService', () => {
     const service = new HerdrSessionsService({ configHome: tmp, connector: () => new FakeSocket(() => snapshot(), calls), bootId: 'boot', allowNonSocketForTests: true });
     const sessions = await service.listSessions();
     assert.deepEqual(sessions.map((session) => session.name), ['default', 'work']);
+    assert.equal(calls.length, 0);
+  });
+
+  it('requires selection for ambiguous admitted instances and exports no endpoint paths', async () => {
+    const service = new HerdrSessionsService({ configHome: tmp, allowNonSocketForTests: true });
+    const ambiguous = await service.provisioningSelection(null);
+    assert.equal(ambiguous.status, 'selection_required');
+    assert.equal(ambiguous.selectedSessionName, null);
+    assert.ok(Object.isFrozen(ambiguous.instances));
+    assert.ok(!JSON.stringify(ambiguous).includes(tmp));
+    await fs.unlink(path.join(tmp, 'herdr', 'sessions', 'work', 'herdr.sock'));
+    const single = await service.provisioningSelection(null);
+    assert.equal(single.selectedSessionName, 'default');
+    assert.equal(single.status, 'unknown');
+    const selectedMissing = await service.provisioningSelection('work');
+    assert.equal(selectedMissing.selectedSessionName, 'work');
+    assert.equal(selectedMissing.status, 'unavailable');
+  });
+
+  it('freezes provisioning identity and refuses socket replacement immediately before dispatch', async () => {
+    let socket: FakeSocket & { connecting?: boolean } | undefined;
+    const service = new HerdrSessionsService({
+      configHome: tmp, allowNonSocketForTests: true,
+      connector: () => {
+        socket = new FakeSocket(() => { throw new Error('Must not dispatch'); }, calls);
+        socket.connecting = true;
+        return socket;
+      },
+    });
+    const handle = await service.openProvisioningHandle('default');
+    assert.ok(Object.isFrozen(handle));
+    assert.ok(Object.isFrozen(handle.identity));
+    assert.equal(handle.identity.canonicalPath, await fs.realpath(path.join(tmp, 'herdr', 'herdr.sock')));
+    assert.equal('request' in handle, false);
+    const pending = handle.createWorkspace('/repo', 'Owned');
+    const rejection = assert.rejects(pending, { code: 'HERDR_STALE_OBSERVATION' });
+    while (!socket) await new Promise<void>((resolve) => setImmediate(resolve));
+    const socketPath = path.join(tmp, 'herdr', 'herdr.sock');
+    await fs.rename(socketPath, `${socketPath}.old`);
+    await fs.writeFile(socketPath, '');
+    socket.emit('connect');
+    await rejection;
     assert.equal(calls.length, 0);
   });
 

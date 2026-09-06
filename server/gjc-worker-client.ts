@@ -277,7 +277,7 @@ export async function resolveGjcResumeSessionRoot(
   return undefined;
 }
 
-async function enrichGjcSdkRunOptions(options: GjcWorkerOptions): Promise<GjcWorkerOptions> {
+export async function enrichGjcSdkRunOptions(options: GjcWorkerOptions): Promise<GjcWorkerOptions> {
   let modelId = options.modelId ?? options.model;
   let modelProfile = typeof options.modelProfile === 'string' ? options.modelProfile.trim() : '';
   if (typeof modelId === 'string' && modelId.startsWith('profile:')) {

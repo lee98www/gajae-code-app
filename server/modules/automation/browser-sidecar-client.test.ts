@@ -20,6 +20,35 @@ async function waitFor(
   throw new Error(message);
 }
 
+test('client sends exact managed fences while leaving legacy payloads unchanged', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'gajae-browser-target-'));
+  const sidecarPath = join(directory, 'fake-sidecar.mjs');
+  await writeFile(sidecarPath, `
+    import readline from 'node:readline';
+    readline.createInterface({ input: process.stdin }).on('line', line => {
+      const request = JSON.parse(line);
+      process.stdout.write(JSON.stringify({
+        protocolVersion: 1, kind: 'response', id: request.id, method: request.method,
+        ...(request.sessionId ? { sessionId: request.sessionId } : {}),
+        ok: true, result: request.payload
+      }) + '\\n');
+      if (request.method === 'shutdown') setImmediate(() => process.exit(0));
+    });
+  `);
+  const client = new BrowserSidecarClient({ runtimePath: process.execPath, sidecarPath });
+  try {
+    const expectedTarget = { tabId: 'approved-tab', origin: 'https://approved.test' };
+    const command = { action: 'press' as const, key: 'Enter' };
+    assert.deepEqual(await client.command('target-session', command, undefined, expectedTarget), { command, expectedTarget });
+    assert.deepEqual(await client.command('target-session', command), { command });
+    assert.deepEqual(await client.open('target-session', {}, undefined, { tabId: null }), { expectedTarget: { tabId: null } });
+    assert.deepEqual(await client.open('target-session', {}), {});
+  } finally {
+    await client.shutdown();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('a crashed sidecar is restarted and restores the shared tabs and screencast subscription', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'gajae-browser-client-recovery-'));
   const sidecarPath = join(directory, 'fake-sidecar.mjs');

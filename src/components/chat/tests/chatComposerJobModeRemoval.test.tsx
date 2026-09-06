@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import { createElement, type FormEvent } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { DropzoneInputProps, DropzoneRootProps } from 'react-dropzone';
 
 import type { Project } from '../../../types/app';
@@ -126,7 +127,7 @@ test('normal chat submit sends one chat message and never creates a GJC job', as
   };
 
   try {
-    renderToStaticMarkup(createElement(Capture));
+    renderToStaticMarkup(createElement(QueryClientProvider, { client: new QueryClient() }, createElement(Capture)));
     assert.ok(composer);
 
     composer.handleVoiceTranscript('normal message');
@@ -134,7 +135,9 @@ test('normal chat submit sends one chat message and never creates a GJC job', as
 
     assert.equal(createCalls, 0);
     assert.equal(sentMessages.length, 1);
-    assert.deepEqual(sentMessages[0], {
+    const { actionId, ...sent } = sentMessages[0] as { actionId: string; [key: string]: unknown };
+    assert.match(actionId, /^[0-9a-f-]{36}$/);
+    assert.deepEqual(sent, {
       type: 'chat.send',
       sessionId: 'session-1',
       content: 'normal message',
@@ -176,7 +179,7 @@ test('/login opens the app login flow without sending a chat message', async () 
     return null;
   }
 
-  renderToStaticMarkup(createElement(Capture));
+  renderToStaticMarkup(createElement(QueryClientProvider, { client: new QueryClient() }, createElement(Capture)));
   assert.ok(composer);
   composer.handleVoiceTranscript('/login openai');
   await composer.handleSubmit(submitEvent);
@@ -207,7 +210,7 @@ test('a running turn queues Enter submissions and only steers through the explic
     return null;
   }
 
-  renderToStaticMarkup(createElement(Capture));
+  renderToStaticMarkup(createElement(QueryClientProvider, { client: new QueryClient() }, createElement(Capture)));
   assert.ok(composer);
 
   composer.handleVoiceTranscript('send this after the answer');
@@ -216,8 +219,11 @@ test('a running turn queues Enter submissions and only steers through the explic
 
   composer.handleVoiceTranscript('adjust the answer now');
   composer.handleSteer(submitEvent);
+  const actionId = (sentMessages[0] as { actionId: string }).actionId;
+  assert.match(actionId, /^[a-f0-9-]{36}$/);
   assert.deepEqual(sentMessages, [{
     type: 'chat.steer',
+    actionId,
     sessionId: 'session-1',
     content: 'adjust the answer now',
   }]);
@@ -311,4 +317,56 @@ test('the composer tools row wraps instead of clipping its trailing controls', (
   assert.ok(toolsRow, 'the composer no longer renders a tools row');
   assert.doesNotMatch(toolsRow, /overflow-hidden/);
   assert.match(toolsRow, /flex-wrap/);
+});
+
+for (const isLoading of [true, false]) {
+  for (const paused of [true, false]) {
+    test(`host queue count is read-only with loading=${isLoading}, paused=${paused}`, () => {
+      const html = renderToStaticMarkup(createElement(ChatComposer, {
+        ...baseComposerProps,
+        isLoading,
+        sessionState: { managed: true, managedQueue: { count: 3, paused, actionIds: ['a', 'b', 'c'] } },
+        queuedDrafts: [{ content: 'stale browser draft', images: [] }],
+      }));
+      assert.match(html, /role="status" data-managed-queue/);
+      assert.match(html, /input\.queue\.label<\/span><span>3<\/span>/);
+      assert.match(html, paused ? /input\.queue\.paused/ : /input\.queue\.willSend/);
+      assert.doesNotMatch(html, /stale browser draft|input\.queue\.(edit|delete|moveUp|moveDown)/);
+    });
+  }
+}
+
+test('an idle empty paused host queue stays visible, while an empty active queue stays hidden', () => {
+  const render = (paused: boolean) => renderToStaticMarkup(createElement(ChatComposer, {
+    ...baseComposerProps,
+    sessionState: { managed: true, managedQueue: { count: 0, paused, actionIds: [] } },
+  }));
+  assert.match(render(true), /input\.queue\.label<\/span><span>0<\/span>/);
+  assert.match(render(true), /input\.queue\.paused/);
+  assert.doesNotMatch(render(false), /data-managed-queue/);
+});
+
+test('managed state without queue data never exposes stale local controls', () => {
+  const html = renderToStaticMarkup(createElement(ChatComposer, {
+    ...baseComposerProps,
+    sessionState: { managed: true },
+    queuedDrafts: [{ content: 'stale browser draft', images: [] }],
+  }));
+  assert.doesNotMatch(html, /stale browser draft|input\.queue\.(edit|delete|moveUp|moveDown)/);
+});
+
+test('ordinary chat retains local queue text and edit delete reorder controls', () => {
+  const html = renderToStaticMarkup(createElement(ChatComposer, {
+    ...baseComposerProps,
+    queuedDrafts: [
+      { content: 'first local draft', images: [] },
+      { content: 'second local draft', images: [] },
+    ],
+  }));
+  assert.match(html, /first local draft/);
+  assert.match(html, /second local draft/);
+  for (const control of ['edit', 'delete', 'moveUp', 'moveDown']) {
+    assert.ok(html.includes(`aria-label="input.queue.${control}"`));
+  }
+  assert.doesNotMatch(html, /data-managed-queue/);
 });

@@ -61,13 +61,125 @@ port forwarding.
 ssh -N -L 3001:127.0.0.1:3001 user@server
 ```
 
-## Herdr client boundary
+## Managed GJC chat in an existing Herdr
+
+Normal new GJC chat provisions an App-owned workspace/tab/pane in the selected
+**existing** current-user Herdr. First-use ambiguity is resolved by the inline
+Herdr selector; there is no focused-pane guess. A selected but unavailable
+Herdr blocks chat rather than starting a local SDK, a second App server, or
+another Herdr. Imported non-managed sessions are not adopted or mutated.
+
+One independent Node task host in that pane owns one pinned Bun SDK child.
+The real provider session must be ready before the App publishes its mapping
+and submits the prompt. Lost provisioning RPC replies mean **unknown**, not
+permission to create another workspace, pane, or SDK owner.
+
+The independent host publishes `gjc` and its display status through
+`pane.report_agent`. Its **only Herdr identity-correlation channel** is the
+official `pane.report_metadata` API: `gajae_native_session_id`,
+`gajae_owner_generation`, and `gajae_app_session_id` in the owned pane's
+`tokens`. Publication uses the actual initialized SDK ID, an owner-specific
+source and increasing sequence numbers; the host confirms the values in a
+fresh snapshot. A bare RPC acknowledgement is not publication proof.
+
+These tokens are correlation metadata, **not command authorization or native
+Herdr resume support**. The App's authenticated private binding remains the
+authority. Reserved `agent_session` admission and native Collie history/resume
+are not required or impersonated. On confirmed owner closure, the host clears
+only its still-matching namespaced values and releases only its source.
+Replacement identities and unrelated token keys are preserved. These are local
+preflight guards, not an atomic metadata compare-and-swap guarantee.
+
+App quit, server-client detach, or browser disconnect does not terminate this
+managed owner. Ordinary coding, file operations, commands, asks, and permissions
+can continue through the Herdr/Collie R2 console. App-dependent browser/screen
+steps wait on the original SDK callback: reconnect must renew a capability for
+the actual target and obtain explicit resume approval. Reattachment alone is
+not approval. Recovery accepts an authoritative completed receipt or a fenced
+not-dispatched result; a reserved/unknown attempt remains unknown, never replayed.
+
+### R2 console and uncertain outcomes
+
+Use `:help` and `:status` in the owned pane. Current parser grammar is:
+
+```text
+:prompt ACTION STATE_REVISION "JSON text"
+:followup ACTION "JSON text"
+:steer ACTION TURN "JSON text"
+:abort ACTION TURN
+:answer ACTION APP/GENERATION/PROVIDER/TURN/REQUEST "JSON answer"
+:permission ACTION APP/GENERATION/PROVIDER/TURN/REQUEST POLICY_REVISION allow-once
+:resume ACTION APP/GENERATION/PROVIDER/TURN/REQUEST CAPABILITY_GENERATION approve
+:ack ACTION
+:status
+:help
+```
+
+Permission decisions also accept `deny-once`, `allow-always`, and
+`deny-remaining`; resume accepts `deny`. Copy the full five-part request identity
+and current revisions from the host, never the newest or focused request.
+Use the answer values offered by that request. The parser accepts JSON arrays,
+but they are not an indication that the installed SDK supports multi-select;
+the host validates the request's actual answer schema.
+Action IDs are 1–64 ASCII letters/digits/underscore/hyphen; identity components
+are 1–160 of the same characters. Mutations require an action ID.
+
+Input is one physical line, capped at 64 KiB UTF-8; JSON strings may encode
+newlines (at most 256 logical lines). Bracketed paste containing raw newlines,
+malformed UTF-8, and unsupported controls are rejected. Do not paste multiple
+commands without bracketed-paste protection: ordinary newlines submit lines. Escape or
+Ctrl-C cancels the draft, not the SDK turn; use `:abort` for a turn.
+The owned physical TTY enters non-echoing raw mode before SDK initialization,
+and enables bracketed paste when its output is also a TTY. Ctrl-D is input,
+not owner shutdown. Input EOF/error detaches only that input and restores its
+original raw mode and disables bracketed paste; App/attach disconnects do not
+release the owned terminal. Owner close/exit also restores terminal settings.
+Programmatic SIGINT, SIGTERM, or SIGHUP closes the independent owner gracefully,
+waiting for private child disposal and its persistent writer before marking closed.
+The console does not echo payloads or retain input history. Secret-tagged
+requests suppress their content; output sanitizes controls and known secrets,
+but cannot recognize arbitrary secrets in prose. Never paste credentials into
+an echoing shell or publish console/bootstrap dumps.
+
+Herdr accepting bytes is not a host ACK. `ACK ACTION STATE SEQ` records
+admission/execution/settlement, not necessarily successful task completion.
+After a missing reply, use `:ack ACTION` and `:status` before any retry.
+Unknown needs status and authoritative proof, **not restart-and-retry** or a
+fresh action ID. Do not mutate foreign tasks to recover a managed one.
+
+The App server projects mappings through a generation/sequence CAS. Project
+policy writers share revision-checked storage; the live host alone resolves its
+pending permission requests and commits winning Always grants, including while
+the App is absent.
+Delete/archive must respect managed lifecycle fences rather than deleting an
+active owner or silently adopting its session. Native history, rich event
+replay, and bounded paginated snapshots restore chat; terminal scraping does
+not. Private bootstrap, attach tokens, and automation target paths stay
+server-side, outside browser payloads and diagnostic logs. Tokens and prompt
+contents must not enter argv; the host CLI receives only its protected
+bootstrap locator. Keep private files outside the project, owner-only.
+The server defaults to loopback and rejects unsafe exposure unless explicitly
+configured under its exposure guard.
+
+For managed computer use, the latest required `launch_app` change resolves an
+exact installed `bundle_id`, binds canonical bundle identity, and revalidates
+it before dispatch; an arbitrary application name is not target authority.
+Resolution uses macOS's installed-application inventory without opening the app.
+Missing or ambiguous installations and changed identities cannot launch under an
+old approval. Launch uses the existing CUA session and its validated bundle ID,
+not a direct OS-command path around driver revocation or suspension. A rejected
+session is not silently renamed to regain authority. Successful dispatch reports
+`launchRequested: true` after the driver accepts the request, not a fabricated PID.
+This is a product contract, not evidence of an executed installed-app test.
+
+## Non-managed Herdr observer/input boundary
 
 When Herdr is installed for the same user, Gajae Code App can list admitted
 current-user Herdr API sockets under `$XDG_CONFIG_HOME/herdr` or
 `~/.config/herdr`, read selected-pane visible plain text, and send explicit
 bounded input. Gajae Code App does not start, stop, upgrade, rename, focus, or
-repair Herdr, and it does not migrate Herdr panes into SDK chat sessions.
+repair Herdr. The observer does not migrate Herdr panes into SDK chat sessions;
+managed provisioning above only creates explicitly App-owned placement.
 Collie remains an independent client.
 
 The browser never supplies a socket path. It selects an admitted session name

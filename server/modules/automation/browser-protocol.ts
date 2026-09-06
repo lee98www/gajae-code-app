@@ -1,5 +1,46 @@
 export const BROWSER_PROTOCOL_VERSION = 1 as const;
 
+export type BrowserExpectedTarget = { tabId: string; origin?: string };
+export type BrowserExpectedOpenTarget = { tabId: string | null; origin?: string };
+
+/** Missing means unmanaged; malformed supplied fences must never become unmanaged. */
+export function parseBrowserExpectedTarget(value: unknown, allowEmpty = false): BrowserExpectedOpenTarget | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_target: Invalid browser target.');
+  const target = value as Record<string, unknown>;
+  if (Object.keys(target).some((key) => key !== 'tabId' && key !== 'origin')
+    || !(typeof target.tabId === 'string' && target.tabId.length > 0 || allowEmpty && target.tabId === null)) {
+    throw new Error('invalid_target: Invalid browser target.');
+  }
+  if (target.origin !== undefined) {
+    if (typeof target.origin !== 'string') throw new Error('invalid_target: Invalid browser origin.');
+    try {
+      if (new URL(target.origin).origin !== target.origin || target.origin === 'null') throw new Error();
+    } catch {
+      throw new Error('invalid_target: Invalid browser origin.');
+    }
+  }
+  return { tabId: target.tabId as string | null, ...(target.origin === undefined ? {} : { origin: target.origin as string }) };
+}
+
+/** Synchronous fence over the captured page; not an atomic navigation guarantee. */
+export function assertBrowserExpectedTarget(
+  expected: BrowserExpectedOpenTarget,
+  activeTabId: string | null,
+  tabId: string | null,
+  currentUrl?: string,
+  destinationUrl?: string,
+): void {
+  if (expected.tabId !== activeTabId || expected.tabId !== tabId) {
+    throw new Error('target_changed: Browser tab changed.');
+  }
+  if (expected.origin !== undefined) {
+    let origin: string | undefined;
+    try { origin = new URL(destinationUrl ?? currentUrl ?? '').origin; } catch { /* Fail closed. */ }
+    if (origin !== expected.origin) throw new Error('target_changed: Browser origin changed.');
+  }
+}
+
 export type BrowserCommand =
   | { action: 'navigate'; url: string; waitUntil?: BrowserWaitUntil }
   | { action: 'back' }

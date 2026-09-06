@@ -4,11 +4,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { JobProjectionErrorCode, JobProjectionEvent, JobSnapshot, JobState, JobTerminalPayload } from '../../shared/gjc-job-projection-protocol';
 import type { LLMProvider } from '../types/app';
 import { authenticatedFetch } from '../utils/api';
+import type { ManagedChatRecord, ManagedUIStatus } from '../../shared/herdr-managed-chat';
 
 import { buildRefreshMessagesUrl } from './sessionMessageFetch';
 
 type MessageKind = 'text' | 'tool_use' | 'tool_result' | 'thinking' | 'stream_delta' | 'stream_end' | 'error' | 'complete' | 'status' | 'permission_request' | 'permission_cancelled' | 'session_created' | 'interactive_prompt' | 'task_notification' | 'system_notice';
 export interface NormalizedMessage {
+  actionId?: string; ownerGeneration?: string;
   id: string; sessionId: string; timestamp: string; provider: LLMProvider; kind: MessageKind; seq?: number;
   role?: 'user' | 'assistant'; content?: string; displayText?: string; commandName?: string; commandMessage?: string; commandArgs?: string;
   isLocalCommand?: boolean; isLocalCommandStdout?: boolean; isCompactSummary?: boolean; images?: Array<{ path?: string; data?: string; name?: string }>;
@@ -19,6 +21,7 @@ export interface NormalizedMessage {
 }
 export type SessionStatus = 'idle' | 'loading' | 'streaming' | 'error';
 export interface SessionSlot {
+  managedProjection?: NormalizedMessage[]; managedMetadata?: ManagedUIStatus; _lastManagedRef?: NormalizedMessage[];
   serverMessages: NormalizedMessage[]; realtimeMessages: NormalizedMessage[]; merged: NormalizedMessage[];
   _lastServerRef: NormalizedMessage[]; _lastRealtimeRef: NormalizedMessage[]; _fetchSeq: number; _fetchMoreTicket: number | null;
   _pendingRequests: number; _loadingTicket: number | null; _includeImages: boolean; status: SessionStatus; fetchedAt: number;
@@ -156,7 +159,7 @@ function retainUnpersisted(server: NormalizedMessage[], realtime: NormalizedMess
   const diskIds = new Set(server.map((row) => row.id).filter(Boolean));
   return realtime.filter((row) => {
     if (row.id && diskIds.has(row.id)) return false;
-    if (row.id?.startsWith('local_')) return !localUserIsPersisted(row, server);
+    if (row.id?.startsWith('local_')) return row.actionId ? !server.some((candidate) => candidate.actionId === row.actionId) : !localUserIsPersisted(row, server);
     if ((row.kind === 'stream_delta' || row.id === `__streaming_${row.sessionId}`) || (row.kind === 'text' && row.role === 'assistant' && row.id?.startsWith('text_'))) return !assistantEchoesPersisted(row, server, realtime);
     return !(row.kind === 'tool_use' && row.toolId && server.some((saved) => saved.kind === 'tool_use' && saved.toolId === row.toolId));
   });
@@ -179,6 +182,24 @@ function mergeWindows(server: NormalizedMessage[], realtime: NormalizedMessage[]
 
 function refreshMerged(slot: SessionSlot) {
   const server = slot.serverMessages;
+  if (slot.managedProjection) {
+    if (slot._lastManagedRef === slot.managedProjection && server === slot._lastServerRef && slot.realtimeMessages === slot._lastRealtimeRef) return false;
+    slot._lastManagedRef = slot.managedProjection;
+    slot._lastServerRef = server;
+    slot._lastRealtimeRef = slot.realtimeMessages;
+    const managed = slot.managedProjection;
+    const overlaps = (row: NormalizedMessage) => managed.some((record) =>
+      record.id === row.id || (row.actionId && record.actionId === row.actionId)
+      || (row.toolId && row.toolId === record.toolId && row.kind === record.kind)
+      || (!row.id?.startsWith('local_') && row.kind === record.kind && row.role === record.role
+        && Boolean(row.content) && row.content === record.content));
+    slot.merged = withoutRepeatedIds([
+      ...server.filter((row) => !row.ownerGeneration && !overlaps(row)),
+      ...managed,
+      ...slot.realtimeMessages.filter((row) => !row.ownerGeneration && !overlaps(row)),
+    ]);
+    return true;
+  }
   if (server === slot._lastServerRef && slot.realtimeMessages === slot._lastRealtimeRef) return false;
   slot._lastServerRef = server;
   slot._lastRealtimeRef = slot.realtimeMessages;
@@ -310,6 +331,16 @@ export function useSessionStore() {
   const append = useCallback((id: string, messages: NormalizedMessage[]) => { if (!messages.length) return; const slot = getSlot(id); const index = new Map<string, number>(); const next = [...slot.realtimeMessages]; next.forEach((row, position) => { const key = messageKey(row); if (key) index.set(key, position); }); messages.forEach((row) => { const normalized = row.sessionId === id ? row : { ...row, sessionId: id }; const key = messageKey(normalized); const position = key ? index.get(key) : undefined; if (position === undefined) { if (key) index.set(key, next.length); next.push(normalized); } else next[position] = normalized; }); slot.realtimeMessages = next.length > MAX_REALTIME_MESSAGES ? next.slice(-MAX_REALTIME_MESSAGES) : next; refreshMerged(slot); emitSession(id); }, [emitSession, getSlot]);
   const appendRealtime = useCallback((id: string, message: NormalizedMessage) => append(id, [message]), [append]);
   const appendRealtimeBatch = useCallback((id: string, messages: NormalizedMessage[]) => append(id, messages), [append]);
+  const replaceManagedProjection = useCallback((id: string, records: ManagedChatRecord[], metadata?: ManagedUIStatus) => {
+    const slot = getSlot(id);
+    slot.managedProjection = withoutRepeatedIds(records.map((record) => ({ ...record, sessionId: id })) as NormalizedMessage[]);
+    const acceptedActions = new Set(records.filter((record) => record.role === 'user' && typeof record.actionId === 'string').map((record) => record.actionId));
+    slot.realtimeMessages = slot.realtimeMessages.filter((row) => !row.actionId || !acceptedActions.has(row.actionId));
+    slot.managedMetadata = metadata;
+    if (metadata) slot.status = metadata.isProcessing ? 'streaming' : 'idle';
+    refreshMerged(slot);
+    emitSession(id);
+  }, [emitSession, getSlot]);
 
   const refreshFromServer = useCallback(async (id: string, options: { includeImages?: boolean } = {}) => {
     const slot = begin(id); if (typeof options.includeImages === 'boolean') slot._includeImages = options.includeImages; const ticket = ++slot._fetchSeq; if (slot.status === 'loading') slot._loadingTicket = ticket;
@@ -330,7 +361,7 @@ export function useSessionStore() {
   const getMessages = useCallback((id: string) => { const slot = slots.current.get(id); if (!slot) return EMPTY; refreshMerged(slot); return slot.merged; }, []);
   const getSessionSlot = useCallback((id: string) => { const slot = slots.current.get(id); if (slot) refreshMerged(slot); return slot; }, []);
 
-  return useMemo(() => ({ getSlot, has, fetchFromServer, fetchMore, appendRealtime, appendRealtimeBatch, refreshFromServer, setActiveSession, setStatus, isStale, updateStreaming, finalizeStreaming, clearRealtime, clear, getJobSlot, getJobCursor, setActiveJob, applyJobSubscribed, applyJobReplayChunk, applyJobLiveEvent, setJobError, clearJobs, getMessages, getSessionSlot, subscribeSession }), [getSlot, has, fetchFromServer, fetchMore, appendRealtime, appendRealtimeBatch, refreshFromServer, setActiveSession, setStatus, isStale, updateStreaming, finalizeStreaming, clearRealtime, clear, getJobSlot, getJobCursor, setActiveJob, applyJobSubscribed, applyJobReplayChunk, applyJobLiveEvent, setJobError, clearJobs, getMessages, getSessionSlot, subscribeSession]);
+  return useMemo(() => ({ replaceManagedProjection, getSlot, has, fetchFromServer, fetchMore, appendRealtime, appendRealtimeBatch, refreshFromServer, setActiveSession, setStatus, isStale, updateStreaming, finalizeStreaming, clearRealtime, clear, getJobSlot, getJobCursor, setActiveJob, applyJobSubscribed, applyJobReplayChunk, applyJobLiveEvent, setJobError, clearJobs, getMessages, getSessionSlot, subscribeSession }), [replaceManagedProjection, getSlot, has, fetchFromServer, fetchMore, appendRealtime, appendRealtimeBatch, refreshFromServer, setActiveSession, setStatus, isStale, updateStreaming, finalizeStreaming, clearRealtime, clear, getJobSlot, getJobCursor, setActiveJob, applyJobSubscribed, applyJobReplayChunk, applyJobLiveEvent, setJobError, clearJobs, getMessages, getSessionSlot, subscribeSession]);
 }
 
 export type SessionStore = ReturnType<typeof useSessionStore>;

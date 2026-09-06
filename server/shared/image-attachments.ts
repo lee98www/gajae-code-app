@@ -46,6 +46,17 @@ export function normalizeImageDescriptors(images: unknown): ImageAttachmentDescr
   return descriptors;
 }
 
+/** Chat uploads are files directly inside the server-owned upload directory. */
+export function filterImagesToUploadStore(images: unknown, assetsRootOverride?: string): ImageAttachmentDescriptor[] {
+  const assetRoot = path.resolve(assetsRootOverride ?? getGlobalImageAssetsDir());
+  return normalizeImageDescriptors(images).filter(({ path: imagePath }) => {
+    const relativePath = path.relative(assetRoot, path.resolve(assetRoot, imagePath));
+    return relativePath.length > 0 && !relativePath.startsWith('..')
+      && !path.isAbsolute(relativePath) && !relativePath.includes(path.sep)
+      && !relativePath.includes('/');
+  });
+}
+
 export function toPosixPath(value: string): string {
   return value.replaceAll('\\', '/');
 }

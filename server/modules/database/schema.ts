@@ -81,6 +81,10 @@ export const PROJECTS_TABLE_SCHEMA_SQL = table(`
 `);
 
 export const PROJECT_PERMISSIONS_TABLE_SCHEMA_SQL = table(`
+  CREATE TABLE IF NOT EXISTS project_permission_revisions (
+      project_path TEXT PRIMARY KEY,
+      revision INTEGER NOT NULL DEFAULT 0
+  );
   CREATE TABLE IF NOT EXISTS project_permissions (
       project_path TEXT NOT NULL PRIMARY KEY, -- one policy per project, keyed like sessions are
       mode TEXT NOT NULL DEFAULT 'ask' CHECK (mode IN ('ask', 'auto_edits', 'bypass')), -- how gated tools resolve
@@ -91,6 +95,18 @@ export const PROJECT_PERMISSIONS_TABLE_SCHEMA_SQL = table(`
           ON DELETE CASCADE
           ON UPDATE CASCADE
   );
+  CREATE TRIGGER IF NOT EXISTS project_permissions_insert_revision AFTER INSERT ON project_permissions BEGIN
+    INSERT INTO project_permission_revisions VALUES (NEW.project_path, 1)
+      ON CONFLICT(project_path) DO UPDATE SET revision = revision + 1;
+  END;
+  CREATE TRIGGER IF NOT EXISTS project_permissions_update_revision AFTER UPDATE ON project_permissions BEGIN
+    INSERT INTO project_permission_revisions VALUES (NEW.project_path, 1)
+      ON CONFLICT(project_path) DO UPDATE SET revision = revision + 1;
+  END;
+  CREATE TRIGGER IF NOT EXISTS project_permissions_delete_revision AFTER DELETE ON project_permissions BEGIN
+    INSERT INTO project_permission_revisions VALUES (OLD.project_path, 1)
+      ON CONFLICT(project_path) DO UPDATE SET revision = revision + 1;
+  END;
 `);
 
 export const SESSIONS_TABLE_SCHEMA_SQL = table(`
@@ -155,11 +171,128 @@ export const GJC_TERMINAL_NOTIFICATION_META_TABLE_SCHEMA_SQL = table(`
   );
 `);
 
+export const HERDR_MANAGED_BINDINGS_TABLE_SCHEMA_SQL = table(`
+  CREATE TABLE IF NOT EXISTS herdr_managed_bindings (
+      app_session_id TEXT PRIMARY KEY, -- app conversation identity
+      provider_session_id TEXT, -- native GJC provider identity once ready
+      owner_generation TEXT NOT NULL, -- single live-owner fence
+      herdr_instance_id TEXT NOT NULL, -- selected existing Herdr authority
+      workspace_id TEXT, -- owned managed workspace
+      tab_id TEXT, -- owned task tab
+      pane_id TEXT, -- owned task pane
+      terminal_id TEXT, -- observed terminal identity
+      lifecycle TEXT NOT NULL CHECK (lifecycle IN ('reserved', 'claiming', 'ready', 'idle', 'running', 'awaiting_input', 'waiting_attachment', 'awaiting_reattach_approval', 'unknown', 'interrupted', 'closed')),
+      last_seq INTEGER NOT NULL DEFAULT 0 CHECK (last_seq >= 0), -- durable rich event watermark
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (herdr_instance_id, owner_generation),
+      FOREIGN KEY (app_session_id) REFERENCES sessions (session_id) ON DELETE CASCADE
+  );
+`);
+
+export const HERDR_MANAGED_EVENTS_TABLE_SCHEMA_SQL = table(`
+  CREATE TABLE IF NOT EXISTS herdr_managed_events (
+      app_session_id TEXT NOT NULL,
+      owner_generation TEXT NOT NULL,
+      seq INTEGER NOT NULL CHECK (seq >= 1),
+      kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (app_session_id, owner_generation, seq),
+      FOREIGN KEY (app_session_id) REFERENCES herdr_managed_bindings (app_session_id) ON DELETE CASCADE
+  );
+`);
+
+export const HERDR_MANAGED_COMMANDS_TABLE_SCHEMA_SQL = table(`
+  CREATE TABLE IF NOT EXISTS herdr_managed_commands (
+      app_session_id TEXT NOT NULL,
+      owner_generation TEXT NOT NULL,
+      action_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('admitted', 'executing', 'settled', 'unknown', 'rejected')),
+      seq INTEGER NOT NULL DEFAULT 0 CHECK (seq >= 0),
+      message TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (app_session_id, owner_generation, action_id),
+      FOREIGN KEY (app_session_id) REFERENCES herdr_managed_bindings (app_session_id) ON DELETE CASCADE
+  );
+`);
+
+export const HERDR_MANAGED_DECISIONS_TABLE_SCHEMA_SQL = table(`
+  CREATE TABLE IF NOT EXISTS herdr_managed_decisions (
+      app_session_id TEXT NOT NULL,
+      owner_generation TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      provider_session_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      request_kind TEXT NOT NULL CHECK (request_kind IN ('ask', 'permission')),
+      request_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'decided', 'settled', 'unknown', 'cancelled')),
+      policy_revision INTEGER NOT NULL DEFAULT 0 CHECK (policy_revision >= 0),
+      resolution_json TEXT,
+      decided_by_action_id TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      decided_at DATETIME,
+      PRIMARY KEY (app_session_id, owner_generation, request_id),
+      FOREIGN KEY (app_session_id) REFERENCES herdr_managed_bindings (app_session_id) ON DELETE CASCADE
+  );
+`);
+
 export const APP_CONFIG_TABLE_SCHEMA_SQL = table(`
   CREATE TABLE IF NOT EXISTS app_config (
       key TEXT PRIMARY KEY, -- configuration entry name
       value TEXT NOT NULL, -- serialized configuration value
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP -- first write instant
+  );
+`);
+
+export const HERDR_MANAGED_STATE_TABLE_SCHEMA_SQL = table(`
+  CREATE TABLE IF NOT EXISTS herdr_managed_state (
+      app_session_id TEXT NOT NULL,
+      owner_generation TEXT NOT NULL,
+      state_json TEXT NOT NULL,
+      PRIMARY KEY (app_session_id, owner_generation),
+      FOREIGN KEY (app_session_id) REFERENCES herdr_managed_bindings (app_session_id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS herdr_managed_snapshots (
+      snapshot_id TEXT PRIMARY KEY,
+      app_session_id TEXT NOT NULL,
+      owner_generation TEXT NOT NULL,
+      watermark INTEGER NOT NULL,
+      byte_length INTEGER NOT NULL,
+      pages_json TEXT NOT NULL,
+      lease_expires_at INTEGER NOT NULL,
+      progress_page INTEGER NOT NULL DEFAULT -1,
+      FOREIGN KEY (app_session_id) REFERENCES herdr_managed_bindings (app_session_id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_managed_snapshot_expiry ON herdr_managed_snapshots (lease_expires_at);
+  CREATE INDEX IF NOT EXISTS idx_managed_snapshot_owner ON herdr_managed_snapshots (app_session_id, owner_generation, lease_expires_at);
+`);
+
+export const HERDR_MANAGED_PROVISION_TABLE_SCHEMA_SQL = table(`
+  CREATE TABLE IF NOT EXISTS herdr_managed_registrations (
+    app_session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+    project_path TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS herdr_managed_workspaces (
+    endpoint_key TEXT PRIMARY KEY,
+    phase TEXT NOT NULL,
+    workspace_id TEXT
+  );
+  CREATE TABLE IF NOT EXISTS herdr_managed_provisions (
+    app_session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+    owner_generation TEXT NOT NULL UNIQUE,
+    claim_nonce TEXT NOT NULL UNIQUE,
+    launch_claimed INTEGER NOT NULL DEFAULT 0,
+    endpoint_json TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    workspace_id TEXT,
+    placement_json TEXT,
+    provider_session_id TEXT,
+    private_directory TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 `);
 
@@ -189,8 +322,14 @@ const statements = [
   'CREATE INDEX IF NOT EXISTS idx_gjc_terminal_notification_dispatches_status_claimed_at ON gjc_terminal_notification_dispatches(status, claimed_at);',
   GJC_TERMINAL_NOTIFICATION_SCAN_CURSORS_TABLE_SCHEMA_SQL,
   GJC_TERMINAL_NOTIFICATION_META_TABLE_SCHEMA_SQL,
+  HERDR_MANAGED_BINDINGS_TABLE_SCHEMA_SQL,
+  HERDR_MANAGED_EVENTS_TABLE_SCHEMA_SQL,
+  HERDR_MANAGED_COMMANDS_TABLE_SCHEMA_SQL,
+  HERDR_MANAGED_DECISIONS_TABLE_SCHEMA_SQL,
+  HERDR_MANAGED_STATE_TABLE_SCHEMA_SQL,
   LAST_SCANNED_AT_SQL,
   APP_CONFIG_TABLE_SCHEMA_SQL,
+  HERDR_MANAGED_PROVISION_TABLE_SCHEMA_SQL,
 ];
 
 export const INIT_SCHEMA_SQL = `${statements.join('\n')}\n`;

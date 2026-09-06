@@ -76,6 +76,7 @@
     "queue": {
       "sendNext": "Mettre un autre message en file d'attente",
       "label": "En file d'attente",
+      "paused": "File d’attente en pause",
       "willSend": "Envoie lorsque l'exécution en cours se termine",
       "willFollow": "Envoie après les messages ci-dessus",
       "edit": "Modifier l'élément en file d'attente",
