@@ -154,8 +154,10 @@ Unknown needs status and authoritative proof, **not restart-and-retry** or a
 fresh action ID. Do not mutate foreign tasks to recover a managed one.
 Closing the App's own `Gajae <install>` workspace in Herdr is safe: the next
 new conversation notices it is gone and creates a fresh owned workspace. A
-send that Herdr provably never dispatched reports the owner unavailable; send
-again to provision a fresh owner.
+send that Herdr provably never dispatched (Herdr answered a request-validation
+error and a fresh snapshot shows no new pane) reports the owner unavailable;
+send again to provision a fresh owner. Any other failed or unanswered layout
+stays an uncertain owner.
 A fenced owner (`unknown`, `interrupted`) still answers `:status` and
 `:ack ACTION` from what it durably knows, and rejects new commands with
 `ACK ACTION rejected SEQ`; those replies are not journaled and nothing is
@@ -177,8 +179,9 @@ the App is absent.
 Archiving hides a conversation without stopping its owner. Permanent deletion
 requires confirmed native closure and owned metadata cleanup; an active or
 uncertain owner cannot be deleted or silently adopted. A project force-delete
-is fenced the same way for every session it contains, before any transcript is
-unlinked. Native history, rich event
+is fenced the same way for every session it contains; the fence and the row
+cascade are one writer transaction, and only the transcripts of the rows it
+removed are unlinked afterwards. Native history, rich event
 replay, and bounded paginated snapshots restore chat; terminal scraping does
 not. Private bootstrap, attach tokens, and automation target paths stay
 server-side, outside browser payloads and diagnostic logs. Tokens and prompt

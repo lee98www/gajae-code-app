@@ -29,13 +29,6 @@ async function discardSessionFile(filename: string): Promise<void> {
   });
 }
 
-export async function deleteSessionJsonlFilesForProjectPath(projectPath: string): Promise<void> {
-  const sessions = sessionStore.getSessionsByProjectPathIncludingArchived(projectPath);
-  for (const filename of uniqueSessionFilePaths(sessions)) {
-    await discardSessionFile(filename);
-  }
-}
-
 /**
  * A project force-delete removes every session row, and managed bindings and
  * provisions cascade with them. That must never overtake a live or uncertain
@@ -63,15 +56,19 @@ export async function deleteOrArchiveProject(projectId: string, force: boolean):
 
   if (!force) return void projectStore.updateProjectIsArchivedById(projectId, true);
 
-  // Transcript files are only discarded once the durable fence has admitted the
-  // deletion, so an uncertain owner keeps its native history as well.
-  getConnection().transaction(() => { assertManagedOwnersClosed(project.project_path); }).immediate();
-  await deleteSessionJsonlFilesForProjectPath(project.project_path);
-  getConnection().transaction(() => {
+  // Admission and the row cascade are one writer transaction: no reservation,
+  // claim or closure can interleave between the fence and the deletion. Only
+  // the transcripts of rows that transaction removed are discarded afterwards,
+  // so an owner admitted later in the same project keeps its own history and
+  // a refused deletion removes nothing.
+  const transcripts = getConnection().transaction(() => {
     assertManagedOwnersClosed(project.project_path);
+    const sessions = sessionStore.getSessionsByProjectPathIncludingArchived(project.project_path);
     sessionStore.deleteSessionsByProjectPath(project.project_path);
     projectStore.deleteProjectById(projectId);
+    return uniqueSessionFilePaths(sessions);
   }).immediate();
+  for (const filename of transcripts) await discardSessionFile(filename);
 }
 
 export function restoreArchivedProject(projectId: string): void {

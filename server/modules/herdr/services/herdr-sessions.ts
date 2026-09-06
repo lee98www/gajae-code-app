@@ -6,14 +6,14 @@ import path from 'node:path';
 import { herdrInputRequestSchema, HERDR_OUTPUT_LINES, type HerdrInputRequest, type HerdrInputResponse, type HerdrOutputResponse, type HerdrPane, type HerdrSessionSummary, type HerdrSnapshotResponse } from '../../../../shared/herdr-protocol.js';
 import type { HerdrManagedEndpointIdentity, HerdrManagedPublicSelection } from '../../../../shared/herdr-managed-provision-protocol.js';
 
-import { checkHerdrAbort, HerdrClient, HerdrError, type HerdrConnector, type HerdrProvisionReceipt, type HerdrWirePane } from './herdr-client.js';
+import { checkHerdrAbort, HerdrClient, HerdrError, type HerdrConnector, type HerdrOwnedWorkspace, type HerdrProvisionReceipt, type HerdrWirePane } from './herdr-client.js';
 
 const SESSION_NAME = /^[A-Za-z0-9._-]{1,80}$/;
 export type HerdrProvisioningHandle = Readonly<{
   identity: HerdrManagedEndpointIdentity;
   createWorkspace(cwd: string, label: string, signal?: AbortSignal): Promise<HerdrProvisionReceipt>;
   inspectWorkspace(workspaceId: string, label: string, signal?: AbortSignal): Promise<'present' | 'absent' | 'foreign'>;
-  applyLayout(workspaceId: string, argv: readonly string[], cwd: string, signal?: AbortSignal): Promise<HerdrProvisionReceipt>;
+  applyLayout(target: HerdrOwnedWorkspace, argv: readonly string[], cwd: string, signal?: AbortSignal): Promise<HerdrProvisionReceipt>;
 }>;
 const SEND_KEYS = { text: [], 'text-enter': ['Enter'], enter: ['Enter'], escape: ['Escape'] };
 export type HerdrSessionEntry = {
@@ -113,8 +113,8 @@ export class HerdrSessionsService {
         guarded(() => client.createWorkspace(cwd, label, operationSignal, { admit, check }), operationSignal),
       inspectWorkspace: (workspaceId: string, label: string, operationSignal?: AbortSignal) =>
         guarded(() => client.inspectWorkspace(workspaceId, label, operationSignal, { admit, check }), operationSignal),
-      applyLayout: (workspaceId: string, argv: readonly string[], cwd: string, operationSignal?: AbortSignal) =>
-        guarded(() => client.applyLayout(workspaceId, argv, cwd, operationSignal, { admit, check }), operationSignal),
+      applyLayout: (target: HerdrOwnedWorkspace, argv: readonly string[], cwd: string, operationSignal?: AbortSignal) =>
+        guarded(() => client.applyLayout(target, argv, cwd, operationSignal, { admit, check }), operationSignal),
     });
   }
 

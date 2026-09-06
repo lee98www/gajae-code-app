@@ -241,6 +241,12 @@ function presentEvent(row: EventRow): HerdrManagedEvent {
   };
 }
 
+/** The journal of a closed, unknown or interrupted owner is fenced by design. */
+export class HerdrManagedOwnerFencedError extends Error {
+  readonly code = 'MANAGED_OWNER_FENCED' as const;
+  constructor(lifecycle: string) { super(`Managed Herdr owner is not writable (${lifecycle}).`); this.name = 'HerdrManagedOwnerFencedError'; }
+}
+
 export const herdrManagedDb = {
   reserve(input: { appSessionId: string; projectPath: string; herdrInstanceId: string; ownerGeneration: string }): HerdrManagedBinding {
     const db = getConnection();
@@ -313,7 +319,7 @@ export const herdrManagedDb = {
     return db.transaction(() => {
       const binding = this.get(input.appSessionId, input.ownerGeneration);
       if (!binding || binding.lifecycle === 'closed' ||
-        (['unknown', 'interrupted'].includes(binding.lifecycle) && input.kind !== 'managed.session')) throw new Error('Managed Herdr owner is not writable.');
+        (['unknown', 'interrupted'].includes(binding.lifecycle) && input.kind !== 'managed.session')) throw new HerdrManagedOwnerFencedError(binding?.lifecycle ?? 'missing');
       const current = this.getState(input.appSessionId, input.ownerGeneration);
       const seq = binding.lastSeq + 1;
       db.prepare(`INSERT INTO herdr_managed_events (app_session_id, owner_generation, seq, kind, payload_json)

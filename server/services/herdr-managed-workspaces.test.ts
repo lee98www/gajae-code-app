@@ -59,7 +59,7 @@ test('one layout per intent, shared workspace, protected bootstrap and provider 
       provisioningSelection: async selected => selection(['chosen'], selected),
       openProvisioningHandle: async () => ({ identity: endpoint, inspectWorkspace: async () => 'present' as const,
         createWorkspace: async () => { creates++; return { workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'terminal-1' }; },
-        applyLayout: async (workspaceId, argv) => {
+        applyLayout: async (target, argv) => {
           const layout = ++layouts;
           const file = argv[argv.length - 1]!;
           const bootstrap = JSON.parse(await fs.readFile(file, 'utf8')) as Record<string, unknown>; bootstraps.push(bootstrap);
@@ -79,7 +79,8 @@ test('one layout per intent, shared workspace, protected bootstrap and provider 
           assert.throws(() => db.claimLaunch(id, generation, bootstrap.claimNonce as string));
           herdrManagedDb.beginClaim(id, generation);
           herdrManagedDb.claim({ protocolVersion: 1, appSessionId: id, ownerGeneration: generation, providerSessionId: `provider-${id}` });
-          return { workspaceId, tabId: `w1:t${layout}`, paneId: `w1:p${layout}`, terminalId: `terminal-${layout}` };
+          assert.match(target.label, /^Gajae [0-9a-f-]{36}$/);
+          return { workspaceId: target.workspaceId, tabId: `w1:t${layout}`, paneId: `w1:p${layout}`, terminalId: `terminal-${layout}` };
         },
       }),
     },
@@ -126,9 +127,10 @@ test('a registered parent workspace that vanished or was relabelled is supersede
     sessions: { provisioningSelection: async selected => selection(['chosen'], selected), openProvisioningHandle: async () => ({ identity: endpoint,
       inspectWorkspace: async (workspaceId: string, label: string) => { inspected.push(`${workspaceId}:${label}`); if (inspection === 'unreadable') throw new Error('snapshot unavailable'); return inspection; },
       createWorkspace: async () => ({ workspaceId: `w${++creates}`, tabId: `w${creates}:t1`, paneId: `w${creates}:p1`, terminalId: `term-${creates}` }),
-      applyLayout: async (workspaceId: string) => { layouts.push(workspaceId); throw new Error('response lost'); },
+      applyLayout: async (target) => { layouts.push(target.workspaceId); appended.push(`${target.workspaceId}:${target.label}`); throw new Error('response lost'); },
     }) },
   });
+  const appended: string[] = [];
   const start = async (id: string) => { sessionsDb.createAppSession(id, 'gjc', '/project'); service.registerNewSession(id, '/project'); return service.ensure(id, {}); };
   assert.equal((await start('a')).status, 'unknown');
   assert.deepEqual({ creates, layouts, inspected }, { creates: 1, layouts: ['w1'], inspected: [] }, 'first use creates the parent without inspection');
@@ -149,6 +151,8 @@ test('a registered parent workspace that vanished or was relabelled is supersede
   assert.equal((await start('e')).status, 'unknown');
   assert.deepEqual({ creates, last: layouts.at(-1) }, { creates: 3, last: 'w3' });
   assert.ok(inspected.every(entry => /^w\d:Gajae [0-9a-f-]{36}$/.test(entry)), 'inspection is by exact id and the owned label');
+  assert.equal(appended.length, layouts.length);
+  assert.ok(appended.every(entry => /^w\d:Gajae [0-9a-f-]{36}$/.test(entry)), 'every append is bound to the exact id under the owned label');
   service.close();
 }));
 
@@ -203,7 +207,7 @@ test('keeps a dropped layout unknown despite a live claimed owner and an unlinke
     enrich: async options => options,
     sessions: { provisioningSelection: async selected => selection(['chosen'], selected), openProvisioningHandle: async () => ({ identity: endpoint, inspectWorkspace: async () => 'present' as const,
       createWorkspace: async () => { creates++; return { workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }; },
-      applyLayout: async (_workspaceId, argv) => {
+      applyLayout: async (_target, argv) => {
         layouts++; liveClaimedOwner = true; unlinkedPane = { workspaceId: 'w1', paneId: 'w1:p9', cwd: '/project' };
         const bootstrap = JSON.parse(await fs.readFile(argv[argv.length - 1]!, 'utf8')) as Record<string, unknown>;
         const id = bootstrap.appSessionId as string; const generation = bootstrap.ownerGeneration as string;
@@ -220,6 +224,55 @@ test('keeps a dropped layout unknown despite a live claimed owner and an unlinke
   assert.deepEqual(unlinkedPane, { workspaceId: 'w1', paneId: 'w1:p9', cwd: '/project' });
   assert.equal((await service.ensure('a', {})).status, 'unknown');
   assert.equal(creates, 1); assert.equal(layouts, 1);
+}));
+
+test('a claiming owner without captured placement is fenced only on its exact confirmed death', async () => fixture(async root => {
+  const service = new HerdrManagedWorkspacesService({ privateRoot: path.join(root, 'private'),
+    enrich: async options => options,
+    sessions: { provisioningSelection: async selected => selection(['chosen'], selected), openProvisioningHandle: async () => ({ identity: endpoint, inspectWorkspace: async () => 'present' as const,
+      createWorkspace: async () => ({ workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }),
+      applyLayout: async (_target, argv) => {
+        const bootstrap = JSON.parse(await fs.readFile(argv[argv.length - 1]!, 'utf8')) as Record<string, unknown>;
+        const id = bootstrap.appSessionId as string; const generation = bootstrap.ownerGeneration as string;
+        db.claimLaunch(id, generation, bootstrap.claimNonce as string);
+        herdrManagedDb.beginClaim(id, generation);
+        herdrManagedDb.claim({ protocolVersion: 1, appSessionId: id, ownerGeneration: generation, providerSessionId: 'provider-a' });
+        throw new Error('layout.apply reply lost after owner claim');
+      },
+    }) },
+  });
+  sessionsDb.createAppSession('claimed', 'gjc', '/project'); service.registerNewSession('claimed', '/project');
+  const stand = spawn('/bin/sleep', ['60'], { stdio: 'ignore' });
+  const exited = new Promise<void>(resolve => stand.once('exit', () => resolve()));
+  try {
+    assert.equal((await service.ensure('claimed', {})).status, 'unknown');
+    const record = db.get('claimed')!;
+    assert.equal(record.placement, null);
+    const lifecycle = () => herdrManagedDb.get('claimed', record.ownerGeneration)?.lifecycle;
+    const before = lifecycle();
+    // No identity record: nothing is known about the owner process.
+    assert.equal((await service.ensure('claimed', {})).status, 'unknown');
+    assert.equal(lifecycle(), before);
+    // The recorded process is alive with its recorded start time: not death.
+    const ownerFile = path.join(record.privateDirectory, 'owner.json');
+    const standToken = processStartToken(stand.pid!);
+    assert.ok(standToken);
+    await fs.writeFile(ownerFile, JSON.stringify({ ownerGeneration: record.ownerGeneration, pid: stand.pid, startedAt: standToken }), { mode: 0o600 });
+    assert.equal((await service.ensure('claimed', {})).status, 'unknown');
+    assert.equal(lifecycle(), before);
+    // The exact recorded process is gone: fenced, and nothing is replayed or replaced.
+    stand.kill('SIGKILL'); await exited;
+    const fenced = await service.ensure('claimed', {});
+    assert.equal(fenced.status, 'unknown');
+    assert.equal(fenced.ownerGeneration, record.ownerGeneration);
+    assert.equal(lifecycle(), 'interrupted');
+    assert.equal(db.get('claimed')!.ownerGeneration, record.ownerGeneration, 'no replacement owner is provisioned');
+    assert.equal(db.get('claimed')!.placement, null, 'no placement is invented');
+    assert.ok(await fs.stat(path.join(record.privateDirectory, 'bootstrap.json')), 'private files are retained');
+  } finally {
+    if (stand.exitCode === null && stand.signalCode === null) stand.kill('SIGKILL');
+    service.close();
+  }
 }));
 
 test('dropped layout reply recovers through the actual host-owned placement and private attach', { timeout: 20_000 }, async () => fixture(async () => {
@@ -306,7 +359,7 @@ test('dropped layout reply recovers through the actual host-owned placement and 
         identity: endpointForTest,
         inspectWorkspace: async () => 'present' as const,
         createWorkspace: async () => ({ workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }),
-        applyLayout: async (_workspaceId, argv) => {
+        applyLayout: async (_target, argv) => {
           layouts++;
           const bootstrap = JSON.parse(await fs.readFile(argv[argv.length - 1]!, 'utf8')) as HerdrTaskHostBootstrap;
           host = new HerdrTaskHost({
@@ -408,7 +461,7 @@ test('a reopened App recovers an owner fenced unknown read-only, without promoti
       identity: endpointForTest,
       inspectWorkspace: async () => 'present' as const,
       createWorkspace: async () => ({ workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }),
-      applyLayout: async (_workspaceId: string, argv: readonly string[]) => {
+      applyLayout: async (_target: { workspaceId: string; label: string }, argv: readonly string[]) => {
         const bootstrap = JSON.parse(await fs.readFile(argv[argv.length - 1]!, 'utf8')) as HerdrTaskHostBootstrap;
         host = new HerdrTaskHost({
           bootstrap,
@@ -508,7 +561,7 @@ test('a failed attach fences the generation only on exact confirmed owner death'
       identity: endpointForTest,
       inspectWorkspace: async () => 'present' as const,
       createWorkspace: async () => ({ workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }),
-      applyLayout: async (_workspaceId: string, argv: readonly string[]) => {
+      applyLayout: async (_target: { workspaceId: string; label: string }, argv: readonly string[]) => {
         const bootstrap = JSON.parse(await fs.readFile(argv[argv.length - 1]!, 'utf8')) as HerdrTaskHostBootstrap;
         host = new HerdrTaskHost({ bootstrap, launchEnvironment: { HERDR_WORKSPACE_ID: 'w1', HERDR_TAB_ID: 'w1:t1', HERDR_PANE_ID: 'w1:p1' },
           createSession: () => ({ providerSessionId: 'actual-provider', async prompt() {}, async dispose() {} }) });

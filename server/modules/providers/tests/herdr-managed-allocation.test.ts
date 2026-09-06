@@ -115,6 +115,68 @@ test('project force-delete cannot overtake a live or uncertain managed owner', a
   });
 });
 
+test('project force-delete admission is atomic with its cascade and discards only the transcripts it removed', async () => {
+  await isolated(async (directory) => {
+    const { deleteOrArchiveProject } = await import('@/modules/projects/index.js');
+    const { projectsDb, herdrManagedProvisionDb, herdrManagedDb } = await import('@/modules/database/index.js');
+    const fs = await import('node:fs');
+    const db = getConnection();
+    const project = projectsDb.createProjectPath(directory, 'Owned project').project;
+    assert.ok(project);
+    const projectId = project.project_id;
+    const endpoint = { name: 'default', canonicalPath: path.join(directory, 'herdr.sock'), dev: 1, inode: 1 };
+    const closed = sessionsService.createAppSession('gjc', directory);
+    const transcript = path.join(directory, 'native.jsonl');
+    await writeFile(transcript, 'native history');
+    db.prepare('UPDATE sessions SET jsonl_path = ? WHERE session_id = ?').run(transcript, closed.sessionId);
+    db.prepare(`INSERT INTO herdr_managed_bindings (app_session_id, owner_generation, herdr_instance_id, lifecycle) VALUES (?, 'generation', 'default', 'closed')`).run(closed.sessionId);
+    db.prepare(`INSERT INTO herdr_managed_provisions (app_session_id, owner_generation, claim_nonce, endpoint_json, phase, private_directory) VALUES (?, 'generation', 'nonce', '{}', 'ready', ?)`).run(closed.sessionId, directory);
+    // A managed session reserved through the production writer before admission
+    // refuses the cascade, and the refused cascade discards nothing.
+    const early = sessionsService.createAppSession('gjc', directory);
+    const earlyTranscript = path.join(directory, 'early.jsonl');
+    await writeFile(earlyTranscript, 'early history');
+    db.prepare('UPDATE sessions SET jsonl_path = ? WHERE session_id = ?').run(earlyTranscript, early.sessionId);
+    herdrManagedProvisionDb.registerNewSession(early.sessionId, directory);
+    const reserved = herdrManagedProvisionDb.reserve(early.sessionId, endpoint, path.join(directory, 'early'));
+    await assert.rejects(deleteOrArchiveProject(projectId, true), { code: 'MANAGED_SESSION_NOT_CLOSED', statusCode: 409 });
+    assert.equal(await readFile(transcript, 'utf8'), 'native history');
+    assert.equal(await readFile(earlyTranscript, 'utf8'), 'early history');
+    assert.equal(herdrManagedDb.get(early.sessionId, reserved.ownerGeneration)?.lifecycle, 'reserved');
+    herdrManagedDb.setLifecycle(early.sessionId, reserved.ownerGeneration, 'closed');
+    // Every owner is closed: the cascade is admitted and committed in one
+    // writer transaction. A managed session that starts in the same project
+    // while transcripts are being discarded is a new owner the cascade never
+    // saw: its rows and history are untouched.
+    const unlink = fs.promises.unlink;
+    let fresh: { sessionId: string; ownerGeneration: string; transcript: string } | undefined;
+    fs.promises.unlink = async (target) => {
+      if (!fresh) {
+        const session = sessionsService.createAppSession('gjc', directory);
+        const freshTranscript = path.join(directory, 'fresh.jsonl');
+        await writeFile(freshTranscript, 'fresh history');
+        db.prepare('UPDATE sessions SET jsonl_path = ? WHERE session_id = ?').run(freshTranscript, session.sessionId);
+        herdrManagedProvisionDb.registerNewSession(session.sessionId, directory);
+        const record = herdrManagedProvisionDb.reserve(session.sessionId, endpoint, path.join(directory, 'fresh'));
+        fresh = { sessionId: session.sessionId, ownerGeneration: record.ownerGeneration, transcript: freshTranscript };
+      }
+      return unlink(target);
+    };
+    try { await deleteOrArchiveProject(projectId, true); } finally { fs.promises.unlink = unlink; }
+    assert.ok(fresh);
+    await assert.rejects(readFile(transcript), { code: 'ENOENT' });
+    await assert.rejects(readFile(earlyTranscript), { code: 'ENOENT' });
+    assert.equal(sessionsDb.getSessionById(closed.sessionId), null);
+    assert.equal(sessionsDb.getSessionById(early.sessionId), null);
+    assert.equal(projectsDb.getProjectById(projectId) ?? null, null);
+    assert.equal((db.prepare('SELECT count(*) AS n FROM herdr_managed_bindings WHERE app_session_id IN (?, ?)').get(closed.sessionId, early.sessionId) as { n: number }).n, 0, 'bindings cascade with the session rows');
+    assert.equal(await readFile(fresh.transcript, 'utf8'), 'fresh history', 'a later owner keeps its own history');
+    assert.ok(sessionsDb.getSessionById(fresh.sessionId));
+    assert.equal(herdrManagedDb.get(fresh.sessionId, fresh.ownerGeneration)?.lifecycle, 'reserved', 'the new reservation is untouched');
+    assert.equal(herdrManagedProvisionDb.get(fresh.sessionId)?.ownerGeneration, fresh.ownerGeneration);
+  });
+});
+
 test('nonmanaged native history removal is unchanged', async () => {
   await isolated(async (directory) => {
     for (const provider of ['gjc', 'claude']) {

@@ -9,7 +9,7 @@ import type { Writable } from 'node:stream';
 
 import { initializeDatabase } from '@/modules/database/init-db.js';
 import { closeConnection, getConnection, getDatabasePath } from '@/modules/database/connection.js';
-import { herdrManagedDb } from '@/modules/database/repositories/herdr-managed.db.js';
+import { HerdrManagedOwnerFencedError, herdrManagedDb } from '@/modules/database/repositories/herdr-managed.db.js';
 import { herdrManagedProvisionDb } from '@/modules/database/repositories/herdr-managed-provision.db.js';
 import { herdrManagedSnapshotsDb } from '@/modules/database/repositories/herdr-managed-snapshots.db.js';
 import { HerdrAgentReporter, HerdrClient, recordOwnerProcess, type HerdrAgentReporterStatus, type HerdrWireSnapshot } from '@/modules/herdr/index.js';
@@ -516,14 +516,46 @@ export class HerdrTaskHost {
     return secrets.reduce((value, secret) => value.split(secret).join('[redacted]'), text);
   }
 
+  /**
+   * The publication safety boundary every journaled SDK event crosses: browser
+   * and computer tool payloads are replaced by protected placeholders and every
+   * known attach/transport token is redacted.
+   */
+  #protect(input: Record<string, unknown>): Record<string, unknown> {
+    let event = input;
+    const automationTool = event.toolName === 'browser' || event.toolName === 'computer'
+      || (typeof event.toolId === 'string' && this.#session && ['browser', 'computer'].includes(String(this.snapshot().tools[event.toolId]?.input?.toolName)));
+    if (automationTool && event.kind === 'tool_use') event = { kind: 'tool_use', toolId: event.toolId, toolName: event.toolName, toolInput: {}, protected: true };
+    else if (automationTool && event.kind === 'tool_result') event = { kind: 'tool_result', toolId: event.toolId, content: '[Protected automation result]', isError: event.isError === true, isFinal: event.isFinal !== false };
+    else if (automationTool && event.kind === 'permission_request') {
+      const context = isObject(event.context) ? event.context : {};
+      event = { kind: event.kind, toolName: event.toolName, requestId: event.requestId, input: {}, context: { source: context.source, options: context.options } };
+    }
+    const secrets = this.#secrets();
+    if (secrets.length) event = JSON.parse(JSON.stringify(event, (_key, value: unknown) => typeof value === 'string' ? this.#redact(value, secrets) : value)) as Record<string, unknown>;
+    return event;
+  }
+
   #journalEvent(frame: ManagedChildEvent): void {
     if (frame.generation !== this.#bootstrap.ownerGeneration) throw new Error('SDK event generation mismatch.');
     let event = frame.event;
     if (event.kind === 'managed.automation-record-chunk') { this.#privateStore().putChunk(event, { provider: this.#providerSessionId, turn: frame.runId }); return; }
     if (event.kind === 'managed.idle') {
-      // Durable evidence of between-turn runtime state. A fenced owner's journal
-      // is intentionally not writable; the fence itself is that evidence.
-      try { herdrManagedDb.appendEvent({ appSessionId: this.#bootstrap.appSessionId, ownerGeneration: this.#bootstrap.ownerGeneration, kind: 'sdk.idle', payload: { ...event, turnId: frame.runId } }); this.#broadcast(); } catch { /* fenced */ }
+      // Durable evidence of between-turn runtime state. The wrapped event crosses
+      // the same publication boundary as an in-turn event: automation payloads
+      // stay protected and known tokens are redacted before anything is journaled.
+      const inner = isObject(event.event) ? this.#protect(event.event) : undefined;
+      const payload = { ...event, ...(inner ? { event: inner } : {}), turnId: frame.runId };
+      try {
+        herdrManagedDb.appendEvent({ appSessionId: this.#bootstrap.appSessionId, ownerGeneration: this.#bootstrap.ownerGeneration, kind: 'sdk.idle', payload });
+      } catch (error) {
+        // A fenced owner's journal is intentionally not writable; the fence itself
+        // is the evidence. Any other persistence failure is a lost event and
+        // must fail the private transport rather than be acknowledged.
+        if (error instanceof HerdrManagedOwnerFencedError) return;
+        throw error;
+      }
+      this.#broadcast();
       return;
     }
     if (event.kind === 'managed.automation') {
@@ -541,16 +573,7 @@ export class HerdrTaskHost {
       this.#broadcast();
       return;
     }
-    const automationTool = event.toolName === 'browser' || event.toolName === 'computer'
-      || (typeof event.toolId === 'string' && this.#session && ['browser', 'computer'].includes(String(this.snapshot().tools[event.toolId]?.input?.toolName)));
-    if (automationTool && event.kind === 'tool_use') event = { kind: 'tool_use', toolId: event.toolId, toolName: event.toolName, toolInput: {}, protected: true };
-    else if (automationTool && event.kind === 'tool_result') event = { kind: 'tool_result', toolId: event.toolId, content: '[Protected automation result]', isError: event.isError === true, isFinal: event.isFinal !== false };
-    else if (automationTool && event.kind === 'permission_request') {
-      const context = isObject(event.context) ? event.context : {};
-      event = { kind: event.kind, toolName: event.toolName, requestId: event.requestId, input: {}, context: { source: context.source, options: context.options } };
-    }
-    const secrets = this.#secrets();
-    if (secrets.length) event = JSON.parse(JSON.stringify(event, (_key, value: unknown) => typeof value === 'string' ? this.#redact(value, secrets) : value)) as Record<string, unknown>;
+    event = this.#protect(event);
     if (event.kind === 'session' && typeof event.providerSessionId === 'string') this.#providerSessionId = event.providerSessionId;
     const context = isObject(event.context) ? event.context : {};
     const requestKind = context.source === 'sdk-permission' ? 'permission' : event.toolName === 'ask' ? 'ask' : null;
@@ -1240,8 +1263,10 @@ export async function runHerdrTaskHostStdio(options: { bootstrap: HerdrTaskHostB
       if (display) writer.write(display);
     } else if (event.kind === 'managed.command' && isObject(event.payload) && event.payload.state === 'unknown' && typeof event.payload.actionId === 'string' && typeof event.payload.seq === 'number') {
       // An uncertain outcome is a critical fact for whoever holds the terminal,
-      // whichever client started the turn.
+      // whichever client started the turn; its bounded reason travels with it.
       writer.write(renderConsoleReceipt(event.payload.actionId, 'unknown', event.payload.seq), 'critical');
+      const reason = typeof event.payload.message === 'string' ? renderEvent({ kind: 'error', text: event.payload.message }, secrets) : null;
+      if (reason) writer.write(reason, 'critical');
     }
   });
   function onData(chunk: Buffer | string) {
@@ -1268,11 +1293,19 @@ export async function runHerdrTaskHostStdio(options: { bootstrap: HerdrTaskHostB
           else {
             const receipt = herdrManagedDb.getCommand(hello.appSessionId, hello.ownerGeneration, parsed.actionId!);
             writer.write(receipt ? renderConsoleReceipt(receipt.actionId, receipt.state, receipt.seq) : renderConsoleReject(parsed.actionId!, 'receipt_not_found'), 'critical');
+            const reason = receipt?.state === 'unknown' ? renderEvent({ kind: 'error', text: receipt.message }, secrets) : null;
+            if (reason) writer.write(reason, 'critical');
           }
           return;
         }
-        const receipt = await host.dispatch(parsed.command);
-        writer.write(renderConsoleReceipt(receipt.actionId, receipt.state, receipt.seq), 'critical');
+        const receipt = await host.dispatch(parsed.command).catch((error: unknown) => {
+          // A turn that ended unknown is not a rejected command: its durable
+          // receipt and reason are already announced from the journal, and a
+          // REJECT here would invite the operator to send it again.
+          if (herdrManagedDb.getCommand(hello.appSessionId, hello.ownerGeneration, parsed.command.actionId)?.state === 'unknown') return null;
+          throw error;
+        });
+        if (receipt) writer.write(renderConsoleReceipt(receipt.actionId, receipt.state, receipt.seq), 'critical');
       })().catch(() => {
         writer.write(renderConsoleReject(null, 'command_rejected'), 'critical');
       });

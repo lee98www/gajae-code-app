@@ -494,20 +494,57 @@ test('an App-started turn that ends unknown is announced on the console with its
     let stdout = '';
     output.on('data', chunk => { stdout += String(chunk); });
     const host = await runHerdrTaskHostStdio({
+      bootstrap: { appSessionId: 'managed-session', ownerGeneration: 'owner-gen-1', herdrInstanceId: 'herdr-main', projectPath: '/tmp/project', sessionRoot: tmp, attachSocketPath: path.join(tmp, 'attach.sock'), attachSecret: 'k'.repeat(32) },
+      input,
+      output,
+      createSession: () => ({ providerSessionId: 'provider-session-1', async prompt() { throw new Error(`Managed child prompt failed: provider quota exhausted (token ${'k'.repeat(32)})`); } }),
+    });
+    const command = promptCommand('app-turn', 'from the App');
+    await assert.rejects(host.dispatch(command), /provider quota exhausted/);
+    for (let i = 0; i < 100 && !stdout.includes('ERROR Prompt outcome is unknown'); i++) await new Promise(resolve => setTimeout(resolve, 5));
+    const receipt = host.snapshot().commands['app-turn'];
+    assert.equal(receipt.state, 'unknown');
+    assert.equal(receipt.message, 'Prompt outcome is unknown. Managed child prompt failed: provider quota exhausted (token [redacted])');
+    assert.match(stdout, new RegExp(`ACK app-turn unknown ${receipt.seq}\n`));
+    // The bounded reason is rendered for the terminal user, never a known token.
+    assert.match(stdout, /ERROR Prompt outcome is unknown\. Managed child prompt failed: provider quota exhausted \(token \[redacted\]\)\n/);
+    assert.doesNotMatch(stdout, /k{32}/);
+    assert.equal(host.snapshot().lifecycle, 'unknown');
+    // A later :ack query answers the reason as well.
+    input.write(':ack app-turn\n');
+    for (let i = 0; i < 100 && stdout.split('ERROR Prompt outcome is unknown').length < 3; i++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(stdout.split(`ACK app-turn unknown ${receipt.seq}\n`).length, 3);
+    assert.equal(stdout.split('ERROR Prompt outcome is unknown').length, 3);
+    assert.doesNotMatch(stdout, /REJECT/);
+    await host.close();
+  });
+});
+
+test('a console-entered turn that ends unknown is announced once and never as a rejected command', async () => {
+  await withManagedDatabase(async tmp => {
+    herdrManagedDb.reserve({ appSessionId: 'managed-session', projectPath: '/tmp/project', herdrInstanceId: 'herdr-main', ownerGeneration: 'owner-gen-1' });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    output.setEncoding('utf8');
+    let stdout = '';
+    output.on('data', chunk => { stdout += String(chunk); });
+    const host = await runHerdrTaskHostStdio({
       bootstrap: { appSessionId: 'managed-session', ownerGeneration: 'owner-gen-1', herdrInstanceId: 'herdr-main', projectPath: '/tmp/project', sessionRoot: tmp },
       input,
       output,
       createSession: () => ({ providerSessionId: 'provider-session-1', async prompt() { throw new Error('Managed child prompt failed: provider quota exhausted'); } }),
     });
-    const command = promptCommand('app-turn', 'from the App');
-    await assert.rejects(host.dispatch(command), /provider quota exhausted/);
-    for (let i = 0; i < 100 && !stdout.includes('ACK app-turn unknown'); i++) await new Promise(resolve => setTimeout(resolve, 5));
-    const receipt = host.snapshot().commands['app-turn'];
+    input.write(`:prompt console-turn ${host.snapshot().watermark} "from the console"\n`);
+    for (let i = 0; i < 200 && !stdout.includes('ERROR Prompt outcome is unknown'); i++) await new Promise(resolve => setTimeout(resolve, 5));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const receipt = host.snapshot().commands['console-turn'];
     assert.equal(receipt.state, 'unknown');
-    assert.equal(receipt.message, 'Prompt outcome is unknown. Managed child prompt failed: provider quota exhausted');
-    assert.match(stdout, new RegExp(`ACK app-turn unknown ${receipt.seq}`));
+    assert.equal(stdout.split(`ACK console-turn unknown ${receipt.seq}\n`).length, 2, 'exactly one unknown acknowledgement');
+    assert.equal(stdout.split('ERROR Prompt outcome is unknown. Managed child prompt failed: provider quota exhausted\n').length, 2, 'exactly one reason');
+    assert.doesNotMatch(stdout, /REJECT/, 'an unknown outcome is never presented as a rejected command');
+    assert.doesNotMatch(stdout, /ACK console-turn (admitted|settled|rejected)/);
     assert.equal(host.snapshot().lifecycle, 'unknown');
-    await host.close();
+    await host.close().catch(() => {});
   });
 });
 
@@ -1209,5 +1246,97 @@ await runManagedChild({ createAdapter: async () => new GjcBunSdkAdapter(authStor
       if (child.exitCode === null) child.kill('SIGKILL');
       await exited;
     }
+  });
+});
+
+test('between-turn events cross the publication boundary and a lost idle journal write is not acknowledged', async () => {
+  await withManagedDatabase(async () => {
+    herdrManagedDb.reserve({ appSessionId: 'managed-session', projectPath: '/tmp/project', herdrInstanceId: 'herdr-main', ownerGeneration: 'owner-gen-1' });
+    const secret = 't'.repeat(32);
+    let emit!: (event: Record<string, unknown>, seq: number) => void | Promise<void>;
+    const host = new HerdrTaskHost({
+      bootstrap: { appSessionId: 'managed-session', ownerGeneration: 'owner-gen-1', herdrInstanceId: 'herdr-main', projectPath: '/tmp/project', sessionRoot: '/tmp/gjc', attachSocketPath: '/tmp/unused.sock', attachSecret: secret },
+      createSession: ({ onEvent }) => {
+        emit = (event, seq) => onEvent({ version: 1, generation: 'owner-gen-1', requestId: 'action:turn-1', runId: 'turn-1', type: 'event', eventSeq: seq, event });
+        return {
+          providerSessionId: 'provider-session-1',
+          async prompt() {
+            await emit({ kind: 'tool_use', toolId: 'browser-1', toolName: 'browser', input: { url: 'https://example.test' } }, 1);
+            await emit({ kind: 'stream_end', content: 'done' }, 2);
+            await emit({ kind: 'complete' }, 3);
+          },
+        };
+      },
+    });
+    await host.initialize();
+    assert.equal((await host.dispatch(promptCommand('turn-1', 'open'))).state, 'settled');
+    // Late runtime state for the browser tool and a notice carrying a known token.
+    await emit({ kind: 'managed.idle', afterActionId: 'turn-1', event: { kind: 'tool_result', toolId: 'browser-1', content: `page text with ${secret}`, isFinal: true } }, 4);
+    await emit({ kind: 'managed.idle', afterActionId: 'turn-1', event: { kind: 'text', text: `notice ${secret}` } }, 5);
+    const idle = herdrManagedDb.eventsSince('managed-session', 'owner-gen-1', 0).filter(event => event.kind === 'sdk.idle');
+    assert.equal(idle.length, 2);
+    const [lateResult, lateNotice] = idle.map(event => event.payload as { event: Record<string, unknown>; turnId: string });
+    assert.deepEqual(lateResult.event, { kind: 'tool_result', toolId: 'browser-1', content: '[Protected automation result]', isError: false, isFinal: true });
+    assert.equal(lateResult.turnId, 'turn-1');
+    assert.deepEqual(lateNotice.event, { kind: 'text', text: 'notice [redacted]' });
+    assert.doesNotMatch(JSON.stringify(idle), new RegExp(secret));
+    // A writable owner whose journal write fails has lost an event: the failure
+    // reaches the transport instead of being acknowledged as fenced.
+    const appendEvent = herdrManagedDb.appendEvent;
+    herdrManagedDb.appendEvent = () => { throw new Error('SQLITE_FULL: database or disk is full'); };
+    try {
+      await assert.rejects(Promise.resolve().then(() => emit({ kind: 'managed.idle', afterActionId: 'turn-1', event: { kind: 'text', text: 'lost' } }, 6)), /SQLITE_FULL/);
+    } finally { herdrManagedDb.appendEvent = appendEvent; }
+    // A fenced owner's journal is not writable by design; that is not a lost event.
+    herdrManagedDb.setLifecycle('managed-session', 'owner-gen-1', 'unknown');
+    await emit({ kind: 'managed.idle', afterActionId: 'turn-1', event: { kind: 'text', text: 'after fence' } }, 7);
+    assert.equal(herdrManagedDb.eventsSince('managed-session', 'owner-gen-1', 0).filter(event => event.kind === 'sdk.idle').length, 2);
+    await host.close().catch(() => {});
+  });
+});
+
+test('project force-delete racing the owner\'s own closure never overtakes an open owner', async () => {
+  await withManagedDatabase(async tmp => {
+    const { deleteOrArchiveProject } = await import('@/modules/projects/index.js');
+    const { projectsDb } = await import('@/modules/database/index.js');
+    const outcomes: string[] = [];
+    for (let round = 0; round < 4; round++) {
+      const projectPath = path.join(tmp, `round-${round}`);
+      await fs.mkdir(projectPath, { recursive: true });
+      const project = projectsDb.createProjectPath(projectPath, `Owned project ${round}`).project;
+      assert.ok(project);
+      const appSessionId = `managed-${round}`;
+      herdrManagedDb.reserve({ appSessionId, projectPath, herdrInstanceId: 'herdr-main', ownerGeneration: `owner-${round}` });
+      const host = new HerdrTaskHost({
+        bootstrap: { appSessionId, ownerGeneration: `owner-${round}`, herdrInstanceId: 'herdr-main', projectPath, sessionRoot: path.join(tmp, 'gjc') },
+        createSession: () => ({ providerSessionId: `provider-${round}`, async prompt() {} }),
+      });
+      await host.initialize();
+      assert.equal(herdrManagedDb.get(appSessionId, `owner-${round}`)?.lifecycle, 'idle');
+      // An open owner refuses the cascade outright.
+      await assert.rejects(deleteOrArchiveProject(project.project_id, true), { code: 'MANAGED_SESSION_NOT_CLOSED' });
+      assert.ok(sessionsDb.getSessionById(appSessionId));
+      // Closure and the cascade race through the same writer lock with varying
+      // interleavings: whichever wins, no open owner is ever deleted and the
+      // closure always lands.
+      const delay = round === 0 ? Promise.resolve() : new Promise<void>(resolve => setTimeout(resolve, round * 3));
+      const [outcome] = await Promise.all([
+        (round % 2 === 0 ? Promise.resolve() : delay).then(() => deleteOrArchiveProject(project.project_id, true)).then(() => 'deleted', (error: { code?: string }) => String(error.code)),
+        (round % 2 === 0 ? delay : Promise.resolve()).then(() => host.close()),
+      ]);
+      outcomes.push(outcome);
+      if (outcome === 'deleted') {
+        assert.equal(sessionsDb.getSessionById(appSessionId), null);
+        assert.equal(herdrManagedDb.get(appSessionId, `owner-${round}`), null, 'the closed binding cascaded with its session');
+      } else {
+        assert.equal(outcome, 'MANAGED_SESSION_NOT_CLOSED');
+        assert.equal(herdrManagedDb.get(appSessionId, `owner-${round}`)?.lifecycle, 'closed');
+        assert.ok(sessionsDb.getSessionById(appSessionId));
+        await deleteOrArchiveProject(project.project_id, true);
+        assert.equal(sessionsDb.getSessionById(appSessionId), null);
+      }
+      assert.equal(projectsDb.getProjectById(project.project_id) ?? null, null);
+    }
+    assert.ok(outcomes.every(outcome => outcome === 'deleted' || outcome === 'MANAGED_SESSION_NOT_CLOSED'), JSON.stringify(outcomes));
   });
 });

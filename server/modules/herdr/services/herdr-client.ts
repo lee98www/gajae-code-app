@@ -289,6 +289,16 @@ export class HerdrRpcError extends HerdrError {
   readonly rpcMessage: string;
 }
 
+/**
+ * `layout.apply` error codes Herdr 0.8.0 (`src/app/api/layouts.rs`) returns from
+ * request validation, before `create_tab*` runs. Every other code may be answered
+ * after a tab or pane was created.
+ */
+export const HERDR_LAYOUT_PRE_DISPATCH_REJECTIONS: ReadonlySet<string> = new Set(['workspace_not_found', 'tab_not_found', 'invalid_target', 'invalid_layout', 'invalid_env']);
+
+/** The exact identity of a workspace this App owns: its registered id under the owned label. */
+export type HerdrOwnedWorkspace = Readonly<{ workspaceId: string; label: string }>;
+
 export class HerdrClient {
   #nextId = 0;
 
@@ -441,8 +451,17 @@ export class HerdrClient {
     return matches.length === 1 && matches[0]!.label === label ? 'present' : 'foreign';
   }
 
-  async applyLayout(workspaceId: string, argv: readonly string[], cwd: string, signal?: AbortSignal, guard?: HerdrDispatchGuard): Promise<HerdrProvisionReceipt> {
+  /**
+   * Appends the managed host pane to an owned workspace. Ownership is bound to
+   * this request: the fresh pre-dispatch snapshot must show exactly the
+   * registered id under the owned label, or nothing is sent (a proven
+   * non-dispatch). After dispatch the receipt must map to that same owned
+   * workspace, or the outcome stays unknown.
+   */
+  async applyLayout(target: HerdrOwnedWorkspace, argv: readonly string[], cwd: string, signal?: AbortSignal, guard?: HerdrDispatchGuard): Promise<HerdrProvisionReceipt> {
+    const { workspaceId, label } = target;
     herdrPaneIdSchema.parse(workspaceId);
+    if (typeof label !== 'string' || !label) throw new HerdrError('HERDR_INVALID_REQUEST', 400, 'Invalid owned workspace label.');
     if (!argv.length || argv.some((arg) => typeof arg !== 'string' || arg.includes('\0')) || !argv[0]) {
       throw new HerdrError('HERDR_INVALID_REQUEST', 400, 'Invalid managed host argv.');
     }
@@ -455,6 +474,10 @@ export class HerdrClient {
       panes: s.panes.filter((p) => p.focused).map((p) => p.pane_id).sort(),
     });
     const beforeSnapshot = await this.snapshot(signal, guard);
+    const owned = (s: HerdrWireSnapshot) => s.workspaces.filter((w) => w.workspace_id === workspaceId);
+    if (owned(beforeSnapshot).length !== 1 || owned(beforeSnapshot)[0]!.label !== label) {
+      throw new HerdrError('HERDR_LAYOUT_NOT_DISPATCHED', 409, 'The registered workspace is not owned under its label; no pane was created.');
+    }
     const before = focusOf(beforeSnapshot);
     const panesOf = (s: HerdrWireSnapshot) => s.panes.filter((p) => p.workspace_id === workspaceId).map((p) => p.pane_id).sort();
     let receipt: { tabId: string; paneId: string };
@@ -476,10 +499,13 @@ export class HerdrClient {
       return { tabId, paneId };
       }, signal, guard);
     } catch (error) {
-      // A Herdr rejection is a known non-dispatch only when a fresh snapshot
-      // proves it: the target workspace is gone, or its pane set is unchanged.
-      // Anything else (lost reply, timeout, unreadable state) stays unknown.
-      if (error instanceof HerdrRpcError) {
+      // A rejection is a known non-dispatch only with two independent proofs:
+      // Herdr answered one of its validation codes, which it returns before any
+      // tab or pane exists, and a fresh snapshot shows no pane appeared (the
+      // workspace is gone or its pane set is unchanged). `layout_apply_failed`
+      // can follow a partial creation and, like a lost reply, timeout or
+      // unreadable state, stays unknown.
+      if (error instanceof HerdrRpcError && HERDR_LAYOUT_PRE_DISPATCH_REJECTIONS.has(error.rpcCode)) {
         const after = await this.snapshot(signal, guard).catch(() => null);
         if (after && (!after.workspaces.some((w) => w.workspace_id === workspaceId) || JSON.stringify(panesOf(after)) === JSON.stringify(panesOf(beforeSnapshot)))) {
           throw new HerdrError('HERDR_LAYOUT_NOT_DISPATCHED', 409, 'Herdr rejected the layout; no pane was created.');
@@ -489,7 +515,7 @@ export class HerdrClient {
     }
     // LayoutDescription has no terminal id. Resolve only its exact IDs.
     const snapshot = await this.snapshot(signal, guard);
-    const workspaces = snapshot.workspaces.filter((w) => w.workspace_id === workspaceId);
+    const workspaces = owned(snapshot).filter((w) => w.label === label);
     const tabs = snapshot.tabs.filter((t) => t.tab_id === receipt.tabId);
     const panes = snapshot.panes.filter((p) => p.pane_id === receipt.paneId);
     if (workspaces.length !== 1 || tabs.length !== 1 || tabs[0]!.workspace_id !== workspaceId || panes.length !== 1 ||

@@ -37,6 +37,13 @@ const IDLE_EVENT_KINDS = new Set(['managed.automation', 'managed.automation-reco
  * count per idle interval is bounded and the bound itself is recorded once.
  */
 const IDLE_EVENT_LIMIT = 16;
+/**
+ * The SDK carries no turn identity on its callbacks. Tool identifiers are the
+ * one causal marker that survives a turn boundary: a tool started under one
+ * prompt whose update arrives under a later prompt (or none) belongs to the
+ * turn that started it, never to the prompt that happens to be active.
+ */
+const TOOL_ORIGIN_LIMIT = 4096;
 const sameIdentity = (left: ManagedChildIdentity | undefined, right: ManagedChildIdentity | undefined): boolean =>
   left?.version === right?.version
   && left?.generation === right?.generation
@@ -57,6 +64,7 @@ export async function runManagedChild(options: RunManagedChildOptions = {}): Pro
   let idleEvents = 0;
   let lastActionId: string | undefined;
   const promptIdentities = new Map<string, ManagedChildIdentity>();
+  const toolOrigins = new Map<string, { identity: ManagedChildIdentity; actionId: string }>();
   let sequence = 0;
   let acknowledged = 0;
   let pendingBytes = 0;
@@ -149,11 +157,22 @@ export async function runManagedChild(options: RunManagedChildOptions = {}): Pro
               onDeath();
               throw new Error('Managed child event scope rejected.');
             }
-            if (owner && !activePrompt && !IDLE_EVENT_KINDS.has(String(record.kind))) {
-              // No turn owns this; record it as idle instead of presenting it
-              // under a settled identity (stream failure) or dropping it (loss).
-              if (idleEvents < IDLE_EVENT_LIMIT) emit({ kind: 'managed.idle', afterActionId: lastActionId ?? null, event: record });
-              else if (idleEvents === IDLE_EVENT_LIMIT) emit({ kind: 'managed.idle', afterActionId: lastActionId ?? null, omittedAfter: IDLE_EVENT_LIMIT });
+            const toolId = typeof record.toolId === 'string' ? record.toolId : undefined;
+            const origin = toolId ? toolOrigins.get(toolId) : undefined;
+            if (toolId && record.kind === 'tool_use' && activePrompt && !origin) {
+              if (toolOrigins.size >= TOOL_ORIGIN_LIMIT) toolOrigins.delete(toolOrigins.keys().next().value!);
+              toolOrigins.set(toolId, { identity: activePrompt, actionId: lastActionId! });
+            }
+            if (toolId && record.kind === 'tool_result' && record.isFinal !== false) toolOrigins.delete(toolId);
+            const foreignTurn = origin !== undefined && !sameIdentity(origin.identity, activePrompt);
+            if (owner && (!activePrompt || foreignTurn) && !IDLE_EVENT_KINDS.has(String(record.kind))) {
+              // No turn owns this, or a settled turn does: record it as idle under
+              // its causal origin instead of presenting it under the active
+              // prompt (misattribution), a settled identity (stream failure) or
+              // dropping it (loss).
+              const afterActionId = origin?.actionId ?? lastActionId ?? null;
+              if (idleEvents < IDLE_EVENT_LIMIT) emit({ kind: 'managed.idle', afterActionId, event: record });
+              else if (idleEvents === IDLE_EVENT_LIMIT) emit({ kind: 'managed.idle', afterActionId, omittedAfter: IDLE_EVENT_LIMIT });
               idleEvents++;
               return;
             }

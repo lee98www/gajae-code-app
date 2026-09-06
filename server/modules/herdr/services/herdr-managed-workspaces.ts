@@ -142,6 +142,10 @@ export class HerdrManagedWorkspacesService {
       }
       // Another process may still be executing the recorded intent, or its
       // reply may have been lost. Neither case permits replaying create/layout.
+      // A host that claimed this generation before its placement was captured
+      // recorded its exact process identity; when that process is confirmed
+      // gone the generation is fenced like a placed owner, nothing replaced.
+      await this.#reconcileOwner(old);
       return this.#uncertain(old);
     }
     const selection = await this.selection();
@@ -168,7 +172,7 @@ export class HerdrManagedWorkspacesService {
       if (!this.#db.cas(id, generation, 'workspace_requested', 'workspace_created', workspaceId) || !this.#db.cas(id, generation, 'workspace_created', 'layout_requested', workspaceId)) throw new Error('Provision phase conflict.');
       let receipt: Awaited<ReturnType<HerdrProvisioningHandle['applyLayout']>>;
       try {
-        receipt = await handle.applyLayout(workspaceId, hostArgv(bootstrapPath), projectPath);
+        receipt = await handle.applyLayout({ workspaceId, label: this.#ownedLabel() }, hostArgv(bootstrapPath), projectPath);
       } catch (error) {
         // A proven non-dispatch is a known outcome: nothing was launched for
         // this generation, so it is released for a fresh reservation rather
@@ -192,11 +196,12 @@ export class HerdrManagedWorkspacesService {
     const final = this.#db.get(id)!;
     return this.#result(final);
   }
+  #ownedLabel(): string { return `Gajae ${this.#db.installId()}`; }
   #ownedWorkspace(key: string, handle: HerdrProvisioningHandle, projectPath: string): Promise<string> {
     const pending = this.#workspacePending.get(key);
     if (pending) return pending;
     const task = (async () => {
-      const label = `Gajae ${this.#db.installId()}`;
+      const label = this.#ownedLabel();
       let existing = this.#db.workspace(key);
       if (existing?.phase === 'ready' && existing.workspace_id) {
         // The registered parent may have been closed in Herdr since. Only a

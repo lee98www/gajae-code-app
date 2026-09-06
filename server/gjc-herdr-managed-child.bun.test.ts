@@ -86,6 +86,8 @@ const createSessionFactory = async (input) => {
         for (let index = 0; index < 129; index += 1) emit({ type: 'thinking_end', content: 'burst:' + index });
       }
       emit({ type: 'thinking_end', content: 'thinking:' + turns });
+      // A background tool started by this turn whose completion arrives later.
+      if (text === 'late-tool') emit({ type: 'tool_execution_start', toolCallId: 'background:' + turns, toolName: 'bash', args: { command: 'sleep' } });
       emit({ type: 'tool_execution_start', toolCallId: 'tool:' + turns, toolName: 'read', args: { path: 'file' } });
       emit({ type: 'tool_execution_update', toolCallId: 'tool:' + turns, partialResult: { content: [{ type: 'text', text: 'partial' }] } });
       const aborted = new Promise((resolve) => { resolveAbort = resolve; });
@@ -96,6 +98,7 @@ const createSessionFactory = async (input) => {
       // Real runtimes keep reporting background state after a turn (late tool
       // updates, notices, bookkeeping). No turn owns it once the prompt settles.
       if (text === 'idle-after') setTimeout(() => { for (let index = 0; index < 20; index += 1) emit({ type: 'notice', level: 'info', message: 'idle:late-bookkeeping:' + index }); }, 150);
+      if (text === 'late-tool') { const started = turns; setTimeout(() => emit({ type: 'tool_execution_end', toolCallId: 'background:' + started, toolName: 'bash', result: { content: [{ type: 'text', text: 'late:' + started }], details: {} }, isError: false }), 400); }
     },
     async abort() { resolveAbort?.('aborted'); },
     async dispose() { resolveAbort?.('disposed'); await writeFile(${JSON.stringify(disposalFile)}, JSON.stringify({ creations, turns, steers })); },
@@ -359,6 +362,44 @@ test('idle runtime events after a settled turn are journaled as bounded idle rec
     assert.equal((await h.response('close')).ok, true);
     assert.equal(await h.exited, 0);
     assert.deepEqual(JSON.parse(await readFile(h.disposalFile, 'utf8')), { creations: 1, turns: 1, steers: 0 });
+  } finally { await h.cleanup(); }
+});
+
+test('a tool finishing after its turn settled is never attributed to the next prompt', { timeout: 20_000 }, async () => {
+  const h = await harness();
+  try {
+    await h.init();
+    h.send({ type: 'prompt', runId: 'first', requestId: 'first', actionId: 'first', text: 'late-tool' });
+    const ask = await h.event('first', 'permission_request');
+    h.send({ type: 'approval', runId: 'first', requestId: 'answer', actionId: 'answer', askId: ask.event.requestId, decision: { allow: true, message: 'yes' } });
+    assert.equal((await h.response('answer')).ok, true);
+    h.ack(await h.event('first', 'complete'));
+    await h.response('first');
+    const settledFrames = h.frames.length;
+    // The next prompt is active (blocked on its own ask) when the background
+    // tool of the first turn completes.
+    h.send({ type: 'prompt', runId: 'second', requestId: 'second', actionId: 'second', text: 'success' });
+    const secondAsk = await h.event('second', 'permission_request');
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    const during = h.frames.slice(settledFrames).filter((f): f is ManagedChildEvent => f.type === 'event');
+    const late = during.filter((f) => f.event.kind === 'managed.idle');
+    assert.equal(late.length, 1);
+    assert.equal(late[0]!.requestId, 'second');
+    assert.equal(late[0]!.event.afterActionId, 'first', 'the record names the turn that started the tool');
+    const wrapped = late[0]!.event.event as { kind: string; toolId: string; content?: unknown };
+    assert.equal(wrapped.kind, 'tool_result');
+    assert.equal(wrapped.toolId, 'background:1');
+    assert.ok(JSON.stringify(wrapped).includes('late:1'));
+    // Nothing of the first turn's tool is presented as a live event of the second turn.
+    assert.ok(during.every((f) => f.event.kind === 'managed.idle' || f.event.toolId !== 'background:1'));
+    assert.ok(during.some((f) => f.event.kind === 'tool_use' && f.event.toolId === 'tool:2'), 'the second turn\'s own tool events flow normally');
+    h.send({ type: 'approval', runId: 'second', requestId: 'answer:second', actionId: 'answer:second', askId: secondAsk.event.requestId, decision: { allow: true, message: 'yes' } });
+    assert.equal((await h.response('answer:second')).ok, true);
+    h.ack(await h.event('second', 'complete'));
+    assert.equal((await h.response('second')).ok, true);
+    h.send({ type: 'close', requestId: 'close', actionId: 'close' });
+    assert.equal((await h.response('close')).ok, true);
+    assert.equal(await h.exited, 0);
   } finally { await h.cleanup(); }
 });
 

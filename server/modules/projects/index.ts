@@ -1,6 +1,5 @@
 import {
   deleteOrArchiveProject as removeProject,
-  deleteSessionJsonlFilesForProjectPath as removeSessionFiles,
 } from './services/project-delete.service.js';
 import {
   promoteProjectOrigin as promoteOrigin,
@@ -24,6 +23,5 @@ export {
   runPermissions as resolveProjectRunPermissions,
   promoteOrigin as promoteProjectOrigin,
   removeProject as deleteOrArchiveProject,
-  removeSessionFiles as deleteSessionJsonlFilesForProjectPath,
   renameProject as updateProjectDisplayName,
 };

@@ -281,7 +281,7 @@ describe('HerdrClient', () => {
         socket.reply({ id: request.id, result: { type: 'layout_apply', layout: { workspace_id: 'w1', tab_id: 'w1:t1', zoomed: false, focused_pane_id: 'w1:p1', root: { type: 'pane', pane_id: 'w1:p1' } } } });
       } else socket.reply({ id: request.id, result: { type: 'session_snapshot', snapshot: managedSnapshot() } });
     }));
-    const receipt = await client.applyLayout('w1', argv, '/repo');
+    const receipt = await client.applyLayout({ workspaceId: 'w1', label: 'Owned' }, argv, '/repo');
     assert.equal(receipt.terminalId, 'term1');
     assert.ok(Object.isFrozen(receipt));
     assert.deepEqual(methods, ['session.snapshot', 'layout.apply', 'session.snapshot']);
@@ -310,7 +310,7 @@ describe('HerdrClient', () => {
         ? { type: 'layout_apply', layout: { workspace_id: 'w1', tab_id: 'w1:t2', zoomed: false, focused_pane_id: 'w1:p2', root: { type: 'pane', pane_id: 'w1:p2' } } }
         : { type: 'session_snapshot', snapshot: focusedSnapshot() } });
     }));
-    assert.deepEqual(await client.applyLayout('w1', ['bun'], '/repo'), { workspaceId: 'w1', tabId: 'w1:t2', paneId: 'w1:p2', terminalId: 'term2' });
+    assert.deepEqual(await client.applyLayout({ workspaceId: 'w1', label: 'Owned' }, ['bun'], '/repo'), { workspaceId: 'w1', tabId: 'w1:t2', paneId: 'w1:p2', terminalId: 'term2' });
     assert.deepEqual(methods, ['session.snapshot', 'layout.apply', 'session.snapshot']);
   });
 
@@ -336,17 +336,17 @@ describe('HerdrClient', () => {
         ],
       } } });
     }));
-    await assert.rejects(client.applyLayout('w1', ['bun'], '/repo'), /changed focus/);
+    await assert.rejects(client.applyLayout({ workspaceId: 'w1', label: 'Owned' }, ['bun'], '/repo'), /changed focus/);
   });
 
   it('a Herdr rejection is a known non-dispatch only when a fresh snapshot proves no pane appeared', async () => {
-    const run = async (afterPanes: Array<{ pane_id: string; tab_id: string }>, workspacePresent = true) => {
+    const run = async (afterPanes: Array<{ pane_id: string; tab_id: string }>, workspacePresent = true, code = 'workspace_not_found') => {
       let snapshots = 0;
       const methods: string[] = [];
       const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
         const request = JSON.parse(line);
         methods.push(request.method);
-        if (request.method === 'layout.apply') { socket.reply({ id: request.id, error: { code: 'workspace_not_found', message: 'no such workspace' } }); return; }
+        if (request.method === 'layout.apply') { socket.reply({ id: request.id, error: { code, message: 'rejected' } }); return; }
         const after = snapshots++ > 0;
         const panes = (after ? afterPanes : [{ pane_id: 'w1:p1', tab_id: 'w1:t1' }]).map((pane) => ({ ...pane, terminal_id: 'term-' + pane.pane_id, workspace_id: 'w1', focused: false, agent_status: 'idle' }));
         socket.reply({ id: request.id, result: { type: 'session_snapshot', snapshot: {
@@ -356,12 +356,66 @@ describe('HerdrClient', () => {
           panes: after && !workspacePresent ? [] : panes,
         } } });
       }));
-      const outcome = await client.applyLayout('w1', ['bun'], '/repo').then(() => 'resolved', (error: HerdrError) => error.code);
+      const outcome = await client.applyLayout({ workspaceId: 'w1', label: 'Owned' }, ['bun'], '/repo').then(() => 'resolved', (error: HerdrError) => error.code);
       return { outcome, methods };
     };
     assert.deepEqual(await run([{ pane_id: 'w1:p1', tab_id: 'w1:t1' }]), { outcome: 'HERDR_LAYOUT_NOT_DISPATCHED', methods: ['session.snapshot', 'layout.apply', 'session.snapshot'] });
     assert.equal((await run([], false)).outcome, 'HERDR_LAYOUT_NOT_DISPATCHED', 'a vanished workspace cannot hold a new pane');
     assert.equal((await run([{ pane_id: 'w1:p1', tab_id: 'w1:t1' }, { pane_id: 'w1:p2', tab_id: 'w1:t2' }])).outcome, 'HERDR_RPC_ERROR', 'a new pane after a rejection stays unknown');
+    // Herdr answers layout_apply_failed after create_tab ran (possibly with a
+    // rollback); an unchanged snapshot is not proof the launch never happened.
+    assert.deepEqual(await run([{ pane_id: 'w1:p1', tab_id: 'w1:t1' }], true, 'layout_apply_failed'), { outcome: 'HERDR_RPC_ERROR', methods: ['session.snapshot', 'layout.apply'] }, 'a post-creation failure code stays unknown without a second snapshot');
+    assert.equal((await run([], false, 'internal_error')).outcome, 'HERDR_RPC_ERROR', 'an unrecognized code stays unknown even when the workspace is gone');
+    assert.equal((await run([{ pane_id: 'w1:p1', tab_id: 'w1:t1' }], true, 'invalid_layout')).outcome, 'HERDR_LAYOUT_NOT_DISPATCHED', 'every validation code Herdr answers before creating a tab is a proof');
+  });
+
+  it('a layout without a reply stays unknown: no snapshot can prove a request Herdr may still execute', async () => {
+    const methods: string[] = [];
+    const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+      const request = JSON.parse(line);
+      methods.push(request.method);
+      if (request.method === 'layout.apply') return; // delivered, never answered
+      socket.reply({ id: request.id, result: { type: 'session_snapshot', snapshot: managedSnapshot() } });
+    }), 30);
+    await assert.rejects(client.applyLayout({ workspaceId: 'w1', label: 'Owned' }, ['bun'], '/repo'), { code: 'HERDR_TIMEOUT' });
+    assert.deepEqual(methods, ['session.snapshot', 'layout.apply'], 'no second snapshot is consulted; the outcome is not a non-dispatch');
+    const cancelled = new AbortController();
+    const late = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+      const request = JSON.parse(line);
+      if (request.method === 'layout.apply') { cancelled.abort(); return; }
+      socket.reply({ id: request.id, result: { type: 'session_snapshot', snapshot: managedSnapshot() } });
+    }));
+    await assert.rejects(late.applyLayout({ workspaceId: 'w1', label: 'Owned' }, ['bun'], '/repo', cancelled.signal), { code: 'HERDR_CANCELLED' });
+  });
+
+  it('binds the owned label to the append: a relabelled or reused id is never appended to', async () => {
+    const run = async (labelBefore: string, labelAfter: string) => {
+      let snapshots = 0;
+      const methods: string[] = [];
+      const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+        const request = JSON.parse(line);
+        methods.push(request.method);
+        if (request.method === 'layout.apply') {
+          socket.reply({ id: request.id, result: { type: 'layout_apply', layout: { workspace_id: 'w1', tab_id: 'w1:t2', zoomed: false, focused_pane_id: 'w1:p2', root: { type: 'pane', pane_id: 'w1:p2' } } } });
+          return;
+        }
+        const after = snapshots++ > 0;
+        const panes = after ? [{ pane_id: 'w1:p1', tab_id: 'w1:t1' }, { pane_id: 'w1:p2', tab_id: 'w1:t2' }] : [{ pane_id: 'w1:p1', tab_id: 'w1:t1' }];
+        socket.reply({ id: request.id, result: { type: 'session_snapshot', snapshot: {
+          ...managedSnapshot(),
+          workspaces: [{ workspace_id: 'w1', number: 1, label: after ? labelAfter : labelBefore, focused: false, pane_count: panes.length, tab_count: panes.length, active_tab_id: 'w1:t1', agent_status: 'idle' }],
+          tabs: panes.map((pane, index) => ({ tab_id: pane.tab_id, workspace_id: 'w1', number: index + 1, label: String(index + 1), focused: false, pane_count: 1, agent_status: 'idle' })),
+          panes: panes.map((pane) => ({ ...pane, terminal_id: 'term-' + pane.pane_id, workspace_id: 'w1', focused: false, agent_status: 'idle' })),
+        } } });
+      }));
+      const outcome = await client.applyLayout({ workspaceId: 'w1', label: 'Gajae install' }, ['bun'], '/repo').then(() => 'resolved', (error: Error & { code?: string }) => error.code ?? error.message);
+      return { outcome, methods };
+    };
+    // Relabelled between the service's inspection and this append: nothing is sent.
+    assert.deepEqual(await run('Someone else', 'Someone else'), { outcome: 'HERDR_LAYOUT_NOT_DISPATCHED', methods: ['session.snapshot'] });
+    // Owned at dispatch time but no longer mapped to the owned label afterwards: the pane exists, the outcome stays unknown.
+    assert.deepEqual(await run('Gajae install', 'Someone else'), { outcome: 'HERDR_INVALID_RESPONSE', methods: ['session.snapshot', 'layout.apply', 'session.snapshot'] });
+    assert.equal((await run('Gajae install', 'Gajae install')).outcome, 'resolved');
   });
 
   it('inspects a registered owned workspace by exact id and label', async () => {
@@ -391,7 +445,7 @@ describe('HerdrClient', () => {
           ? { type: 'layout_apply', layout }
           : { type: 'session_snapshot', snapshot: managedSnapshot() } });
       }));
-      await assert.rejects(client.applyLayout('w1', ['bun'], '/repo'), { code: 'HERDR_INVALID_RESPONSE' });
+      await assert.rejects(client.applyLayout({ workspaceId: 'w1', label: 'Owned' }, ['bun'], '/repo'), { code: 'HERDR_INVALID_RESPONSE' });
       // The pre-append focus snapshot plus the rejected receipt; no follow-up snapshot, no retry.
       assert.equal(writes, 2);
     }
@@ -408,7 +462,7 @@ describe('HerdrClient', () => {
         ? { type: 'layout_apply', layout: { workspace_id: 'w1', tab_id: 'w1:t1', zoomed: false, focused_pane_id: 'w1:p1', root: { type: 'pane', pane_id: 'w1:p1' } } }
         : { type: 'session_snapshot', snapshot: snap } });
     }));
-    await assert.rejects(client.applyLayout('w1', ['bun'], '/repo'), { code: 'HERDR_INVALID_RESPONSE' });
+    await assert.rejects(client.applyLayout({ workspaceId: 'w1', label: 'Owned' }, ['bun'], '/repo'), { code: 'HERDR_INVALID_RESPONSE' });
     assert.equal(writes, 3);
   });
 

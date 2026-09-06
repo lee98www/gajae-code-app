@@ -19,11 +19,18 @@ owners. Lost RPC outcomes stay unknown and cannot automatically replay
 workspace/layout creation. The registered owned parent workspace is verified
 by a fresh snapshot before every append: present under the exact owned label
 it is reused; definitively absent or relabelled it is superseded by a new owned
-workspace, never adopted; unreadable it stays unknown. A Herdr rejection of
-`layout.apply` is a known non-dispatch only when a fresh snapshot proves the
-workspace is gone or its pane set is unchanged; that empty, unclaimed
-generation is then released for a fresh reservation on the next send instead
-of being fenced unknown.
+workspace, never adopted; unreadable it stays unknown. The same ownership is
+bound to the append itself: `layout.apply` targets the registered id under the
+owned label, the pre-dispatch snapshot must show exactly that, and the receipt
+must map back to it, or the outcome stays unknown. A rejection of
+`layout.apply` is a known non-dispatch only with two independent proofs: Herdr
+answered one of its request-validation codes (`workspace_not_found`,
+`tab_not_found`, `invalid_target`, `invalid_layout`, `invalid_env`; Herdr 0.8.0
+returns these before any tab or pane is created) and a fresh snapshot shows the
+workspace gone or its pane set unchanged. Only then is that empty, unclaimed
+generation released for a fresh reservation on the next send. A
+`layout_apply_failed` answer, a lost reply, a timeout or an unreadable snapshot
+stays unknown.
 
 The pane's independent Node `gjc-herdr-task-host.ts` owns one pinned Bun
 `gjc-herdr-managed-child.ts` SDK session. Readiness requires the real provider
@@ -36,7 +43,10 @@ permissions continue with the same native callbacks through Herdr/Collie.
 Archiving hides the App conversation without stopping its owner. Permanent
 deletion, including project force-delete, remains fenced until native-writer
 closure and owned metadata cleanup are confirmed; UI disconnection is not a
-lifecycle command.
+lifecycle command. A project force-delete admits and cascades in one writer
+transaction, so no reservation, claim or closure can interleave between the
+fence and the deletion, and it discards only the transcripts of the rows that
+transaction removed.
 
 Herdr publication is host-owned: `pane.report_agent` carries `agent: gjc` and
 idle/working/blocked/unknown status; `pane.report_metadata` carries the
@@ -76,11 +86,19 @@ records its exact process identity (`owner.json`: pid plus kernel start time)
 next to its attach socket; a reopened App confirms owner death only when that
 recorded process no longer exists or its start time differs, marks the
 generation `interrupted`, and keeps the claimed target, journal and private
-files. A live but unreachable owner stays unknown. The host's private SDK child
-reports between-turn runtime state as bounded `managed.idle` records journaled
-as `sdk.idle` under the last settled turn, never silently dropped and never
-presented as a live turn event; the child escalation path fences a failed
-claim only after the child's exit is observed. Appending owned placement into
+files; the same confirmation fences a host that claimed its generation before
+its placement was captured. A live but unreachable owner stays unknown. The
+host's private SDK child reports between-turn runtime state as bounded
+`managed.idle` records journaled as `sdk.idle`, never silently dropped and
+never presented as a live turn event. The SDK carries no turn identity on its
+callbacks; a tool started by one turn whose update arrives under a later
+prompt is recorded the same way under the turn that started it, never
+attributed to the active prompt. The wrapped event crosses the ordinary
+publication boundary first (protected automation payloads, redacted known
+tokens), a fenced owner's journal silently declines it, and any other
+persistence failure fails the private transport instead of acknowledging a
+lost event. The child escalation path fences a failed claim only after the
+child's exit is observed. Appending owned placement into
 an already-focused owned workspace is valid; focus is verified by comparing the
 focused identities before and after the append.
 
@@ -89,8 +107,9 @@ The owner's configured model is durable. An App turn carrying the ambient
 model; only an explicit per-session pin or an explicit model choice changes it.
 A prompt the SDK rejects outright settles `unknown` with the SDK's bounded,
 secret-redacted reason in the receipt message, and the owned console prints the
-`ACK ACTION unknown SEQ` record plus an `ERROR` line for whichever client
-started the turn.
+`ACK ACTION unknown SEQ` record plus an `ERROR` line carrying that reason for
+whichever client started the turn (`:ack` repeats both); a console-entered
+turn that ends unknown is never additionally reported as a rejected command.
 
 App-dependent automation waits on the original SDK callback while disconnected.
 Renewal binds the actual browser/application target and requires explicit
