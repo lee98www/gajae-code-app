@@ -483,7 +483,6 @@ export function useChatSessionState({
         if (response.ok) setTokenBudget(await response.json());
         else {
           setTokenBudget(null);
-          setSessionState(null);
         }
       } catch (error) {
         console.error('Failed to fetch initial token usage:', error);

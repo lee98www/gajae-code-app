@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { closeConnection } from '@/modules/database/connection.js';
+import { closeConnection, getConnection } from '@/modules/database/connection.js';
 import { initializeDatabase } from '@/modules/database/init-db.js';
 import { herdrManagedDb as managed, type ManagedRequestIdentity } from '@/modules/database/repositories/herdr-managed.db.js';
 import { projectPermissionsDb as permissions } from '@/modules/database/repositories/project-permissions.db.js';
@@ -79,10 +79,10 @@ test('SDK cancellation prevents decisions and trusted policy uses existing auto 
   assert.deepEqual(managed.getState(owner.appSessionId, owner.ownerGeneration).requests, {});
 }));
 
-test('asks survive unrelated grants and neither typed secrets nor answers enter public state', async () => store(() => {
+test('asks survive unrelated grants and answers do not enter public state', async () => store(() => {
   const event = managed.appendSdkEvent({ ...owner, kind: 'sdk.event', payload: { kind: 'ask', requestId: 'private-callback' }, request: {
     requestId: 'private-callback', requestKind: 'ask',
-    schema: { questions: [{ question: 'Enter value', options: [] }], credential: { secret: true, value: 'private-value' } },
+    schema: { questions: [{ question: 'Enter value', options: [] }] },
   } });
   assert.equal(event.kind, 'managed.request');
   const requestId = Object.keys(managed.getState(owner.appSessionId, owner.ownerGeneration).requests)[0];
@@ -110,4 +110,47 @@ test('rendered question answers and explicit skip reasons retain host schema aut
     assert.equal(managed.decideRequest({ ...identity, actionId: `ui-answer-${index}`, policyRevision: 0, resolution })?.status, 'decided');
     assert.deepEqual(permissions.get(projectPath).allow_always, []);
   }
+}));
+
+test('managed callback rejects SDK batch/multi shapes and fails closed for tagged ask answers', async () => store(() => {
+  const batch = managed.appendSdkEvent({ ...owner, kind: 'sdk.event', payload: {}, request: {
+    requestId: 'sdk-multi', requestKind: 'ask',
+    schema: {
+      questions: [
+        { id: 'access', question: 'Access', options: [{ label: 'Read' }, { label: 'Write' }], multi: true },
+        { id: 'scope', question: 'Scope', options: [{ label: 'Project' }, { label: 'Global' }], multi: false },
+      ],
+    },
+  } });
+  const batchIdentity = { ...owner, requestId: (batch.payload as { requestId: string }).requestId };
+  assert.equal(managed.decideRequest({
+    ...batchIdentity,
+    actionId: 'sdk-multi-answer',
+    policyRevision: 0,
+    resolution: { allow: true, updatedInput: { answers: { access: ['Read', 'Write'], scope: 'Project' } } },
+  }), null);
+  assert.equal(managed.getRequest(batchIdentity)?.resolution, null);
+
+  const secret = managed.appendSdkEvent({ ...owner, kind: 'sdk.event', payload: {}, request: {
+    requestId: 'sdk-secret', requestKind: 'ask',
+    schema: {
+      questions: [{ question: 'Password', options: [] }],
+      credential: { secret: true, value: 'do-not-store' },
+    },
+  } });
+  const secretIdentity = { ...owner, requestId: (secret.payload as { requestId: string }).requestId };
+  assert.equal(managed.decideRequest({
+    ...secretIdentity,
+    actionId: 'sdk-secret-answer',
+    policyRevision: 0,
+    resolution: { allow: true, message: 'private-answer' },
+  }), null);
+  const stored = getConnection().prepare('SELECT request_json, resolution_json FROM herdr_managed_decisions WHERE request_id = ?')
+    .get(secretIdentity.requestId) as { request_json: string; resolution_json: string | null };
+  assert.equal(stored.request_json.includes('do-not-store'), false);
+  assert.equal(stored.resolution_json, null);
+  const publicData = JSON.stringify({ state: managed.getState(owner.appSessionId, owner.ownerGeneration), events: managed.eventsSince(owner.appSessionId, owner.ownerGeneration, 0) });
+  assert.equal(publicData.includes('do-not-store'), false);
+  assert.match(publicData, /"inputMode":"non-echo"/);
+  assert.match(publicData, /"answerRetention":"live-only"/);
 }));

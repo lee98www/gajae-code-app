@@ -22,6 +22,13 @@ export type HerdrAgentReporterStatus = Readonly<{
   seq: number;
 }>;
 export type HerdrAgentReporterTarget = { record: ProvisionRecord | null; binding: HerdrManagedBinding | null };
+/** Exact owner proof used to release native metadata before the DB lifecycle closes. */
+export type HerdrAgentReporterClosureProof = Readonly<{
+  appSessionId: string;
+  ownerGeneration: string;
+  providerSessionId: string;
+  childClosed: true;
+}>;
 export type HerdrAgentReporterOptions = {
   appSessionId: string;
   ownerGeneration: string;
@@ -211,11 +218,21 @@ export class HerdrAgentReporter {
     throw new HerdrError('HERDR_PUBLICATION_UNCONFIRMED', 502, 'Herdr native agent metadata is unconfirmed.');
   }
 
-  private guard(releasing = false, expectedNamespace: NamespaceKind | 'publish' = 'empty'): HerdrDispatchGuard {
+  private closureProofMatches(proof: HerdrAgentReporterClosureProof | undefined): boolean {
+    return proof !== undefined
+      && proof.appSessionId === this.options.appSessionId
+      && proof.ownerGeneration === this.options.ownerGeneration
+      && proof.providerSessionId === this.options.providerSessionId
+      && proof.childClosed === true;
+  }
+
+  private guard(releasing = false, expectedNamespace: NamespaceKind | 'publish' = 'empty', closureProof?: HerdrAgentReporterClosureProof): HerdrDispatchGuard {
     return {
       admit: async () => {
         const target = this.target();
-        if (!target || (releasing ? target.binding?.lifecycle !== 'closed' : target.binding?.lifecycle === 'closed')) this.refuse();
+        if (!target || (releasing
+          ? target.binding?.lifecycle !== 'closed' && !this.closureProofMatches(closureProof)
+          : target.binding?.lifecycle === 'closed')) this.refuse();
         const observed = await this.inspect(releasing);
         if (!observed) throw new HerdrError('HERDR_NOT_PRESENT', 404, 'Herdr pane is absent.');
         this.namespaceFailure(observed.namespace, expectedNamespace);
@@ -287,16 +304,19 @@ export class HerdrAgentReporter {
     if (!this.stale && !this.released && !this.cleanupAttempted) this.publish('quiesced');
   }
 
-  async release(): Promise<void> {
+  async release(closureProof?: HerdrAgentReporterClosureProof): Promise<boolean> {
     await this.quiesce();
-    if (this.stale || this.released || this.cleanupAttempted) return;
+    if (this.stale || this.released || this.cleanupAttempted) return this.released;
     try {
       const target = this.target();
-      if (!target) { this.publish('pending'); return; }
-      if (target.binding?.lifecycle !== 'closed') { this.publish('not_closed'); return; }
-      if (!this.metadataAttempted && !this.agentAttempted) { this.publish('not_present'); return; }
+      if (!target) { this.publish('pending'); return !this.pinned; }
+      if (target.binding?.lifecycle !== 'closed' && !this.closureProofMatches(closureProof)) {
+        this.publish('not_closed');
+        return false;
+      }
+      if (!this.metadataAttempted && !this.agentAttempted) { this.publish('not_present'); return true; }
       const before = await this.inspect(true);
-      if (!before) { this.publish('not_present'); return; }
+      if (!before) { this.publish('not_present'); return true; }
       if (before.namespace.kind === 'foreign') this.refuse();
       const foreign = before.namespace.foreign;
       // A lost cleanup reply never permits an automatic second removal.
@@ -311,10 +331,10 @@ export class HerdrAgentReporter {
             gajae_owner_generation: null,
             gajae_app_session_id: null,
           },
-        }, undefined, this.guard(true, 'ours'));
+        }, undefined, this.guard(true, 'ours', closureProof));
         this.target();
         const afterClear = await this.inspect(true);
-        if (!afterClear) { this.publish('not_present'); return; }
+        if (!afterClear) { this.publish('not_present'); return true; }
         if (afterClear.namespace.kind === 'foreign') this.refuse();
         if (afterClear.namespace.kind !== 'empty' || !sameTokens(afterClear.namespace.foreign, foreign)) {
           throw new HerdrError('HERDR_PUBLICATION_UNCONFIRMED', 502, 'Herdr native agent metadata cleanup is unconfirmed.');
@@ -324,18 +344,20 @@ export class HerdrAgentReporter {
         paneId: this.pinned!.placement!.paneId,
         source: this.source,
         seq: this.nextSeq(),
-      }, undefined, this.guard(true, 'empty'));
+      }, undefined, this.guard(true, 'empty', closureProof));
       this.target();
       const afterRelease = await this.inspect(true);
-      if (!afterRelease) { this.publish('not_present'); return; }
+      if (!afterRelease) { this.publish('not_present'); return true; }
       if (afterRelease.namespace.kind === 'foreign') this.refuse();
       if (afterRelease.namespace.kind !== 'empty' || !sameTokens(afterRelease.namespace.foreign, foreign)) {
         throw new HerdrError('HERDR_PUBLICATION_UNCONFIRMED', 502, 'Herdr native agent release is unconfirmed.');
       }
       this.released = true;
       this.publish('released');
+      return true;
     } catch (error) {
       if (!this.stale) this.publish(error instanceof HerdrError && error.code === 'HERDR_NOT_PRESENT' ? 'not_present' : 'unavailable');
+      return error instanceof HerdrError && error.code === 'HERDR_NOT_PRESENT';
     }
   }
 

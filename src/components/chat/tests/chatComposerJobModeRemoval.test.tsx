@@ -105,6 +105,8 @@ test('normal chat submit sends one chat message and never creates a GJC job', as
 
   function Capture() {
     composer = useChatComposerState({
+      // These harnesses exercise a resolved legacy session; an undefined mode means still resolving.
+      managedSession: false,
       selectedProject,
       selectedSession: null,
       currentSessionId: 'session-1',
@@ -162,6 +164,8 @@ test('/login opens the app login flow without sending a chat message', async () 
 
   function Capture() {
     composer = useChatComposerState({
+      // These harnesses exercise a resolved legacy session; an undefined mode means still resolving.
+      managedSession: false,
       selectedProject,
       selectedSession: null,
       currentSessionId: 'session-1',
@@ -194,6 +198,8 @@ test('a running turn queues Enter submissions and only steers through the explic
 
   function Capture() {
     composer = useChatComposerState({
+      // These harnesses exercise a resolved legacy session; an undefined mode means still resolving.
+      managedSession: false,
       selectedProject,
       selectedSession: null,
       currentSessionId: 'session-1',
@@ -331,7 +337,12 @@ for (const isLoading of [true, false]) {
       assert.match(html, /role="status" data-managed-queue/);
       assert.match(html, /input\.queue\.label<\/span><span>3<\/span>/);
       assert.match(html, paused ? /input\.queue\.paused/ : /input\.queue\.willSend/);
-      assert.doesNotMatch(html, /stale browser draft|input\.queue\.(edit|delete|moveUp|moveDown)/);
+      // A browser-local draft is never silently dropped or auto-sent in managed
+      // mode: it stays visible as a recovered draft that needs explicit review.
+      assert.match(html, /stale browser draft/);
+      assert.match(html, /input\.queue\.recovered/);
+      assert.match(html, /input\.queue\.reviewBeforeSending/);
+      assert.doesNotMatch(html, /input\.queue\.willFollow|input\.queue\.(moveUp|moveDown)/);
     });
   }
 }
@@ -346,13 +357,15 @@ test('an idle empty paused host queue stays visible, while an empty active queue
   assert.doesNotMatch(render(false), /data-managed-queue/);
 });
 
-test('managed state without queue data never exposes stale local controls', () => {
+test('managed state without queue data keeps a local draft recoverable but never auto-sendable', () => {
   const html = renderToStaticMarkup(createElement(ChatComposer, {
     ...baseComposerProps,
     sessionState: { managed: true },
     queuedDrafts: [{ content: 'stale browser draft', images: [] }],
   }));
-  assert.doesNotMatch(html, /stale browser draft|input\.queue\.(edit|delete|moveUp|moveDown)/);
+  assert.match(html, /stale browser draft/);
+  assert.match(html, /input\.queue\.recovered/);
+  assert.doesNotMatch(html, /input\.queue\.willSend|input\.queue\.willFollow|data-managed-queue/);
 });
 
 test('ordinary chat retains local queue text and edit delete reorder controls', () => {

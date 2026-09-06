@@ -74,6 +74,8 @@
     },
     "scrollToBottom": "Vai all'ultimo",
     "queue": {
+      "recovered": "Bozza salvata",
+      "reviewBeforeSending": "Modifica e invia manualmente; non è nella coda dell’host",
       "sendNext": "Metti in coda un altro messaggio",
       "label": "In coda",
       "paused": "Coda in pausa",
@@ -210,6 +212,10 @@
     }
   },
   "permissionCard": {
+    "secretUnavailableTitle": "Le risposte segrete non sono supportate",
+    "secretUnavailableGuidance": "Questo runtime non può garantire che una risposta segreta resti fuori dalla cronologia. Non inserire credenziali; rifiuta la richiesta e usa un flusso di autenticazione separato.",
+    "unknownTitle": "Esito della decisione sconosciuto",
+    "unknownGuidance": "Riconnettiti per recuperare l’esito oppure interrompi l’attività, se possibile. Non inviare di nuovo questa decisione.",
     "title": "Permesso richiesto",
     "tool": "Strumento:",
     "viewInput": "Mostra input dello strumento",

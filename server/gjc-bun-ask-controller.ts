@@ -28,6 +28,29 @@ type Pending = PendingAsk | PendingPermission;
 
 type Decision = { allow?: unknown; always?: unknown; updatedInput?: unknown; message?: unknown };
 
+/** Preserve the shape of a tagged value while removing its content. */
+export function redactSecretValue(value: unknown, seen = new Set<object>()): unknown {
+  if (Array.isArray(value)) return value.map(item => redactSecretValue(item, seen));
+  if (!value || typeof value !== 'object') return value;
+  if (seen.has(value)) return { secret: true, redacted: true };
+  seen.add(value);
+  const record = value as Record<string, unknown>;
+  if (record.secret === true || record.sensitive === true || record.format === 'password' || record.type === 'password') {
+    return { secret: true, redacted: true };
+  }
+  return Object.fromEntries(Object.entries(record).map(([key, child]) => [key, redactSecretValue(child, seen)]));
+}
+
+function hasSecretTag(value: unknown, seen = new Set<object>()): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some(item => hasSecretTag(item, seen));
+  const record = value as Record<string, unknown>;
+  if (record.secret === true || record.sensitive === true || record.format === 'password' || record.type === 'password') return true;
+  return Object.values(record).some(item => hasSecretTag(item, seen));
+}
+
 function decisionText(decision: Decision): string | undefined {
   if (typeof decision.message === 'string' && decision.message.trim()) return decision.message.trim();
   if (decision.updatedInput !== null && typeof decision.updatedInput === 'object') {
@@ -105,6 +128,8 @@ export class GjcBunAskController {
   ): Promise<ClientBridgePermissionOutcome> {
     if (this.#disposed || signal?.aborted) return Promise.resolve({ outcome: 'cancelled' });
     const requestId = `sdk-permission:${randomUUID()}`;
+    const rawInput = toolCall.rawInput ?? {};
+    const secretInput = hasSecretTag(rawInput);
     return new Promise((resolve) => {
       const abort = () => {
         const pending = this.#pending.get(requestId);
@@ -121,7 +146,7 @@ export class GjcBunAskController {
         kind: 'permission_request',
         requestId,
         toolName: toolCall.toolName,
-        input: toolCall.rawInput ?? {},
+        input: redactSecretValue(rawInput),
         context: {
           source: 'sdk-permission',
           toolCallId: toolCall.toolCallId,
@@ -129,6 +154,7 @@ export class GjcBunAskController {
           ...(toolCall.kind ? { kind: toolCall.kind } : {}),
           ...(toolCall.locations ? { locations: toolCall.locations } : {}),
           options: options.map((option) => option.kind),
+          ...(secretInput ? { inputMode: 'non-echo', answerRetention: 'live-only' } : {}),
         },
       });
     });
@@ -153,6 +179,10 @@ export class GjcBunAskController {
   #present(title: string, options: string[], prefill?: string, dialogOptions?: ExtensionUIDialogOptions): Promise<string | undefined> {
     if (this.#disposed) return Promise.reject(new Error('GJC ask request cancelled.'));
     const requestId = `sdk-ask:${randomUUID()}`;
+    // SDK 0.15.6 calls ExtensionUIContext once per visible question and
+    // performs its own multi-select toggle loop by invoking select repeatedly.
+    // This bridge resolves one offered label per callback; it is not a batch
+    // answer resolver and must not infer a multi-select schema from labels.
     return new Promise((resolve, reject) => {
       let timeout: NodeJS.Timeout | undefined;
       const abort = () => {

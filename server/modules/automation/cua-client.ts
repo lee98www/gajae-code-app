@@ -42,19 +42,63 @@ type JsonRpcResponse = {
   error?: { code?: number; message?: string; data?: unknown };
 };
 
+export type CuaTransportDispatchState = 'not_sent' | 'possibly_dispatched';
+
+/**
+ * The driver transport failed before a verified tool result arrived. Once the
+ * request write starts, the caller cannot infer whether the driver performed
+ * the action, so the operation must remain unresolved.
+ */
+export class CuaTransportError extends Error {
+  readonly kind = 'transport-failure' as const;
+
+  constructor(
+    message: string,
+    readonly dispatchState: CuaTransportDispatchState,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = 'CuaTransportError';
+  }
+}
+
+/** The driver returned a structured JSON-RPC failure, which is a known result. */
+export class CuaKnownResultError extends Error {
+  readonly kind = 'known-result' as const;
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'CuaKnownResultError';
+  }
+}
+
+/** JSON-RPC errors are known driver responses rather than transport loss. */
+export class CuaDriverResponseError extends CuaKnownResultError {
+  readonly code?: number;
+  readonly data?: unknown;
+
+  constructor(message: string, code?: number, data?: unknown) {
+    super(message);
+    this.name = 'CuaDriverResponseError';
+    this.code = code;
+    this.data = data;
+  }
+}
+
 type Pending = {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
+  dispatchState: CuaTransportDispatchState;
 };
 
 function executableCandidates(): string[] {
+  if (process.env.CUA_DRIVER_PATH) return [process.env.CUA_DRIVER_PATH];
   return [
-    process.env.CUA_DRIVER_PATH,
     join(homedir(), '.local', 'bin', 'cua-driver'),
     '/opt/homebrew/bin/cua-driver',
     '/usr/local/bin/cua-driver',
-  ].filter((value): value is string => Boolean(value));
+  ];
 }
 
 async function findExecutable(): Promise<string | null> {
@@ -98,8 +142,8 @@ async function runInspection(executable: string, args: string[], timeoutMs = 3_0
 function permissionValue(output: string, names: string[]): boolean | undefined {
   const line = output.split(/\r?\n/u).find((entry) => names.some((name) => entry.toLowerCase().includes(name)));
   if (!line) return undefined;
-  if (/granted|authorized|enabled|yes|true|✅/iu.test(line)) return true;
-  if (/denied|not granted|disabled|no|false|❌/iu.test(line)) return false;
+  if (/\b(?:denied|not granted|disabled|unauthorized|no|false)\b|❌/iu.test(line)) return false;
+  if (/\b(?:granted|authorized|enabled|yes|true)\b|✅/iu.test(line)) return true;
   return undefined;
 }
 
@@ -131,14 +175,16 @@ export class CuaDriverClient {
 
   async call(tool: CuaSafeTool, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     if (!CUA_SAFE_TOOLS.includes(tool)) throw new Error('CUA Driver tool is not allowed.');
-    await this.ensureStarted();
+    if (signal?.aborted) throw new CuaTransportError('CUA Driver request was cancelled.', 'not_sent');
+    try { await this.ensureStarted(); }
+    catch (error) { throw new CuaTransportError('CUA Driver initialization failed.', 'not_sent', { cause: error }); }
     return this.request('tools/call', { name: tool, arguments: args }, 60_000, signal);
   }
 
   async shutdown(): Promise<void> {
     const child = this.child;
-    this.child = undefined;
     if (!child) return;
+    this.failAll(new Error('CUA Driver is shutting down.'), child);
     child.stdin.end();
     await new Promise<void>((resolve) => {
       const timer = setTimeout(() => {
@@ -153,28 +199,37 @@ export class CuaDriverClient {
   }
 
   private async ensureStarted(): Promise<void> {
-    if (this.child && this.child.exitCode === null) return;
     if (this.starting) return this.starting;
+    if (this.child && this.child.exitCode === null) return;
     this.starting = (async () => {
       const executable = await findExecutable();
-      if (!executable) throw new Error('CUA Driver is not installed.');
-      const child = spawn(executable, ['mcp'], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: process.env,
-      });
+      if (!executable) throw new CuaTransportError('CUA Driver is not installed.', 'not_sent');
+      let child: ChildProcessWithoutNullStreams;
+      try {
+        child = spawn(executable, ['mcp'], {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: process.env,
+        });
+      } catch (error) {
+        throw new CuaTransportError('CUA Driver could not be started.', 'not_sent', { cause: error });
+      }
       this.child = child;
       const lines = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
-      lines.on('line', (line) => this.handleLine(line));
+      lines.on('line', (line) => this.handleLine(line, child));
       child.stderr.on('data', () => {});
-      child.on('close', () => this.failAll(new Error('CUA Driver disconnected.')));
-      child.on('error', (error) => this.failAll(error));
+      child.stdin.on('error', (error) => this.failAll(error, child, true));
+      child.on('close', () => this.failAll(new Error('CUA Driver disconnected.'), child));
+      child.on('error', (error) => this.failAll(error, child, true));
       await this.request('initialize', {
         protocolVersion: '2025-03-26',
         capabilities: {},
         clientInfo: { name: 'gajae-code-app', version: '0.1.0' },
       }, 10_000);
       this.notify('notifications/initialized', {});
-    })().finally(() => {
+    })().catch(async error => {
+      await this.shutdown();
+      throw error;
+    }).finally(() => {
       this.starting = undefined;
     });
     return this.starting;
@@ -182,21 +237,18 @@ export class CuaDriverClient {
 
   private request(method: string, params: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal): Promise<unknown> {
     const child = this.child;
-    if (!child || child.exitCode !== null) return Promise.reject(new Error('CUA Driver is unavailable.'));
+    if (!child || child.exitCode !== null) {
+      return Promise.reject(new CuaTransportError('CUA Driver is unavailable.', 'not_sent'));
+    }
     const id = `${++this.sequence}-${randomUUID()}`;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error('CUA Driver request timed out.'));
-      }, timeoutMs);
       const onAbort = () => {
-        clearTimeout(timer);
+        clearTimeout(pending.timer);
         this.pending.delete(id);
         this.notify('notifications/cancelled', { requestId: id, reason: 'Client request cancelled.' });
-        reject(new Error('CUA Driver request was cancelled.'));
+        pending.reject(new CuaTransportError('CUA Driver request was cancelled.', pending.dispatchState));
       };
-      signal?.addEventListener('abort', onAbort, { once: true });
-      this.pending.set(id, {
+      const pending: Pending = {
         resolve: (value) => {
           signal?.removeEventListener('abort', onAbort);
           resolve(value);
@@ -205,39 +257,94 @@ export class CuaDriverClient {
           signal?.removeEventListener('abort', onAbort);
           reject(error);
         },
-        timer,
-      });
-      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+        timer: setTimeout(() => {
+          this.pending.delete(id);
+          pending.reject(new CuaTransportError('CUA Driver request timed out.', pending.dispatchState));
+        }, timeoutMs),
+        dispatchState: 'not_sent',
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      this.pending.set(id, pending);
+      try {
+        if (signal?.aborted) {
+          onAbort();
+          return;
+        }
+        const frame = `${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`;
+        pending.dispatchState = 'possibly_dispatched';
+        child.stdin.write(
+          frame,
+          (error?: Error | null) => {
+            if (!error) return;
+            const pending = this.pending.get(id);
+            if (!pending) return;
+            this.pending.delete(id);
+            clearTimeout(pending.timer);
+            pending.reject(new CuaTransportError('CUA Driver request could not be written.', pending.dispatchState, { cause: error }));
+          },
+        );
+      } catch (error) {
+        this.pending.delete(id);
+        clearTimeout(pending.timer);
+        signal?.removeEventListener('abort', onAbort);
+        reject(new CuaTransportError(
+          'CUA Driver request could not be written.',
+          pending.dispatchState,
+          { cause: error },
+        ));
+      }
     });
   }
 
   private notify(method: string, params: Record<string, unknown>): void {
-    this.child?.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`);
+    const child = this.child;
+    if (!child || child.exitCode !== null) return;
+    try {
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`);
+    } catch {
+      // Cancellation is already represented by the typed request failure.
+    }
   }
 
-  private handleLine(line: string): void {
+  private handleLine(line: string, source: ChildProcessWithoutNullStreams): void {
+    if (source !== this.child) return;
     let message: JsonRpcResponse;
     try {
       message = JSON.parse(line) as JsonRpcResponse;
     } catch {
       return;
     }
-    if (message.id === undefined) return;
+    if (!message || typeof message !== 'object' || Array.isArray(message) || message.id === undefined) return;
     const pending = this.pending.get(message.id);
     if (!pending) return;
     this.pending.delete(message.id);
     clearTimeout(pending.timer);
-    if (message.error) pending.reject(new Error(message.error.message || 'CUA Driver request failed.'));
+    const hasResult = Object.prototype.hasOwnProperty.call(message, 'result');
+    const hasError = Object.prototype.hasOwnProperty.call(message, 'error');
+    if (message.jsonrpc !== '2.0' || hasResult === hasError
+      || (hasError && (!message.error || !Number.isInteger(message.error.code) || typeof message.error.message !== 'string'))) {
+      pending.reject(new CuaTransportError('CUA Driver returned an invalid response.', pending.dispatchState));
+      return;
+    }
+    if (message.error) {
+      pending.reject(new CuaDriverResponseError(
+        message.error.message || 'CUA Driver request failed.',
+        message.error.code,
+        message.error.data,
+      ));
+    }
     else pending.resolve(message.result);
   }
 
-  private failAll(error: Error): void {
+  private failAll(error: Error, source: ChildProcessWithoutNullStreams, terminate = false): void {
+    if (source !== this.child) return;
     this.child = undefined;
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
-      pending.reject(error);
+      pending.reject(new CuaTransportError(error.message, pending.dispatchState, { cause: error }));
     }
     this.pending.clear();
+    if (terminate && source.exitCode === null && !source.killed) source.kill('SIGTERM');
   }
 }
 

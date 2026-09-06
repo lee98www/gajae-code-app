@@ -74,6 +74,8 @@
     },
     "scrollToBottom": "En yeniye atla",
     "queue": {
+      "recovered": "Kaydedilmiş taslak",
+      "reviewBeforeSending": "Düzenleyip elle gönderin; ana makinenin kuyruğunda değil",
       "sendNext": "Başka bir mesajı sıraya koy",
       "label": "Sıraya alındı",
       "paused": "Kuyruk duraklatıldı",
@@ -210,6 +212,10 @@
     }
   },
   "permissionCard": {
+    "secretUnavailableTitle": "Gizli yanıtlar desteklenmiyor",
+    "secretUnavailableGuidance": "Bu çalışma zamanı gizli yanıtların geçmişe kaydedilmeyeceğini garanti edemez. Kimlik bilgilerini girmeyin; bu isteği reddedip ayrı bir kimlik doğrulama akışı kullanın.",
+    "unknownTitle": "Kararın sonucu bilinmiyor",
+    "unknownGuidance": "Sonucu öğrenmek için yeniden bağlanın veya mümkünse görevi durdurun. Bu kararı yeniden göndermeyin.",
     "title": "İzin gerekli",
     "tool": "Araç:",
     "viewInput": "Araç girdisini göster",

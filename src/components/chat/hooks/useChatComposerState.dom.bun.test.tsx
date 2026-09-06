@@ -158,12 +158,12 @@ for (const isLoading of [true, false]) {
     assert.equal(sent.length, 1);
     assert.equal((sent[0] as { content: string }).content, 'host queued prompt');
     assert.deepEqual(added, []);
-    assert.deepEqual(view.result.current.queuedDrafts, []);
-    assert.deepEqual(readQueuedMessages('managed-a'), []);
+    assert.deepEqual(view.result.current.queuedDrafts.map(draft => draft.content), ['stale local queue']);
+    assert.deepEqual(readQueuedMessages('managed-a').map(draft => draft.content), ['stale local queue']);
   });
 }
 
-test('managed state arriving and switching sessions discard stale local queues without flushing', async () => {
+test('managed state arriving preserves unsent local drafts without flushing them', async () => {
   const sent: unknown[] = [];
   const props = {
     selectedSession: session('session-a'),
@@ -175,11 +175,60 @@ test('managed state arriving and switching sessions discard stale local queues w
   const view = composer(props);
   assert.equal(view.result.current.queuedDrafts.length, 1);
   view.rerender({ ...props, managedSession: true, isLoading: false });
-  assert.deepEqual(view.result.current.queuedDrafts, []);
-  assert.deepEqual(readQueuedMessages('session-a'), []);
+  assert.deepEqual(view.result.current.queuedDrafts.map(draft => draft.content), ['old A queue']);
+  assert.deepEqual(readQueuedMessages('session-a').map(draft => draft.content), ['old A queue']);
   view.rerender({ ...props, selectedSession: session('session-b'), managedSession: true, isLoading: false });
   await act(async () => { await new Promise((resolve) => setTimeout(resolve, 850)); });
-  assert.deepEqual(view.result.current.queuedDrafts, []);
-  assert.deepEqual(readQueuedMessages('session-b'), []);
+  assert.deepEqual(view.result.current.queuedDrafts.map(draft => draft.content), ['old B queue']);
+  assert.deepEqual(readQueuedMessages('session-b').map(draft => draft.content), ['old B queue']);
   assert.deepEqual(sent, []);
+});
+
+test('unresolved session mode preserves input and saved drafts until authoritative managed readiness', async () => {
+  const sent: unknown[] = [];
+  const added: unknown[] = [];
+  writeQueuedMessages('resolving', [{ content: 'preserved queued draft' }]);
+  const props = {
+    selectedSession: session('resolving'), managedSession: undefined, isLoading: true,
+    sendMessage: (value: unknown) => { sent.push(value); },
+    addMessage: (value: unknown) => { added.push(value); },
+  };
+  const view = composer(props);
+  act(() => view.result.current.handleVoiceTranscript('new draft while resolving'));
+  await act(async () => {
+    await view.result.current.handleSubmit({ preventDefault() {} } as never);
+    view.result.current.handleSteer({ preventDefault() {} } as never);
+  });
+  view.rerender({ ...props, isLoading: false });
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 850)); });
+  assert.deepEqual(sent, []);
+  assert.deepEqual(added, []);
+  assert.equal(view.result.current.input, 'new draft while resolving');
+  assert.deepEqual(readQueuedMessages('resolving').map(draft => draft.content), ['preserved queued draft']);
+  view.rerender({ ...props, managedSession: true, isLoading: false });
+  await act(async () => { await view.result.current.handleSubmit({ preventDefault() {} } as never); });
+  assert.equal(sent.length, 1);
+  assert.deepEqual(added, []);
+  assert.deepEqual(readQueuedMessages('resolving').map(draft => draft.content), ['preserved queued draft']);
+});
+
+test('managed submission retains its draft until admission and a late receipt cannot erase newer input', async () => {
+  const sent: Array<{ actionId: string }> = [];
+  const view = composer({
+    selectedSession: session('receipt-owner'), managedSession: true,
+    sendMessage: value => { sent.push(value as { actionId: string }); },
+  });
+  act(() => view.result.current.handleVoiceTranscript('first draft'));
+  await act(async () => { await view.result.current.handleSubmit({ preventDefault() {} } as never); });
+  assert.equal(view.result.current.input, 'first draft');
+  act(() => view.result.current.resolveManagedAction(sent[0].actionId, false));
+  assert.equal(view.result.current.input, 'first draft', 'rejection does not consume an unadmitted draft');
+  await act(async () => { await view.result.current.handleSubmit({ preventDefault() {} } as never); });
+  assert.notEqual(sent[1].actionId, sent[0].actionId);
+  act(() => view.result.current.handleInputChange({ target: { value: 'newer draft', selectionStart: 11 } } as never));
+  act(() => view.result.current.resolveManagedAction(sent[1].actionId, true));
+  assert.equal(view.result.current.input, 'newer draft');
+  await act(async () => { await view.result.current.handleSubmit({ preventDefault() {} } as never); });
+  act(() => view.result.current.resolveManagedAction(sent[2].actionId, true));
+  assert.equal(view.result.current.input, '');
 });

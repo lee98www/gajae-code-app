@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { GjcBunAskController, selectPermissionOption } from './gjc-bun-ask-controller.js';
+import { GjcBunAskController, redactSecretValue, selectPermissionOption } from './gjc-bun-ask-controller.js';
 
 /** The selected arm of the runtime's outcome union. */
 const kindOf = (outcome: { outcome: string; kind?: string }): string | undefined =>
@@ -64,4 +64,49 @@ test('a denial without always stays a single rejection; an unoffered reject_alwa
   const secondRequest = out.sent.filter((frame) => frame.kind === 'permission_request')[1] as { requestId: string };
   controller.resolve(secondRequest.requestId, { allow: false, always: true });
   assert.equal(kindOf(await second as never), 'reject_once');
+});
+
+test('ask selector resolves one label per SDK select loop callback', async () => {
+  const out = writer();
+  const controller = new GjcBunAskController(out as never);
+  // AskTool 0.15.6 owns the multi-select loop: after each choice it calls the
+  // UI selector again with the updated checkbox labels, then calls it once
+  // more for "Done selecting". The managed bridge must not collapse those
+  // callbacks into one invented array answer.
+  const first = controller.uiContext.select('Access', ['☐ Read', '☐ Write', 'Done selecting']);
+  const firstRequest = out.sent.find((frame) => frame.kind === 'permission_request') as {
+    requestId: string;
+    input: { questions: [{ multiSelect: boolean; options: Array<{ label: string }> }] };
+  };
+  assert.equal(firstRequest.input.questions[0].multiSelect, false);
+  assert.deepEqual(firstRequest.input.questions[0].options.map(option => option.label), ['☐ Read', '☐ Write', 'Done selecting']);
+  assert.equal(controller.resolve(firstRequest.requestId, { allow: true, message: '☐ Read' }), true);
+  assert.equal(await first, '☐ Read');
+
+  const second = controller.uiContext.select('Access', ['☑ Read', '☐ Write', 'Done selecting']);
+  const secondRequest = out.sent.filter((frame) => frame.kind === 'permission_request')[1] as { requestId: string };
+  assert.equal(controller.resolve(secondRequest.requestId, { allow: true, message: '☐ Write' }), true);
+  assert.equal(await second, '☐ Write');
+
+  const done = controller.uiContext.select('Access', ['☑ Read', '☑ Write', 'Done selecting']);
+  const doneRequest = out.sent.filter((frame) => frame.kind === 'permission_request')[2] as { requestId: string };
+  assert.equal(controller.resolve(doneRequest.requestId, { allow: true, message: 'Done selecting' }), true);
+  assert.equal(await done, 'Done selecting');
+});
+
+test('tagged permission input is reduced to a safe descriptor before publication', async () => {
+  const out = writer();
+  const controller = new GjcBunAskController(out as never);
+  const decision = controller.requestPermission(
+    { toolCallId: 'secret', toolName: 'login', title: 'Sign in', rawInput: { username: 'alice', password: { secret: true, value: 'private-value' } } } as never,
+    options(['allow_once', 'reject_once']),
+  );
+  const request = out.sent.find((frame) => frame.kind === 'permission_request') as { input: Record<string, unknown>; context: { inputMode: string; answerRetention: string } };
+  assert.deepEqual(request.input, { username: 'alice', password: { secret: true, redacted: true } });
+  assert.equal(request.context.inputMode, 'non-echo');
+  assert.equal(request.context.answerRetention, 'live-only');
+  const requestId = (out.sent.find((frame) => frame.kind === 'permission_request') as { requestId: string }).requestId;
+  assert.equal(controller.resolve(requestId, { allow: true }), true);
+  assert.deepEqual(await decision, { outcome: 'selected', optionId: 'o-0', kind: 'allow_once' });
+  assert.deepEqual(redactSecretValue({ token: { sensitive: true, value: 'private-value' } }), { token: { secret: true, redacted: true } });
 });

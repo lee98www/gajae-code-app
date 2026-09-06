@@ -46,15 +46,13 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
   const { ensureReady: ensureManagedReady } = managedSelection;
   const submitting = useRef(false);
   const pendingActionIds = useRef(new Map<string, string>());
+  const pendingManagedDrafts = useRef(new Map<string, { sessionId: string; text: string; images: File[]; keys: string[] }>());
   const actionIdFor = useCallback((key: string) => {
     const prior = pendingActionIds.current.get(key);
     if (prior) return prior;
     const id = crypto.randomUUID();
     pendingActionIds.current.set(key, id);
     return id;
-  }, []);
-  const resolveManagedAction = useCallback((actionId: string) => {
-    for (const [key, id] of pendingActionIds.current) if (id === actionId) pendingActionIds.current.delete(key);
   }, []);
   const { selectedProject, selectedSession, currentSessionId, gjcModel, reasoningEffort = 'default', isLoading, canAbortSession, tokenBudget, sendMessage, sendByCtrlEnter, onSessionProcessing, onSessionEstablished, onInputFocusChange, onCommandGateChange, onFileOpen, onShowSettings, onLogin, scrollToBottom, addMessage, setIsUserScrolledUp, setPendingPermissionRequests } = args;
   const projectId = selectedProject?.projectId;
@@ -70,7 +68,7 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
   const [commandModalPayload, setModal] = useState<CommandModalPayload | null>(null);
   const [modelPickerTrigger, setModelPickerTrigger] = useState(0);
   const [pendingCommandGate, setGateState] = useState<PendingCommandGate | null>(null);
-  const [queuedDrafts, setQueuedDrafts] = useState<QueuedDraft[]>(() => !args.managedSession && conversation && typeof window !== 'undefined' ? storedQueue(conversation) : []);
+  const [queuedDrafts, setQueuedDrafts] = useState<QueuedDraft[]>(() => conversation && typeof window !== 'undefined' ? storedQueue(conversation) : []);
   const [queuePulse, setQueuePulse] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const inputHighlightRef = useRef<HTMLDivElement>(null);
@@ -124,6 +122,15 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
   const { slashCommands, slashCommandsCount, filteredCommands, frequentCommands, commandQuery, showCommandMenu, selectedCommandIndex, resetCommandMenuState, handleCommandSelect, handleToggleCommandMenu, handleCommandInputChange, handleCommandMenuKeyDown } = useSlashCommands({ selectedProject, provider: 'gjc', input, setInput, textareaRef, onExecuteCommand: executeCommand, onLoginCommand: login, onAppCommand: (command) => { const app = findAppUiCommand(command.name); if (app) applyAppCommand(app); } });
   const { showFileDropdown, filteredFiles, selectedFileIndex, renderInputWithMentions, selectFile, setCursorPosition, handleFileMentionsKeyDown } = useFileMentions({ selectedProject, input, setInput, textareaRef });
   const clearComposer = useCallback(() => resetBox(setInput, inputRef, setAttachedImages, setUploadingImages, setImageErrors, resetCommandMenuState, setExpanded, textareaRef), [resetCommandMenuState]);
+  const resolveManagedAction = useCallback((actionId: string, accepted: boolean) => {
+    for (const [key, id] of pendingActionIds.current) if (id === actionId) pendingActionIds.current.delete(key);
+    const draft = pendingManagedDrafts.current.get(actionId);
+    pendingManagedDrafts.current.delete(actionId);
+    if (!accepted || !draft) return;
+    for (const key of draft.keys) if (safeLocalStorage.getItem(key) === draft.text) safeLocalStorage.removeItem(key);
+    if (conversation === draft.sessionId && inputRef.current === draft.text
+      && attachedImages.length === draft.images.length && attachedImages.every((file, index) => file === draft.images[index])) clearComposer();
+  }, [attachedImages, clearComposer, conversation]);
 
   // Permissions are deliberately absent here: the policy is the project's, read
   // by the server when the run starts, so nothing the browser sends can widen it.
@@ -138,6 +145,7 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
 
   const handleSubmit = useCallback(async (event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>) => {
     event.preventDefault(); const text = inputRef.current; if (!text.trim() || !selectedProject) return;
+    if (conversation && args.managedSession === undefined) return;
     const signIn = /^\/login(?:\s+(.*))?$/.exec(text.trim()); if (signIn) { login(signIn[1]?.trim() || undefined); resetCommandMenuState(); return; }
     if (isLoading && conversation && !args.managedSession) { queueOwner.current = conversation; setQueuedDrafts((q) => [...q, { content: text, images: attachedImages, options: optionsFor(text) }]); clearComposer(); eraseDraft(); return; }
     const candidate = text.trimEnd(); const help = candidate.trim().toLowerCase() === 'help';
@@ -151,22 +159,25 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
     const actionId = actionIdFor(JSON.stringify(['send', id, text, optionsFor(text), attachedImages.map((file) => [file.name, file.size, file.lastModified])]));
     // Managed user events mark execution, not enqueue acknowledgement. Even an
     // apparently idle viewer can race a turn started by another viewer.
-    if (!args.managedSession) addMessage({ type: 'user', actionId, content: text, images: images as any, timestamp: new Date() });
-    onSessionProcessing?.(id, { statusText: null, canInterrupt: true }); setIsUserScrolledUp(false); setTimeout(scrollToBottom, 100); sendMessage({ type: 'chat.send', actionId, sessionId: id, content: text, options: { ...optionsFor(text), images } }); clearComposer(); eraseDraft(id);
+    if (!args.managedSession && conversation) addMessage({ type: 'user', actionId, content: text, images: images as any, timestamp: new Date() });
+    const managed = args.managedSession === true || !conversation;
+    if (managed) pendingManagedDrafts.current.set(actionId, { sessionId: id, text, images: attachedImages, keys: projectId ? draftKeysToClear(projectId, conversation, id) : [] });
+    onSessionProcessing?.(id, { statusText: null, canInterrupt: true }); setIsUserScrolledUp(false); setTimeout(scrollToBottom, 100); sendMessage({ type: 'chat.send', actionId, sessionId: id, content: text, options: { ...optionsFor(text), images } });
+    if (!managed) { clearComposer(); eraseDraft(id); }
     } finally { submitting.current = false; }
-  }, [actionIdFor, args.managedSession, ensureManagedReady, addMessage, allocate, announceGate, applyAppCommand, attachedImages, clearComposer, conversation, eraseDraft, executeCommand, isLoading, login, onSessionProcessing, optionsFor, resetCommandMenuState, scrollToBottom, selectedProject, selectedSession, sendMessage, setIsUserScrolledUp, slashCommands, upload]);
+  }, [actionIdFor, args.managedSession, ensureManagedReady, addMessage, allocate, announceGate, applyAppCommand, attachedImages, clearComposer, conversation, eraseDraft, executeCommand, isLoading, login, onSessionProcessing, optionsFor, projectId, resetCommandMenuState, scrollToBottom, selectedProject, selectedSession, sendMessage, setIsUserScrolledUp, slashCommands, upload]);
   useEffect(() => { submitRef.current = handleSubmit; }, [handleSubmit]);
 
-  const handleSteer = useCallback((event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>) => { event.preventDefault(); const text = inputRef.current; const id = selectedSession?.id || currentSessionId || null; if (!isLoading || !text.trim() || !selectedProject || !id || attachedImages.length || !isAutoSendable(classifyCommandInput(text))) return; if (args.managedSession) { sendMessage({ type: 'chat.steer', actionId: actionIdFor(JSON.stringify(['steer', id, text])), sessionId: id, content: text }); clearComposer(); eraseDraft(id); return; } const draft = { content: text, images: [], options: optionsFor(text) }; const timer = setTimeout(() => steerAnswer.current(text, false), STEER_REPLY_GRACE); const pending = steerWaiting.current.get(text) || []; pending.push({ draft, timer }); steerWaiting.current.set(text, pending); queueOwner.current = conversation; setQueuedDrafts((q) => [...q, { ...draft, pendingSteer: true }]); sendMessage({ type: 'chat.steer', actionId: actionIdFor(JSON.stringify(['steer', id, text])), sessionId: id, content: text }); clearComposer(); eraseDraft(id); }, [actionIdFor, args.managedSession, attachedImages.length, clearComposer, conversation, currentSessionId, eraseDraft, isLoading, optionsFor, selectedProject, selectedSession?.id, sendMessage]);
+  const handleSteer = useCallback((event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>) => { event.preventDefault(); const text = inputRef.current; const id = selectedSession?.id || currentSessionId || null; if (args.managedSession === undefined || !isLoading || !text.trim() || !selectedProject || !id || attachedImages.length || !isAutoSendable(classifyCommandInput(text))) return; if (args.managedSession) { sendMessage({ type: 'chat.steer', actionId: actionIdFor(JSON.stringify(['steer', id, text])), sessionId: id, content: text }); clearComposer(); eraseDraft(id); return; } const draft = { content: text, images: [], options: optionsFor(text) }; const timer = setTimeout(() => steerAnswer.current(text, false), STEER_REPLY_GRACE); const pending = steerWaiting.current.get(text) || []; pending.push({ draft, timer }); steerWaiting.current.set(text, pending); queueOwner.current = conversation; setQueuedDrafts((q) => [...q, { ...draft, pendingSteer: true }]); sendMessage({ type: 'chat.steer', actionId: actionIdFor(JSON.stringify(['steer', id, text])), sessionId: id, content: text }); clearComposer(); eraseDraft(id); }, [actionIdFor, args.managedSession, attachedImages.length, clearComposer, conversation, currentSessionId, eraseDraft, isLoading, optionsFor, selectedProject, selectedSession?.id, sendMessage]);
   const resolveSteerResult = useCallback((content: string, accepted: boolean) => { const list = steerWaiting.current.get(content); const pending = list?.shift(); if (!pending) return; if (!list?.length) steerWaiting.current.delete(content); clearTimeout(pending.timer); if (!accepted) { setQueuedDrafts((q) => { const at = q.findIndex((item) => item.pendingSteer && item.content === content); if (at < 0) return [...q, pending.draft]; const copy = q.slice(); copy[at] = { ...copy[at], pendingSteer: false }; return copy; }); return; } setQueuedDrafts((q) => { const at = q.findIndex((item) => item.pendingSteer && item.content === content); return at < 0 ? q : q.filter((_, index) => index !== at); }); addMessage({ type: 'user', content: pending.draft.content, timestamp: new Date() } as never); const id = selectedSession?.id || currentSessionId; if (id) onSessionProcessing?.(id, { statusText: null, canInterrupt: true }); scrollToBottom(); }, [addMessage, currentSessionId, onSessionProcessing, scrollToBottom, selectedSession?.id]);
   useEffect(() => { steerAnswer.current = resolveSteerResult; }, [resolveSteerResult]);
   useEffect(() => () => { for (const list of steerWaiting.current.values()) list.forEach(({ timer }) => clearTimeout(timer)); steerWaiting.current.clear(); }, []);
 
-  useEffect(() => { const switched = priorConversation.current !== conversation; priorConversation.current = conversation; const wasBusy = priorLoading.current; priorLoading.current = isLoading; if (isLoading || args.managedSession) { queueInFlight.current = false; if (dispatchTimer.current) clearTimeout(dispatchTimer.current); } if (args.managedSession) return; const head = queuedDrafts[0]; const verdict = decideQueueFlush({ sessionSwitched: switched, isLoading, wasLoading: wasBusy, queueLength: queuedDrafts.length, awaitingDispatchedTurn: queueInFlight.current, composerHasInput: Boolean(input.trim()), headAwaitingSteer: Boolean(head?.pendingSteer) }); if (verdict.action !== 'flush' || !head) return; const timer = setTimeout(() => { if (queueContext.current.managed || queueContext.current.conversation !== conversation) return; const disk = conversation ? readQueuedMessages(conversation) : []; if (conversation && disk.length < queuedDrafts.length) { setQueuedDrafts(storedQueue(conversation)); return; } queueInFlight.current = true; if (dispatchTimer.current) clearTimeout(dispatchTimer.current); dispatchTimer.current = setTimeout(() => { queueInFlight.current = false; setQueuePulse((n) => n + 1); }, TURN_START_GRACE); setQueuedDrafts((q) => q.slice(1)); setInput(head.content); inputRef.current = head.content; setAttachedImages(head.images); setTimeout(() => { if (!queueContext.current.managed && queueContext.current.conversation === conversation) void submitRef.current?.(syntheticSubmit()); }, 0); }, verdict.delayMs); return () => clearTimeout(timer); }, [args.managedSession, conversation, input, isLoading, queuePulse, queuedDrafts]);
+  useEffect(() => { const switched = priorConversation.current !== conversation; priorConversation.current = conversation; const wasBusy = priorLoading.current; priorLoading.current = isLoading; if (isLoading || args.managedSession !== false) { queueInFlight.current = false; if (dispatchTimer.current) clearTimeout(dispatchTimer.current); } if (args.managedSession !== false) return; const head = queuedDrafts[0]; const verdict = decideQueueFlush({ sessionSwitched: switched, isLoading, wasLoading: wasBusy, queueLength: queuedDrafts.length, awaitingDispatchedTurn: queueInFlight.current, composerHasInput: Boolean(input.trim()), headAwaitingSteer: Boolean(head?.pendingSteer) }); if (verdict.action !== 'flush' || !head) return; const timer = setTimeout(() => { if (queueContext.current.managed !== false || queueContext.current.conversation !== conversation) return; const disk = conversation ? readQueuedMessages(conversation) : []; if (conversation && disk.length < queuedDrafts.length) { setQueuedDrafts(storedQueue(conversation)); return; } queueInFlight.current = true; if (dispatchTimer.current) clearTimeout(dispatchTimer.current); dispatchTimer.current = setTimeout(() => { queueInFlight.current = false; setQueuePulse((n) => n + 1); }, TURN_START_GRACE); setQueuedDrafts((q) => q.slice(1)); setInput(head.content); inputRef.current = head.content; setAttachedImages(head.images); setTimeout(() => { if (queueContext.current.managed === false && queueContext.current.conversation === conversation) void submitRef.current?.(syntheticSubmit()); }, 0); }, verdict.delayMs); return () => clearTimeout(timer); }, [args.managedSession, conversation, input, isLoading, queuePulse, queuedDrafts]);
   useEffect(() => () => { if (dispatchTimer.current) clearTimeout(dispatchTimer.current); }, []);
   useEffect(() => { if (!projectId) return; const value = safeLocalStorage.getItem(draftInputKey(projectId, conversation)) || ''; setInput((old) => { inputRef.current = value; return old === value ? old : value; }); }, [conversation, projectId]);
   useEffect(() => { if (!projectId) return; const key = draftInputKey(projectId, conversation); if (input) safeLocalStorage.setItem(key, input); else safeLocalStorage.removeItem(key); }, [conversation, input, projectId]);
-  useEffect(() => { if (args.managedSession) { if (conversation) clearQueuedMessages(conversation); return; } if (conversation && queueOwner.current === conversation) { if (queuedDrafts.length) writeQueuedMessages(conversation, queuedDrafts.map(({ content, options }) => ({ content, options }))); else clearQueuedMessages(conversation); } }, [args.managedSession, conversation, queuedDrafts]);
+  useEffect(() => { if (conversation && queueOwner.current === conversation) { if (queuedDrafts.length) writeQueuedMessages(conversation, queuedDrafts.map(({ content, options }) => ({ content, options }))); else clearQueuedMessages(conversation); } }, [conversation, queuedDrafts]);
   useEffect(() => {
     queueOwner.current = conversation;
     queueInFlight.current = false;
@@ -174,7 +185,7 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
       for (const list of steerWaiting.current.values()) list.forEach(({ timer }) => clearTimeout(timer));
       steerWaiting.current.clear();
     }
-    setQueuedDrafts(!args.managedSession && conversation ? storedQueue(conversation) : []);
+    setQueuedDrafts(conversation ? storedQueue(conversation) : []);
   }, [args.managedSession, conversation]);
 
   const resize = useCallback((target: HTMLTextAreaElement) => { target.style.height = 'auto'; const height = Math.max(22, target.scrollHeight); target.style.height = `${height}px`; if (!lineHeight.current) { const parsed = parseInt(window.getComputedStyle(target).lineHeight); lineHeight.current = Number.isFinite(parsed) ? parsed : 24; } setExpanded(height > lineHeight.current * 2); resized.current = target.value; }, []);

@@ -15,6 +15,7 @@ export const requiredManagedSmokePaths = [
   'dist-server/server/gjc-herdr-task-host.js', 'dist-server/server/gjc-herdr-managed-child.js',
   'dist-server/server/gjc-bun-sdk-adapter.js',
   'dist-server/server/e2e/fixtures/herdr-managed-sdk-child.js',
+  'dist-server/server/e2e/fixtures/herdr-fake-endpoint.js',
   'dist-server/server/modules/database/index.js',
   'dist-server/server/modules/database/repositories/herdr-managed-provision.db.js',
   'dist-server/server/modules/herdr/index.js',
@@ -146,21 +147,26 @@ async function requireProductionDefaultEntrypoint(root, scratch, fixture, factor
   const { sessionsDb } = await load('server/modules/database/repositories/sessions.db.js');
   const { herdrManagedProvisionDb: db } = await load('server/modules/database/repositories/herdr-managed-provision.db.js');
   const { HerdrManagedAttachClient } = await load('server/modules/herdr/index.js');
+  const { startFakeHerdrEndpoint, FAKE_HERDR_PLACEMENT: placement } = await load('server/e2e/fixtures/herdr-fake-endpoint.js');
   const id = 'production-default-probe';
+  // The detached host proves its placement against the selected endpoint using
+  // the IDs Herdr injects into the pane process; this fixture stands in for both.
+  const herdr = await startFakeHerdrEndpoint('default-probe', path.join(scratch, 'default-herdr.sock'));
+  const launchEnv = { HERDR_WORKSPACE_ID: placement.workspaceId, HERDR_TAB_ID: placement.tabId, HERDR_PANE_ID: placement.paneId };
   let bootstrap;
   try {
     await initializeDatabase();
     sessionsDb.createAppSession(id, 'gjc', fixture.projectPath);
     db.registerNewSession(id, fixture.projectPath);
-    const record = db.reserve(id, { name: 'default-probe', canonicalPath: path.join(scratch, 'default-herdr.sock'), dev: 1, inode: 1 }, fixture.projectPath);
+    const record = db.reserve(id, herdr.endpoint, fixture.projectPath);
     db.cas(id, record.ownerGeneration, 'reserved', 'layout_requested');
-    db.cas(id, record.ownerGeneration, 'layout_requested', 'layout_created', 'workspace', { sessionName: 'default-probe', workspaceId: 'workspace', tabId: 'tab', paneId: 'pane', terminalId: 'terminal' });
+    db.cas(id, record.ownerGeneration, 'layout_requested', 'layout_created', placement.workspaceId, { sessionName: 'default-probe', workspaceId: placement.workspaceId, tabId: placement.tabId, paneId: placement.paneId, terminalId: placement.terminalId });
     bootstrap = { ...fixture, appSessionId: id, ownerGeneration: record.ownerGeneration, claimNonce: record.claimNonce, herdrInstanceId: 'default-probe', databasePath: process.env.DATABASE_PATH, attachSocketPath: path.join(scratch, 'default-attach.sock'), attachSecret: randomBytes(32).toString('hex') };
   } finally { closeConnection(); }
   const bootstrapPath = path.join(scratch, 'default-bootstrap.json');
   await fs.writeFile(bootstrapPath, JSON.stringify(bootstrap), { mode: 0o600 });
   const pty = createRequire(path.join(root, 'package.json'))('node-pty');
-  const terminal = pty.spawn(process.execPath, [path.join(root, 'dist-server/server/gjc-herdr-task-host.js'), bootstrapPath], { cwd: fixture.projectPath, env: process.env, name: 'xterm-256color', cols: 160, rows: 40 });
+  const terminal = pty.spawn(process.execPath, [path.join(root, 'dist-server/server/gjc-herdr-task-host.js'), bootstrapPath], { cwd: fixture.projectPath, env: { ...process.env, ...launchEnv }, name: 'xterm-256color', cols: 160, rows: 40 });
   let exited = false, exitCode, output = '', client, projection;
   terminal.onExit(event => { exited = true; exitCode = event.exitCode; });
   terminal.onData(data => { output = (output + data).slice(-64000); });
@@ -185,8 +191,9 @@ async function requireProductionDefaultEntrypoint(root, scratch, fixture, factor
     projection = { pid: terminal.pid, providerSessionId: client.state.providerSessionId, ownerGeneration: bootstrap.ownerGeneration, watermark: client.state.watermark };
   } finally {
     client?.close();
-    try { await close(); } finally { stopDefaultProbe = undefined; }
+    try { await close(); } finally { stopDefaultProbe = undefined; await herdr.close(); }
   }
+  assert.ok(herdr.requests.includes('session.snapshot'), 'Production host must verify its launch placement against the selected endpoint');
   assert.equal(exitCode, 0, 'Production host must await native SDK closure');
   return { ...projection, closed: true, exitCode };
 }
@@ -242,14 +249,17 @@ async function scenario(root, scratch) {
   const { sessionsDb } = await load('server/modules/database/repositories/sessions.db.js');
   const { herdrManagedProvisionDb: db } = await load('server/modules/database/repositories/herdr-managed-provision.db.js');
   const { HerdrManagedAttachClient } = await load('server/modules/herdr/index.js');
+  const { startFakeHerdrEndpoint, FAKE_HERDR_PLACEMENT: placement } = await load('server/e2e/fixtures/herdr-fake-endpoint.js');
   await initializeDatabase();
   const project = path.join(scratch, 'project');
   await fs.mkdir(project, { mode: 0o700 });
   const id = 'packaged-smoke';
+  const herdr = await startFakeHerdrEndpoint('smoke-owned', path.join(scratch, 'herdr.sock'));
+  const launchEnv = { HERDR_WORKSPACE_ID: placement.workspaceId, HERDR_TAB_ID: placement.tabId, HERDR_PANE_ID: placement.paneId };
   sessionsDb.createAppSession(id, 'gjc', project); db.registerNewSession(id, project);
-  const record = db.reserve(id, { name: 'smoke-owned', canonicalPath: path.join(scratch, 'unused.sock'), dev: 1, inode: 1 }, project);
+  const record = db.reserve(id, herdr.endpoint, project);
   db.cas(id, record.ownerGeneration, 'reserved', 'layout_requested');
-  db.cas(id, record.ownerGeneration, 'layout_requested', 'layout_created', 'workspace', { sessionName: 'smoke-owned', workspaceId: 'workspace', tabId: 'tab', paneId: 'pane', terminalId: 'terminal' });
+  db.cas(id, record.ownerGeneration, 'layout_requested', 'layout_created', placement.workspaceId, { sessionName: 'smoke-owned', workspaceId: placement.workspaceId, tabId: placement.tabId, paneId: placement.paneId, terminalId: placement.terminalId });
   const bootstrap = { appSessionId: id, ownerGeneration: record.ownerGeneration, claimNonce: record.claimNonce, herdrInstanceId: 'smoke-owned', projectPath: project, sessionRoot: path.join(scratch, 'native'), agentDir: path.join(scratch, 'agent'), databasePath: process.env.DATABASE_PATH, attachSocketPath: path.join(scratch, 'attach.sock'), attachSecret: randomBytes(32).toString('hex'), runConfig: { cwd: project, sessionRoot: path.join(scratch, 'native'), credential: { kind: 'runtime-env', envVar: 'GJC_RUNTIME_API_KEY' }, modelId: 'lifetime-model', toolNames: [], spawns: 'deny', bashPolicy: { allowedPrefixes: [] } } };
   await fs.mkdir(bootstrap.sessionRoot); await fs.mkdir(bootstrap.agentDir, { recursive: true });
   closeConnection();
@@ -314,7 +324,7 @@ child.on('exit',()=>{if(!closing)process.exit(1)});
     evidence.defaultSdk = await requireOfflineDefaultFactoryReadiness(root, scratch);
     const first = await app(); evidence.app.healthBefore = true;
     const pty = createRequire(path.join(root, 'package.json'))('node-pty');
-    terminal = pty.spawn(process.execPath, [hostScript], { cwd: project, env: process.env, name: 'xterm-256color', cols: 160, rows: 40 });
+    terminal = pty.spawn(process.execPath, [hostScript], { cwd: project, env: { ...process.env, ...launchEnv }, name: 'xterm-256color', cols: 160, rows: 40 });
     terminal.onExit(() => { exited = true; }); terminal.onData(data => { output = (output + data).slice(-64000); });
     await until('PTY READY', () => output.includes('READY'));
     owned = JSON.parse(await fs.readFile(path.join(scratch, 'owned.json'), 'utf8'));
@@ -358,7 +368,9 @@ child.on('exit',()=>{if(!closing)process.exit(1)});
       const gone = () => { try { process.kill(owned.childPid, 0); return false; } catch (error) { if (error.code === 'ESRCH') return true; throw error; } };
       try { await until('SDK exit', gone, 10000); } catch { process.kill(owned.childPid, 'SIGKILL'); await until('SDK forced exit', gone, 5000); }
     }
+    await herdr.close();
   }
+  assert.ok(herdr.requests.includes('session.snapshot'), 'Owned host must verify its launch placement against the selected endpoint');
   const disposed = JSON.parse(await fs.readFile(path.join(scratch, 'sdk.json'), 'utf8'));
   assert.equal(disposed.disposed, true, 'Deterministic SDK native writer must close');
   evidence.cleanupComplete = true;

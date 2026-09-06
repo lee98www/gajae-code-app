@@ -15,12 +15,13 @@ import {
 } from '../shared/herdr-managed-child-protocol.js';
 
 /** This script is test-owned and imported, never a production bootstrap option. */
-function launcherSource(disposalFile: string) {
+function launcherSource(disposalFile: string, titleDelayMs = 0) {
   return `
 import assert from 'node:assert/strict';
 import { writeFile } from 'node:fs/promises';
 import { runManagedChild } from ${JSON.stringify(fileURLToPath(new URL('./gjc-herdr-managed-child.ts', import.meta.url)))};
 import { GjcBunSdkAdapter } from ${JSON.stringify(fileURLToPath(new URL('./gjc-bun-sdk-adapter.ts', import.meta.url)))};
+const configuredTitleDelayMs = ${JSON.stringify(titleDelayMs)};
 let creations = 0;
 const authStorage = {
   exportSnapshot: () => ({ credentials: [] }),
@@ -90,21 +91,31 @@ const createSessionFactory = async (input) => {
       emit({ type: 'tool_execution_end', toolCallId: 'tool:' + turns, toolName: 'read', result: { content: [{ type: 'text', text: String(answer) }], details: { turn: turns } }, isError: false });
       emit({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'answer:' + turns }], stopReason: text === 'fail' ? 'error' : 'stop', ...(text === 'fail' ? { errorMessage: 'first failure' } : {}), usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 } } });
       this.isStreaming = false;
+      // Real runtimes keep reporting background state after a turn (a late
+      // title attempt, bookkeeping). No turn owns it once the prompt settles.
+      if (text === 'idle-after') setTimeout(() => emit({ type: 'notice', level: 'info', message: 'idle:late-bookkeeping' }), 150);
     },
     async abort() { resolveAbort?.('aborted'); },
     async dispose() { resolveAbort?.('disposed'); await writeFile(${JSON.stringify(disposalFile)}, JSON.stringify({ creations, turns, steers })); },
   };
   return { session, setToolUIContext(value) { ui = value; } };
 };
-await runManagedChild({ createAdapter: async () => new GjcBunSdkAdapter(authStorage, modelRegistry, { settings, createSessionFactory }) });
+await runManagedChild({ createAdapter: async () => new GjcBunSdkAdapter(authStorage, modelRegistry, {
+  settings,
+  createSessionFactory,
+  generateSessionTitle: async () => {
+    if (configuredTitleDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, configuredTitleDelayMs));
+    return configuredTitleDelayMs > 0 ? 'Delayed native title' : null;
+  },
+}) });
 `;
 }
 
-async function harness() {
+async function harness(titleDelayMs = 0) {
   const root = await mkdtemp(join(tmpdir(), 'herdr-child-'));
   const script = join(root, 'launcher.ts');
   const disposalFile = join(root, 'disposed.json');
-  await writeFile(script, launcherSource(disposalFile));
+  await writeFile(script, launcherSource(disposalFile, titleDelayMs));
   const child = spawn(process.execPath, [script], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, GJC_RUNTIME_API_KEY: 'test-only-not-a-provider-key' },
@@ -140,7 +151,7 @@ async function harness() {
   });
   const exited = new Promise<number | null>((resolve) => { child.once('exit', resolve); });
   async function wait<T>(read: () => T | undefined): Promise<T> {
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
       if (parseError) throw parseError;
       const value = read();
@@ -230,6 +241,40 @@ test('private Bun child streams real adapter mapping, accepts concurrent control
   } finally { await h.cleanup(); }
 });
 
+test('a delayed native title survives prompt settlement and a later retained turn through private IPC', { timeout: 40_000 }, async () => {
+  const h = await harness(10_200);
+  try {
+    await h.init();
+    h.send({ type: 'prompt', runId: 'late:1', requestId: 'late:1', actionId: 'late:1', text: 'success' });
+    const firstAsk = await h.event('late:1', 'permission_request');
+    h.send({ type: 'approval', runId: 'late:1', requestId: 'late:answer', actionId: 'late:answer', askId: firstAsk.event.requestId, decision: { allow: true, message: 'yes' } });
+    assert.equal((await h.response('late:answer')).ok, true);
+    const firstTerminal = await h.event('late:1', 'complete');
+    h.ack(firstTerminal);
+    assert.equal((await h.response('late:1')).ok, true);
+
+    // Start another turn before the first title completion. The title must
+    // retain its first prompt identity instead of attaching to this stream.
+    h.send({ type: 'prompt', runId: 'late:2', requestId: 'late:2', actionId: 'late:2', text: 'success' });
+    const secondAsk = await h.event('late:2', 'permission_request');
+    const title = await h.event('late:1', 'session_title');
+    assert.equal(title.event.title, 'Delayed native title');
+    assert.equal(title.requestId, 'late:1');
+    assert.equal(title.runId, 'late:1');
+    assert.equal(h.frames.filter((frame) => frame.type === 'event' && frame.event.kind === 'session_title').length, 1);
+
+    h.send({ type: 'approval', runId: 'late:2', requestId: 'late:answer:2', actionId: 'late:answer:2', askId: secondAsk.event.requestId, decision: { allow: true, message: 'yes' } });
+    assert.equal((await h.response('late:answer:2')).ok, true);
+    const secondTerminal = await h.event('late:2', 'complete');
+    h.ack(secondTerminal);
+    assert.equal((await h.response('late:2')).ok, true);
+    h.send({ type: 'close', requestId: 'late:close', actionId: 'late:close' });
+    assert.equal((await h.response('late:close')).ok, true);
+    assert.equal(await h.exited, 0);
+    assert.deepEqual(JSON.parse(await readFile(h.disposalFile, 'utf8')), { creations: 1, turns: 2, steers: 0 });
+  } finally { await h.cleanup(); }
+});
+
 test('managed Always remains host-owned and a later changed policy is consulted through another SDK gate', { timeout: 20_000 }, async () => {
   const h = await harness();
   try {
@@ -256,6 +301,28 @@ test('managed Always remains host-owned and a later changed policy is consulted 
     await h.response('permissions');
     h.child.stdin.end();
     assert.equal(await h.exited, 0);
+  } finally { await h.cleanup(); }
+});
+
+test('idle runtime events after a settled turn are dropped so close stays confirmable', { timeout: 20_000 }, async () => {
+  const h = await harness();
+  try {
+    await h.init();
+    h.send({ type: 'prompt', runId: 'settled', requestId: 'settled', actionId: 'settled', text: 'idle-after' });
+    const ask = await h.event('settled', 'permission_request');
+    h.send({ type: 'approval', runId: 'settled', requestId: 'answer', actionId: 'answer', askId: ask.event.requestId, decision: { allow: true, message: 'yes' } });
+    assert.equal((await h.response('answer')).ok, true);
+    h.ack(await h.event('settled', 'complete'));
+    await h.response('settled');
+    const settledFrames = h.frames.length;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const late = h.frames.slice(settledFrames).filter((f): f is ManagedChildEvent => f.type === 'event');
+    assert.deepEqual(late, [], 'no event may follow the settled prompt response');
+    assert.equal(JSON.stringify(h.frames).includes('idle:late-bookkeeping'), false);
+    h.send({ type: 'close', requestId: 'close', actionId: 'close' });
+    assert.equal((await h.response('close')).ok, true);
+    assert.equal(await h.exited, 0);
+    assert.deepEqual(JSON.parse(await readFile(h.disposalFile, 'utf8')), { creations: 1, turns: 1, steers: 0 });
   } finally { await h.cleanup(); }
 });
 

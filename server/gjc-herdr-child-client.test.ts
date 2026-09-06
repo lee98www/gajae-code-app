@@ -104,6 +104,45 @@ test('parallel prompt cannot poison active stream and early terminal waits for p
   assert.equal(f.writes.at(-1)?.type, 'ack');
 });
 
+test('a delayed native title may settle once on the first prompt identity, but arbitrary late turns are rejected', async () => {
+  const f = fixture(() => {});
+  const first = f.transport.request(prompt);
+  f.emit({ type: 'response', requestId: 'p', runId: 'p', ok: true });
+  assert.equal((await first).ok, true);
+
+  f.emit({
+    type: 'event',
+    requestId: 'p',
+    runId: 'p',
+    eventSeq: 1,
+    event: { kind: 'session_title', title: 'late title', source: 'auto', sessionId: 'provider' },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(f.writes.at(-1)?.eventSeq, 1);
+
+  const second = f.transport.request({ ...prompt, requestId: 'second', runId: 'second', actionId: 'second' });
+  f.emit({ type: 'event', requestId: 'second', runId: 'second', eventSeq: 2, event: { kind: 'text', text: 'next' } });
+  f.emit({ type: 'response', requestId: 'second', runId: 'second', ok: true });
+  assert.equal((await second).ok, true);
+
+  const duplicate = f.transport.request({ ...prompt, requestId: 'third', runId: 'third', actionId: 'third' });
+  f.emit({
+    type: 'event',
+    requestId: 'p',
+    runId: 'p',
+    eventSeq: 3,
+    event: { kind: 'session_title', title: 'duplicate', source: 'auto', sessionId: 'provider' },
+  });
+  await assert.rejects(duplicate, /Managed child protocol failed/);
+
+  const arbitrary = fixture(() => {});
+  const settled = arbitrary.transport.request(prompt);
+  arbitrary.emit({ type: 'response', requestId: 'p', runId: 'p', ok: true });
+  await settled;
+  arbitrary.emit({ type: 'event', requestId: 'p', runId: 'p', eventSeq: 1, event: { kind: 'text', text: 'late turn' } });
+  await assert.rejects(arbitrary.transport.request({ ...prompt, requestId: 'after', runId: 'after', actionId: 'after' }), /Managed child protocol failed/);
+});
+
 test('oversized complete multibyte frame rejects every waiter', async () => {
   const f = fixture(() => {});
   const p = f.transport.request(prompt);

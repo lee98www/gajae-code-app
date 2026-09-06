@@ -23,7 +23,7 @@ export interface ChatMessage {
   [key: string]: unknown;
 }
 
-export interface PendingPermissionRequest { requestId: string; toolName: string; input?: unknown; context?: unknown; sessionId?: string | null; receivedAt?: Date; }
+export interface PendingPermissionRequest { requestId: string; toolName: string; status?: 'pending' | 'unknown'; input?: unknown; context?: unknown; sessionId?: string | null; receivedAt?: Date; }
 /** The user's answer to a permission card; `always` selects the runtime's matching persistent option. */
 export interface PermissionDecision { allow?: boolean; always?: boolean; message?: string; updatedInput?: unknown; }
 interface QuestionOption { label: string; description?: string; }

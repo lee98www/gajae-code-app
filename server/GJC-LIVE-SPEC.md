@@ -21,12 +21,14 @@ workspace/layout creation.
 The pane's independent Node `gjc-herdr-task-host.ts` owns one pinned Bun
 `gjc-herdr-managed-child.ts` SDK session. Readiness requires the real provider
 session ID; only then may the App project the mapping and submit a prompt.
-The App owns schema initialization, mapping/projection CAS and project
-permission revisions, not this process lifetime. Its quit or browser
+Schema initialization and project permission policy remain App-owned;
+mapping/projection writes require generation-fenced CAS. Neither gives the
+App process ownership of the task-host lifetime. Its quit or browser
 disconnect detaches clients. Ordinary coding, files, commands, asks, and
 permissions continue with the same native callbacks through Herdr/Collie.
-Explicit lifecycle operations (including delete/archive) remain fenced against
-active owners and pending work; UI disconnection is not a lifecycle command.
+Archiving hides the App conversation without stopping its owner. Permanent
+deletion remains fenced until native-writer closure and owned metadata cleanup
+are confirmed; UI disconnection is not a lifecycle command.
 
 Herdr publication is host-owned: `pane.report_agent` carries `agent: gjc` and
 idle/working/blocked/unknown status; `pane.report_metadata` carries the
@@ -46,14 +48,27 @@ is bound to app session, owner generation, provider session, turn, and request,
 plus current policy/capability revisions. The concrete R2 grammar, bounded
 paste/no-echo rules, and ACK troubleshooting are in
 [SELF-HOST.md](../docs/SELF-HOST.md#r2-console-and-uncertain-outcomes);
-`gjc-herdr-task-console.ts` is the parser authority.
+`gjc-herdr-task-console.ts` is the parser authority. Snapshot pages advance
+with socket progress rather than a full-history burst; concurrent journal
+changes follow the immutable watermark or a newer authoritative replacement.
+
+SDK 0.15.6 implements multiple questions and checkbox selection through
+successive scalar UI callbacks. Its supported AskTool/UI API has no
+secret/no-echo/no-history answer hook. Tagged ask answers are therefore
+rejected before live delivery; the UI offers refusal, not password entry.
+Redaction of tagged permission inputs is not a promise that arbitrary
+credentials entered into an ordinary question will stay out of native history.
 
 App-dependent automation waits on the original SDK callback while disconnected.
 Renewal binds the actual browser/application target and requires explicit
 resume approval. Only authoritative completed receipts or fenced
 not-dispatched outcomes permit recovery; an existing reservation with unknown
 outcome is not replayable. Missing command replies require status/ACK lookup,
-not restart, a new action ID, or a replacement task.
+not restart, a new action ID, or a replacement task. A denial consumes its
+approval request; another viewer cannot approve that same request afterward.
+Verified driver rejections are known outcomes, but post-write transport loss
+or malformed driver replies remain uncertain. An explicit `CUA_DRIVER_PATH`
+is authoritative and never silently falls through to another installation.
 
 The latest required managed `launch_app` contract uses an exact installed
 bundle ID, a private canonical-path/identity binding and predispatch

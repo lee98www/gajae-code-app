@@ -14,6 +14,7 @@ export interface ManagedChatRecord extends Data {
 }
 export interface ManagedPendingPermission extends Data {
   requestId: string; sessionId: string; toolName: string; input: unknown; context: unknown;
+  status: 'pending' | 'unknown';
   generation: string; providerSessionId: string; turnId: string; policyRevision: number; createdAt: string;
 }
 export interface ManagedUIStatus {
@@ -75,6 +76,7 @@ export function projectManagedState(state: HerdrManagedState): ManagedChatProjec
   }
   records.sort((a, b) => (a.seq ?? Number.MAX_SAFE_INTEGER) - (b.seq ?? Number.MAX_SAFE_INTEGER));
   const pendingPermissions: ManagedPendingPermission[] = Object.values(state.requests).map(request => ({
+    status: request.scope.status === 'unknown' ? 'unknown' : 'pending',
     requestId: request.requestId, sessionId, generation: request.generation, providerSessionId: request.providerSessionId,
     turnId: request.turnId, policyRevision: request.policyRevision, createdAt: request.createdAt,
     toolName: typeof request.scope.toolName === 'string' ? request.scope.toolName : request.kind === 'ask' ? 'AskUserQuestion' : 'Permission',
@@ -92,7 +94,7 @@ export function projectManagedState(state: HerdrManagedState): ManagedChatProjec
     const request = pendingPermissions.find(r => r.requestId === operation.approvalRequestId);
     const fields = { toolName: 'AutomationResume', input: operation, context: { ...operation, title: `Resume ${operation.identity.targetContext}`, options: ['allow_once', 'reject_once'] } };
     if (request) Object.assign(request, fields);
-    else pendingPermissions.push({ ...fields, requestId: operation.approvalRequestId, sessionId, generation: ownerGeneration,
+    else pendingPermissions.push({ ...fields, status: 'pending', requestId: operation.approvalRequestId, sessionId, generation: ownerGeneration,
       providerSessionId: operation.identity.provider, turnId: operation.identity.turn, policyRevision: operation.identity.policyRevision, createdAt: '' });
   }
   const terminal = ['idle', 'interrupted', 'closed'].includes(state.lifecycle);

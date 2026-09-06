@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +12,8 @@ import { WebSocket } from 'ws';
 import { HerdrManagedAttachClient } from '../modules/herdr/index.js';
 import { acceptManagedSequence, assembleManagedTransfer, projectManagedState, type ManagedChatProjection, type ManagedSnapshotFrame } from '../../shared/herdr-managed-chat.js';
 import type { HerdrTaskHostBootstrap } from '../gjc-herdr-task-host.js';
+
+import { FAKE_HERDR_PLACEMENT, startFakeHerdrEndpoint, type FakeHerdrEndpoint } from './fixtures/herdr-fake-endpoint.js';
 
 const repo = fileURLToPath(new URL('../../', import.meta.url));
 const fixture = (name: string) => fileURLToPath(new URL(`./fixtures/${name}.ts`, import.meta.url));
@@ -45,9 +47,13 @@ async function exit(child: ChildProcess, signal: NodeJS.Signals) {
 }
 
 for (const signal of ['SIGTERM', 'SIGKILL'] as const) test(`real PTY owner outlives App ${signal}, native callbacks and two normal-chat viewers recover`, { timeout: 180_000 }, async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'managed lifetime '));
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'managed lifetime ')));
   const env = Object.fromEntries(Object.entries(process.env).filter(([key, value]) => value !== undefined && !/(TOKEN|SECRET|PASSWORD|API_KEY|AUTHORIZATION)/i.test(key))) as Record<string, string>;
   Object.assign(env, { TSX_TSCONFIG_PATH: tsconfig, DATABASE_PATH: path.join(root, 'app.sqlite') });
+  // Herdr outlives the App: the harness owns the endpoint the host proves its placement against,
+  // and only the host process receives the pane identity Herdr would inject.
+  let herdr: FakeHerdrEndpoint | undefined;
+  const hostEnv = { ...env, HERDR_WORKSPACE_ID: FAKE_HERDR_PLACEMENT.workspaceId, HERDR_TAB_ID: FAKE_HERDR_PLACEMENT.tabId, HERDR_PANE_ID: FAKE_HERDR_PLACEMENT.paneId };
   const apps: ChildProcess[] = [];
   const viewers: WebSocket[] = [];
   let host: import('node-pty').IPty | undefined;
@@ -74,14 +80,17 @@ for (const signal of ['SIGTERM', 'SIGKILL'] as const) test(`real PTY owner outli
   }
   function command(value: string) { assert.ok(host && !hostExited); host.write(value + '\r'); }
   try {
+    herdr = await startFakeHerdrEndpoint('test-owned', path.join(root, 'herdr.sock'));
+    await writeFile(path.join(root, 'herdr-endpoint.json'), JSON.stringify(herdr.endpoint), { mode: 0o600 });
     const first = await app(1);
     const bootstrap: HerdrTaskHostBootstrap = await json(path.join(root, 'bootstrap.json'));
     const pty = require(process.env.HERDR_LIFETIME_PTY ?? 'node-pty') as typeof import('node-pty');
-    host = pty.spawn(node, launch(fixture('herdr-managed-test-host'), path.join(root, 'bootstrap.json'), bun, path.join(root, 'sdk.json'), path.join(root, 'host.json')), { cwd: root, env, name: 'xterm-256color', cols: 160, rows: 40 });
+    host = pty.spawn(node, launch(fixture('herdr-managed-test-host'), path.join(root, 'bootstrap.json'), bun, path.join(root, 'sdk.json'), path.join(root, 'host.json')), { cwd: root, env: hostEnv, name: 'xterm-256color', cols: 160, rows: 40 });
     host.onExit(() => { hostExited = true; });
     host.onData(data => { terminal = (terminal + data).slice(-64_000); });
     hostReceipt = await receipt(path.join(root, 'host.json'));
     assert.equal(hostReceipt.hostPid, host.pid);
+    assert.ok(herdr.requests.includes('session.snapshot'), 'host must prove its launch placement against the selected endpoint');
     observer = new HerdrManagedAttachClient({ appSessionId: bootstrap.appSessionId, ownerGeneration: bootstrap.ownerGeneration, socketPath: bootstrap.attachSocketPath!, attachSecret: bootstrap.attachSecret! });
     await observer.connect(); await observer.recover();
     const state = () => observer!.state!;
@@ -211,6 +220,7 @@ for (const signal of ['SIGTERM', 'SIGKILL'] as const) test(`real PTY owner outli
       } catch (error: any) { if (error.code !== 'ENOENT' && error.code !== 'ESRCH') throw error; }
       });
     }
+    await cleanupStep(() => herdr?.close());
     await cleanupStep(() => rm(root, { recursive: true, force: true }));
   if (cleanupFailures.length) {
     throw new AggregateError(

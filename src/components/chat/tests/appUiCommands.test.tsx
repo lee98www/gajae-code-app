@@ -90,6 +90,8 @@ function captureComposer(sentMessages: unknown[], addedMessages: unknown[]) {
 
   function Capture() {
     composer = useChatComposerState({
+      // These harnesses exercise a resolved legacy session; an undefined mode means still resolving.
+      managedSession: false,
       selectedProject,
       selectedSession: null,
       currentSessionId: 'session-1',

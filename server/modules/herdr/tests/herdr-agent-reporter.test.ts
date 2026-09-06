@@ -137,6 +137,33 @@ test('publishes native identity, coalesces token updates, transitions, and relea
   } finally { await f.close(); }
 });
 
+test('exact child-closure proof permits metadata cleanup before lifecycle closed', async () => {
+  const f = await fixture();
+  try {
+    f.reporter.start();
+    await until(() => f.reporter.status().status === 'published');
+    await f.reporter.quiesce();
+    assert.equal(f.target.binding!.lifecycle, 'ready');
+    assert.equal(await f.reporter.release({
+      appSessionId: 'app-id',
+      ownerGeneration: 'other-generation',
+      providerSessionId: 'sdk-id',
+      childClosed: true,
+    }), false);
+    assert.equal(f.reporter.status().status, 'not_closed');
+    const cleaned = await f.reporter.release({
+      appSessionId: 'app-id',
+      ownerGeneration: 'generation',
+      providerSessionId: 'sdk-id',
+      childClosed: true,
+    });
+    assert.equal(cleaned, true);
+    assert.equal(f.reporter.status().status, 'released');
+    assert.equal(f.target.binding!.lifecycle, 'ready', 'reporter does not claim the lifecycle transition');
+    assert.equal(f.calls.filter(call => call.method === 'pane.release_agent').length, 1);
+  } finally { await f.close(); }
+});
+
 test('an RPC acknowledgement without matching native snapshot metadata stays unconfirmed', async () => {
   const f = await fixture();
   try {

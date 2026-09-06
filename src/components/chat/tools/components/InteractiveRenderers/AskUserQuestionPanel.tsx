@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 
 import type { PermissionPanelProps } from '../../configs/permissionPanelRegistry';
 import type { Question } from '../../../types/types';
@@ -9,6 +10,7 @@ const optionClass = (selected: boolean) => `group flex w-full items-start gap-2.
 const keyClass = (selected: boolean) => `flex h-5 w-5 shrink-0 items-center justify-center rounded font-mono text-[10px] transition-all duration-150 ${selected ? 'bg-primary font-semibold text-primary-foreground' : 'border border-border bg-muted text-muted-foreground'}`;
 
 export const AskUserQuestionPanel: React.FC<PermissionPanelProps> = ({ request, onDecision }) => {
+  const { t } = useTranslation('chat');
   const input = request.input as { questions?: Question[] } | undefined;
   const questions = useMemo(() => input?.questions || [], [input]);
   const [step, setStep] = useState(0);
@@ -38,14 +40,14 @@ export const AskUserQuestionPanel: React.FC<PermissionPanelProps> = ({ request, 
     });
   }, []);
   const answers = useCallback(() => {
-    const result: Record<string, string> = {};
+    const result: Record<string, string> = Object.create(null);
     questions.forEach((question, index) => {
       const values = Array.from(picked.get(index) || []);
       const custom = (otherText.get(index) || '').trim();
       if (other.get(index) && custom) values.push(custom);
       if (values.length) result[question.question] = values.join(', ');
     });
-    return result;
+    return { ...result };
   }, [other, otherText, picked, questions]);
   const submit = useCallback(() => onDecision(request.requestId, { allow: true, updatedInput: { answers: answers() } }), [answers, onDecision, request.requestId]);
   const skip = useCallback(() => onDecision(request.requestId, { allow: false, message: 'User skipped the question' }), [onDecision, request.requestId]);
@@ -58,6 +60,11 @@ export const AskUserQuestionPanel: React.FC<PermissionPanelProps> = ({ request, 
     if (event.key === 'Enter') { event.preventDefault(); if (step === questions.length - 1) { submit(); } else { setStep((value) => value + 1); } return; }
     if (event.key === 'Escape') { event.preventDefault(); skip(); }
   }, [questions, select, skip, step, submit, toggleOther]);
+  if (request.status === 'unknown') return <div role="status" className="rounded-lg border border-border bg-muted/50 p-3"><p className="font-medium text-foreground">{t('permissionCard.unknownTitle')}</p><p className="mt-1 text-sm text-muted-foreground">{t('permissionCard.unknownGuidance')}</p></div>;
+  if (request.context !== null && typeof request.context === 'object'
+    && (request.context as { inputMode?: unknown }).inputMode === 'non-echo') {
+    return <div role="status" className="rounded-lg border border-border bg-muted/50 p-3"><p className="font-medium text-foreground">{t('permissionCard.secretUnavailableTitle')}</p><p className="mt-1 text-sm text-muted-foreground">{t('permissionCard.secretUnavailableGuidance')}</p><button type="button" onClick={skip} className="mt-2 rounded-md border border-border px-3 py-1.5 text-sm text-foreground hover:bg-accent">{t('permissionCard.deny')}</button></div>;
+  }
   if (!questions.length) return null;
   const question = questions[step]; const multiple = question.multiSelect || false; const selected = picked.get(step) || new Set<string>(); const otherOn = other.get(step) || false; const last = step === questions.length - 1; const single = questions.length === 1; const canSubmit = selected.size > 0 || (otherOn && (otherText.get(step) || '').trim().length > 0) || Object.keys(answers()).length > 0;
   const advance = () => setStep((value) => value + 1);

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { setImmediate as yieldToSocket, setTimeout as waitForSocket } from 'node:timers/promises';
 
 import { MANAGED_CHAT_MAX_FRAME_BYTES, pageTransfer, projectManagedEvent, projectManagedState } from '../../../../shared/herdr-managed-chat.js';
 import type { HerdrManagedBridgeTransport, HerdrManagedCommand, HerdrManagedCommandReceipt } from '../../../../shared/herdr-managed-protocol.js';
@@ -18,8 +19,9 @@ export type ManagedChatControl = { sessionId: string; actionId: string; content?
 export type ManagedChatPermissionResponse = { sessionId: string; actionId: string; requestId: string; allow: boolean; always?: boolean; message?: string; updatedInput?: unknown };
 type Client = Pick<HerdrManagedAttachClient, 'state' | 'recover' | 'subscribe' | 'subscribeState' | 'command' | 'automationControl' | 'close' | 'connected'>;
 type Binding = { client: Client; viewers: Set<ManagedChatConnection>; off: (() => void)[]; renewing?: boolean };
+type SnapshotTransfer = { latest: HerdrManagedState | null; events: unknown[]; bytes: number };
 export type HerdrManagedChatOptions = {
-  workspaces?: Pick<HerdrManagedWorkspacesService, 'isManaged' | 'ensure' | 'attach'>;
+  workspaces?: Pick<HerdrManagedWorkspacesService, 'isManaged' | 'ensure'> & { attach(id: string): Promise<Client> };
   db?: Pick<typeof herdrManagedProvisionDb, 'get' | 'projectState'>;
   automationTransport?: () => Promise<HerdrManagedBridgeTransport | null>;
 };
@@ -34,6 +36,7 @@ export class HerdrManagedChatService {
   readonly #bindings = new Map<string, Binding>();
   readonly #attaching = new Map<string, Promise<Binding>>();
   readonly #detached = new WeakSet<ManagedChatConnection>();
+  readonly #transfers = new Map<ManagedChatConnection, Map<string, SnapshotTransfer>>();
   #closed = false;
   constructor(options: HerdrManagedChatOptions = {}) {
     this.#workspaces = options.workspaces ?? getProductionHerdrManagedWorkspacesService();
@@ -72,8 +75,80 @@ export class HerdrManagedChatService {
     }
     try { connection.send(encoded); return true; } catch { this.detach(connection); return false; }
   }
-  #snapshot(connection: ManagedChatConnection, state: HerdrManagedState): void {
-    for (const frame of pageTransfer(projectManagedState(state), randomUUID())) if (!this.#emit(connection, frame)) break;
+  async #writeSnapshotFrame(connection: ManagedChatConnection, frame: unknown): Promise<boolean> {
+    const bytes = Buffer.byteLength(JSON.stringify(frame));
+    let buffered = connection.bufferedAmount ?? 0;
+    let progressedAt = Date.now();
+    while (buffered + bytes > MANAGED_CHAT_MAX_FRAME_BYTES * 4) {
+      if (this.#closed || this.#detached.has(connection) || connection.readyState !== 1) return false;
+      await waitForSocket(25);
+      const current = connection.bufferedAmount ?? 0;
+      if (current < buffered) progressedAt = Date.now();
+      buffered = current;
+      if (Date.now() - progressedAt >= 15_000) {
+        this.detach(connection);
+        try { connection.close?.(1013, 'Managed projection consumer stalled; reconnect.'); } catch { /* Already detached. */ }
+        return false;
+      }
+    }
+    if (!this.#emit(connection, frame)) return false;
+    // A complete snapshot must not monopolize the turn that flushes its socket.
+    await yieldToSocket();
+    return !this.#closed && !this.#detached.has(connection) && connection.readyState === 1;
+  }
+  async #snapshot(connection: ManagedChatConnection, state: HerdrManagedState): Promise<boolean> {
+    let transfers = this.#transfers.get(connection);
+    if (!transfers) { transfers = new Map(); this.#transfers.set(connection, transfers); }
+    const id = state.identity.appSessionId;
+    const existing = transfers.get(id);
+    if (existing) {
+      existing.latest = state;
+      existing.events = [];
+      existing.bytes = 0;
+      return true;
+    }
+    const transfer: SnapshotTransfer = { latest: state, events: [], bytes: 0 };
+    transfers.set(id, transfer);
+    try {
+      while (transfer.latest || transfer.events.length) {
+        if (transfer.latest) {
+          const snapshot = transfer.latest;
+          transfer.latest = null;
+          for (const frame of pageTransfer(projectManagedState(snapshot), randomUUID())) {
+            if (!await this.#writeSnapshotFrame(connection, frame)) return false;
+          }
+        }
+        while (!transfer.latest && transfer.events.length) {
+          const frame = transfer.events.shift();
+          transfer.bytes -= Buffer.byteLength(JSON.stringify(frame));
+          if (!await this.#writeSnapshotFrame(connection, frame)) return false;
+        }
+      }
+      return true;
+    } catch {
+      this.#emit(connection, { kind: 'managed_ui_status', sessionId: id, status: 'projection_unavailable' });
+      return false;
+    } finally {
+      transfers.delete(id);
+      if (!transfers.size) this.#transfers.delete(connection);
+    }
+  }
+  #event(connection: ManagedChatConnection, state: HerdrManagedState, frame: unknown): void {
+    const bytes = Buffer.byteLength(JSON.stringify(frame));
+    const transfer = this.#transfers.get(connection)?.get(state.identity.appSessionId);
+    if (transfer) {
+      if (transfer.latest || bytes > MANAGED_CHAT_MAX_FRAME_BYTES || transfer.bytes + bytes > MANAGED_CHAT_MAX_FRAME_BYTES * 4) {
+        // Replace only the unsent suffix. The current immutable transfer still
+        // reaches snapshot_end before its newer authoritative replacement.
+        transfer.latest = state;
+        transfer.events = [];
+        transfer.bytes = 0;
+      } else {
+        transfer.events.push(frame);
+        transfer.bytes += bytes;
+      }
+    } else if (bytes > MANAGED_CHAT_MAX_FRAME_BYTES) void this.#snapshot(connection, state);
+    else this.#emit(connection, frame);
   }
   #project(state: HerdrManagedState): void {
     if (!state.providerSessionId) throw new Error('Managed provider identity is not ready.');
@@ -109,17 +184,14 @@ export class HerdrManagedChatService {
           // Live callbacks immediately follow state callbacks. Only recovery needs replacement.
           queueMicrotask(() => {
             if (this.#closed || this.#bindings.get(id) !== current || client.state !== state || liveWatermark === state.watermark) return;
-            for (const viewer of current.viewers) this.#snapshot(viewer, state);
+            for (const viewer of current.viewers) void this.#snapshot(viewer, state);
           });
         }));
         current.off.push(client.subscribe(event => {
           const state = client.state; if (!state || state.watermark !== event.seq) return;
           liveWatermark = event.seq;
           const frame = projectManagedEvent(event, state);
-          for (const viewer of current.viewers) {
-            if (Buffer.byteLength(JSON.stringify(frame)) <= MANAGED_CHAT_MAX_FRAME_BYTES) this.#emit(viewer, frame);
-            else this.#snapshot(viewer, state);
-          }
+          for (const viewer of current.viewers) this.#event(viewer, state, frame);
         }));
         if (client.state) this.#project(client.state);
         if (client.state) await this.#renew(current, client.state);
@@ -134,7 +206,10 @@ export class HerdrManagedChatService {
       const binding = await this.#attach(sessionId);
       const state = binding.client.state ?? await binding.client.recover();
       if (this.#closed || this.#detached.has(connection) || connection.readyState !== 1) return { ok: false, status: 'unknown', error: 'Managed viewer disconnected.' };
-      if (!binding.viewers.has(connection)) this.#snapshot(connection, state);
+      if (!binding.viewers.has(connection)) {
+        binding.viewers.add(connection);
+        if (!await this.#snapshot(connection, state)) return { ok: false, status: 'unknown', error: 'Managed projection disconnected; reconnect.' };
+      }
       if (this.#detached.has(connection)) return { ok: false, status: 'unknown', error: 'Managed projection disconnected; reconnect.' };
       binding.viewers.add(connection);
       return { ok: true };
@@ -261,7 +336,7 @@ export class HerdrManagedChatService {
     this.#emit(connection, { kind: 'managed_command_result', sessionId, actionId, requestId: requestId || null, result });
     return true;
   }
-  detach(connection: ManagedChatConnection): void { this.#detached.add(connection); for (const binding of this.#bindings.values()) binding.viewers.delete(connection); }
+  detach(connection: ManagedChatConnection): void { this.#detached.add(connection); this.#transfers.delete(connection); for (const binding of this.#bindings.values()) binding.viewers.delete(connection); }
   close(): void { this.#closed = true; for (const binding of this.#bindings.values()) { binding.off.forEach(off => off()); binding.client.close(); } this.#bindings.clear(); }
 }
 let productionService: HerdrManagedChatService | null = null;

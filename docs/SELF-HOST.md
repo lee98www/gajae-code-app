@@ -100,7 +100,9 @@ not-dispatched result; a reserved/unknown attempt remains unknown, never replaye
 
 ### R2 console and uncertain outcomes
 
-Use `:help` and `:status` in the owned pane. Current parser grammar is:
+Use `:help` and `:status` in the owned pane. Status exposes the safe owner,
+active-turn and queued-action identities needed for console-only control.
+Current parser grammar is:
 
 ```text
 :prompt ACTION STATE_REVISION "JSON text"
@@ -118,9 +120,9 @@ Use `:help` and `:status` in the owned pane. Current parser grammar is:
 Permission decisions also accept `deny-once`, `allow-always`, and
 `deny-remaining`; resume accepts `deny`. Copy the full five-part request identity
 and current revisions from the host, never the newest or focused request.
-Use the answer values offered by that request. The parser accepts JSON arrays,
-but they are not an indication that the installed SDK supports multi-select;
-the host validates the request's actual answer schema.
+Use the answer values offered by that request. SDK 0.15.6 implements multi-question and multi-select prompts using successive
+scalar selector callbacks. Answer the current callback once; do not combine
+several callbacks into an array or echo a replacement question schema.
 Action IDs are 1–64 ASCII letters/digits/underscore/hyphen; identity components
 are 1–160 of the same characters. Mutations require an action ID.
 
@@ -135,11 +137,15 @@ not owner shutdown. Input EOF/error detaches only that input and restores its
 original raw mode and disables bracketed paste; App/attach disconnects do not
 release the owned terminal. Owner close/exit also restores terminal settings.
 Programmatic SIGINT, SIGTERM, or SIGHUP closes the independent owner gracefully,
-waiting for private child disposal and its persistent writer before marking closed.
+waiting for private child disposal, its persistent writer and confirmed owned
+metadata cleanup before marking closed.
 The console does not echo payloads or retain input history. Secret-tagged
 requests suppress their content; output sanitizes controls and known secrets,
 but cannot recognize arbitrary secrets in prose. Never paste credentials into
-an echoing shell or publish console/bootstrap dumps.
+an echoing shell or publish console/bootstrap dumps. The pinned SDK has no
+supported no-save secret-answer hook: tagged ask answers fail closed and the
+App offers refusal rather than an editable secret field. Ordinary question
+answers can appear in native history; use a separate credential flow.
 
 Herdr accepting bytes is not a host ACK. `ACK ACTION STATE SEQ` records
 admission/execution/settlement, not necessarily successful task completion.
@@ -151,8 +157,9 @@ The App server projects mappings through a generation/sequence CAS. Project
 policy writers share revision-checked storage; the live host alone resolves its
 pending permission requests and commits winning Always grants, including while
 the App is absent.
-Delete/archive must respect managed lifecycle fences rather than deleting an
-active owner or silently adopting its session. Native history, rich event
+Archiving hides a conversation without stopping its owner. Permanent deletion
+requires confirmed native closure and owned metadata cleanup; an active or
+uncertain owner cannot be deleted or silently adopted. Native history, rich event
 replay, and bounded paginated snapshots restore chat; terminal scraping does
 not. Private bootstrap, attach tokens, and automation target paths stay
 server-side, outside browser payloads and diagnostic logs. Tokens and prompt
@@ -170,6 +177,10 @@ old approval. Launch uses the existing CUA session and its validated bundle ID,
 not a direct OS-command path around driver revocation or suspension. A rejected
 session is not silently renamed to regain authority. Successful dispatch reports
 `launchRequested: true` after the driver accepts the request, not a fabricated PID.
+An explicit `CUA_DRIVER_PATH` is never replaced silently by another discovered
+installation. Transport loss after a possible dispatch remains unknown; only a
+verified driver response can settle it. Denied approval request IDs are consumed,
+so another viewer cannot approve the same request afterward.
 This is a product contract, not evidence of an executed installed-app test.
 
 ## Non-managed Herdr observer/input boundary

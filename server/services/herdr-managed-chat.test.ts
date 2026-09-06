@@ -5,12 +5,15 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
+import { WebSocket, WebSocketServer } from 'ws';
+
 import { closeConnection, getConnection } from '../modules/database/connection.js';
 import { INIT_SCHEMA_SQL } from '../modules/database/schema.js';
 import { sessionsDb } from '../modules/database/repositories/sessions.db.js';
 import { herdrManagedDb } from '../modules/database/repositories/herdr-managed.db.js';
 import { herdrManagedProvisionDb as db } from '../modules/database/repositories/herdr-managed-provision.db.js';
-import { pageHerdrManagedState, serializeHerdrManagedState } from '../../shared/herdr-managed-state.js';
+import { createHerdrManagedState, pageHerdrManagedState, serializeHerdrManagedState } from '../../shared/herdr-managed-state.js';
+import { assembleManagedTransfer, MANAGED_CHAT_MAX_FRAME_BYTES, type ManagedSnapshotFrame } from '../../shared/herdr-managed-chat.js';
 import type { HerdrManagedCommand, HerdrManagedEvent } from '../../shared/herdr-managed-protocol.js';
 import { automationService } from '../modules/automation/automation.service.js';
 import { HerdrManagedAttachClient, HerdrManagedChatService, type ManagedChatConnection } from '../modules/herdr/index.js';
@@ -20,6 +23,79 @@ function viewer() {
   const connection: ManagedChatConnection = { readyState: 1, send: text => { frames.push(JSON.parse(text)); } };
   return { connection, frames };
 }
+
+test('large immutable snapshots drain over a real paused WebSocket and retain concurrent journal changes', async () => {
+  const identity = { appSessionId: 'large-chat', ownerGeneration: 'large-owner' };
+  let state = createHerdrManagedState(identity);
+  state = { ...state, lifecycle: 'idle', providerSessionId: 'native-large', watermark: 10,
+    messages: [{ id: 'message-1', turnId: 'turn-1', content: 'owned transcript\n'.repeat(600_000), reasoning: [], final: true, metadata: {} }] };
+  let onState: (value: typeof state) => void = () => {};
+  let onEvent: (value: HerdrManagedEvent) => void = () => {};
+  const client = {
+    get state() { return state; }, connected: true,
+    recover: async () => state,
+    subscribe: (callback: typeof onEvent) => { onEvent = callback; return () => {}; },
+    subscribeState: (callback: typeof onState) => { onState = callback; return () => {}; },
+    command: async () => { throw new Error('Snapshot transfer must not dispatch commands.'); },
+    automationControl: async () => { throw new Error('Snapshot transfer must not dispatch automation.'); },
+    close: () => {},
+  };
+  const service = new HerdrManagedChatService({
+    workspaces: { isManaged: () => true, attach: async () => client, ensure: async () => { throw new Error('Existing owner must not be provisioned.'); } },
+    db: { get: () => null, projectState: () => true }, automationTransport: async () => null,
+  });
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  let browser: WebSocket | undefined;
+  let peer: WebSocket | undefined;
+  let resumeTimer: ReturnType<typeof setTimeout> | undefined;
+  const watchdog = setTimeout(() => { browser?.terminate(); peer?.terminate(); }, 15_000);
+  try {
+    await new Promise<void>(resolve => server.once('listening', resolve));
+    const accepted = new Promise<WebSocket>(resolve => server.once('connection', resolve));
+    browser = new WebSocket(`ws://127.0.0.1:${(server.address() as net.AddressInfo).port}`);
+    const frames: ManagedSnapshotFrame[] = [];
+    let updates = 0;
+    const recovered = new Promise<void>((resolve, reject) => {
+      browser!.on('error', reject);
+      browser!.on('message', data => {
+        const frame = JSON.parse(data.toString()) as ManagedSnapshotFrame;
+        frames.push(frame);
+        if (frame.kind === 'managed_snapshot_page' && updates < 2) {
+          updates++;
+          state = { ...state, watermark: state.watermark + 1, title: `Concurrent title ${updates}` };
+          onState(state);
+          onEvent({ protocolVersion: 1, ...identity, seq: state.watermark, kind: 'session_title', payload: { title: state.title }, createdAt: new Date().toISOString() });
+        }
+        if (frame.kind === 'managed_snapshot_end' && frame.watermark === 12) resolve();
+      });
+      browser!.once('close', () => reject(new Error('A progressing snapshot viewer was disconnected.')));
+    });
+    await new Promise<void>(resolve => browser!.once('open', resolve));
+    browser.pause();
+    peer = await accepted;
+    resumeTimer = setTimeout(() => browser!.resume(), 75);
+    const subscribed = await service.subscribe(identity.appSessionId, peer);
+    assert.equal(subscribed.ok, true);
+    await recovered;
+    const ends = frames.filter(frame => frame.kind === 'managed_snapshot_end');
+    assert.deepEqual(ends.map(frame => frame.watermark), [10, 12]);
+    for (const end of ends) {
+      const transfer = frames.filter(frame => frame.transferId === end.transferId);
+      assert.ok(JSON.stringify(transfer).length > MANAGED_CHAT_MAX_FRAME_BYTES * 4);
+      const projection = assembleManagedTransfer(transfer);
+      assert.equal(projection.records[0].content, state.messages[0].content);
+      assert.equal(projection.metadata.providerSessionId, 'native-large');
+      assert.equal(projection.metadata.ownerGeneration, identity.ownerGeneration);
+      if (end.watermark === 12) assert.equal(projection.metadata.title, 'Concurrent title 2');
+    }
+    assert.equal(peer.readyState, WebSocket.OPEN);
+  } finally {
+    clearTimeout(watchdog);
+    clearTimeout(resumeTimer);
+    service.close(); browser?.terminate(); peer?.terminate();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
 
 test('real attach projects mapping before send, reuses owner, orders two viewers and detaches without terminating host', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'managed-chat-'));
@@ -38,8 +114,8 @@ test('real attach projects mapping before send, reuses owner, orders two viewers
     db.claimLaunch('app', identity.ownerGeneration, record.claimNonce);
     herdrManagedDb.beginClaim('app', identity.ownerGeneration);
     herdrManagedDb.claim({ protocolVersion: 1, ...identity, providerSessionId: 'native' });
-    const placement = { sessionName: 'chosen', workspaceId: 'w', tabId: 't', paneId: 'p', terminalId: 'term' };
-    db.cas('app', identity.ownerGeneration, 'layout_requested', 'layout_created', 'w', placement);
+    const placement = { sessionName: 'chosen', workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' };
+    db.cas('app', identity.ownerGeneration, 'layout_requested', 'layout_created', 'w1', placement);
     const state = () => herdrManagedDb.getState('app', identity.ownerGeneration);
     const commands: HerdrManagedCommand[] = [];
     const order: string[] = [];

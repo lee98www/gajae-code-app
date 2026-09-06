@@ -74,6 +74,8 @@
     },
     "scrollToBottom": "跳转到最后一个",
     "queue": {
+      "recovered": "已保存的草稿",
+      "reviewBeforeSending": "编辑后手动发送；尚未加入主机队列",
       "sendNext": "添加另一个消息",
       "label": "已加入队列",
       "paused": "队列已暂停",
@@ -210,6 +212,10 @@
     }
   },
   "permissionCard": {
+    "secretUnavailableTitle": "不支持输入机密回答",
+    "secretUnavailableGuidance": "此运行时无法保证机密回答不会保存到历史记录。请勿输入凭据；拒绝此请求并使用单独的认证流程。",
+    "unknownTitle": "决定的处理结果未知",
+    "unknownGuidance": "重新连接以确认结果，或在可用时停止任务。请勿再次提交同一决定。",
     "title": "需要权限",
     "tool": "工具：",
     "viewInput": "查看工具输入",

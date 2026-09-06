@@ -48,7 +48,7 @@ function Probe({ emit, store, calls }: { emit: { current: ((event: ServerEvent) 
     onSessionProcessing: (id, options) => { calls.push(['processing', id, options]); },
     onSessionIdle: (id) => { calls.push(['idle', id]); },
     onWebSocketReconnect: () => { calls.push(['resubscribe']); },
-    onManagedActionResult: (actionId) => { calls.push(['managedAction', actionId]); },
+    onManagedActionResult: (actionId, accepted) => { calls.push(['managedAction', actionId, accepted]); },
     pendingPermissionRequests: [],
     setPendingPermissionRequests: (requests) => { calls.push(['permissions', requests]); },
     streamTimerRef,
@@ -104,7 +104,9 @@ test('managed receipts resolve action IDs without declaring a waiting turn compl
     result: { ok: true, receipt: { state: 'admitted' } } });
   send({ kind: 'managed_command_result', sessionId: 'visible', actionId: 'uncertain',
     result: { ok: false, receipt: { state: 'unknown' }, error: 'Outcome unknown' } });
-  assert.deepEqual(calls.filter(call => call[0] === 'managedAction'), [['managedAction', 'accepted']]);
+  send({ kind: 'managed_command_result', sessionId: 'visible', actionId: 'malformed',
+    result: { ok: true, receipt: {} } });
+  assert.deepEqual(calls.filter(call => call[0] === 'managedAction'), [['managedAction', 'accepted', true]]);
   assert.equal(calls.some(call => call[0] === 'idle'), false);
   assert.equal(calls.some(call => call[0] === 'permissions'), false);
 });
@@ -115,13 +117,25 @@ function projection(sessionId = 'visible', generation = 'g1', watermark = 1): Ma
       provider: 'gjc', timestamp: '', kind: 'tool_result', toolId: 'tool', isFinal: false,
       toolResult: { content: 'partial', isError: false, toolUseResult: { diff: 'rich' } } }],
     pendingPermissions: [{ requestId: 'r', sessionId, generation, providerSessionId: 'p', turnId: 't',
-      policyRevision: 7, createdAt: '', toolName: 'ExitPlanMode', input: {}, context: {}, requestKind: 'permission' }],
+      policyRevision: 7, createdAt: '', status: 'pending', toolName: 'ExitPlanMode', input: {}, context: {}, requestKind: 'permission' }],
     metadata: { kind: 'managed_ui_status', sessionId, ownerGeneration: generation, providerSessionId: 'p', watermark,
       lifecycle: 'waiting_attachment', activeTurnId: 't', title: null, isProcessing: true, terminal: false,
       usage: { tokens: watermark }, configuration: { model: sessionId }, status: null, turns: {},
       queue: { paused: false, count: 0, actionIds: [] }, automation: [] },
   };
 }
+
+test('execution mode is explicitly hydrated and bound to the visible conversation', () => {
+  const { calls, send } = mount();
+  send({ kind: 'chat_subscribed', sessionId: 'other', isProcessing: false } as ServerEvent);
+  assert.equal(calls.some(call => call[0] === 'config'), false);
+  send({ kind: 'chat_subscribed', sessionId: 'visible', isProcessing: false } as ServerEvent);
+  assert.deepEqual(calls.find(call => call[0] === 'config')?.[1], { sessionId: 'visible', managed: false });
+  pageTransfer(projection()).forEach(frame => send(frame));
+  const configured = calls.filter(call => call[0] === 'config').at(-1)?.[1] as Record<string, unknown>;
+  assert.equal(configured.sessionId, 'visible');
+  assert.equal(configured.managed, true);
+});
 
 test('managed transfers replace atomically, isolate usage, retain rich results and recover sequence gaps', () => {
   const { calls, send } = mount();

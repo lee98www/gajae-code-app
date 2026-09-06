@@ -11,6 +11,37 @@ import PermissionRequestsBanner from './PermissionRequestsBanner';
 
 afterEach(cleanup);
 
+for (const toolName of ['bash', 'AskUserQuestion']) {
+  test(`unknown ${toolName} decision is read-only and explains recovery`, () => {
+    const decisions: unknown[] = [];
+    render(createElement(PermissionRequestsBanner, {
+      pendingPermissionRequests: [{
+        requestId: 'uncertain-decision', toolName, status: 'unknown',
+        input: { questions: [{ question: 'Choose', options: [{ label: 'yes' }] }] },
+      }],
+      handlePermissionDecision: (...values) => { decisions.push(values); },
+    }));
+    assert.match(screen.getByRole('status').textContent ?? '', /Decision outcome unknown/);
+    assert.match(screen.getByRole('status').textContent ?? '', /Do not submit this decision again/);
+    assert.deepEqual(screen.queryAllByRole('button'), []);
+    assert.deepEqual(screen.queryAllByRole('textbox'), []);
+    assert.deepEqual(decisions, []);
+  });
+}
+
+test('permission to call ask is not presented as the question itself', () => {
+  const decisions: unknown[] = [];
+  render(createElement(PermissionRequestsBanner, {
+    pendingPermissionRequests: [{ requestId: 'ask-permission', toolName: 'ask',
+      input: { questions: [{ question: 'Not executing yet', options: [{ label: 'yes' }] }] },
+      context: { source: 'sdk-permission', options: ['allow_once', 'reject_once'] } }],
+    handlePermissionDecision: (id, decision) => { decisions.push({ id, decision }); },
+  }));
+  assert.equal(screen.queryByRole('radiogroup'), null);
+  fireEvent.click(screen.getByRole('button', { name: 'Deny' }));
+  assert.deepEqual(decisions, [{ id: 'ask-permission', decision: { allow: false } }]);
+});
+
 function mount() {
   const decisions: Array<[string | string[], PermissionDecision]> = [];
   render(createElement(PermissionRequestsBanner, {
@@ -43,6 +74,7 @@ test('Deny refuses the call', () => {
   assert.equal(decisions.length, 1);
   assert.equal(decisions[0][1].allow, false);
   assert.equal(decisions[0][1].always, undefined);
+  assert.deepEqual(decisions[0][1], { allow: false });
 });
 
 function mountWithOptions(contextOptions: string[] | null) {
@@ -66,7 +98,7 @@ test('Always deny appears only when the runtime offered reject_always, and refus
   // Offered: the button answers { allow: false, always: true }.
   const decisions = mountWithOptions(['allow_once', 'allow_always', 'reject_once', 'reject_always']);
   fireEvent.click(screen.getByRole('button', { name: 'Always deny bash' }));
-  assert.deepEqual(decisions, [['sdk-permission:2', { allow: false, always: true, message: 'User denied tool use (always)' }]]);
+  assert.deepEqual(decisions, [['sdk-permission:2', { allow: false, always: true }]]);
 
   // Not offered: no button, the plain Deny carries no always flag.
   const plain = mountWithOptions(['allow_once', 'allow_always', 'reject_once']);

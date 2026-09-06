@@ -74,6 +74,8 @@
     },
     "scrollToBottom": "最新へ移動。",
     "queue": {
+      "recovered": "保存された下書き",
+      "reviewBeforeSending": "編集して手動で送信してください。ホストのキューには登録されていません",
       "sendNext": "次のメッセージをキューに追加。",
       "label": "待機中。",
       "paused": "キューは一時停止中",
@@ -210,6 +212,10 @@
     }
   },
   "permissionCard": {
+    "secretUnavailableTitle": "秘密の回答の入力には対応していません",
+    "secretUnavailableGuidance": "このランタイムでは、秘密の回答が履歴に残らないことを保証できません。認証情報を入力せず、この要求を拒否して別の認証手順を利用してください。",
+    "unknownTitle": "判断の処理結果が不明です",
+    "unknownGuidance": "再接続して結果を確認するか、可能であればタスクを停止してください。同じ判断を再送信しないでください。",
     "title": "権限が必要です",
     "tool": "ツール:",
     "viewInput": "ツール入力を表示",

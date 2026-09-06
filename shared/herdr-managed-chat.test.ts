@@ -41,6 +41,8 @@ test('request resolution projects current pending state instead of stale journal
   state.watermark = 1;
   state.requests.req = { requestId: 'req', generation: 'gen', appSessionId: 'app', providerSessionId: 'native', turnId: 'turn', kind: 'ask', policyRevision: 1, scope: {}, schema: { questions: ['which?'] }, createdAt: '2026-01-01T00:00:00Z' };
   assert.equal(projectManagedState(state).pendingPermissions.length, 1);
+  state.requests.req.scope = { status: 'unknown' };
+  assert.equal(projectManagedState(state).pendingPermissions[0].status, 'unknown');
   const event: HerdrManagedEvent = { protocolVersion: 1, appSessionId: 'app', ownerGeneration: 'gen', seq: 2, kind: 'managed.request-resolved', payload: { requestId: 'req' }, createdAt: '2026-01-01T00:00:01Z' };
   const live = projectManagedEvent(event, applyHerdrManagedEvent(state, event));
   assert.equal(live.id, 'gen:2'); assert.deepEqual(live.projection.pendingPermissions, []);

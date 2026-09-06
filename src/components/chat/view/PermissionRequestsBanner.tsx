@@ -59,8 +59,18 @@ export default function PermissionRequestsBanner({
   return (
     <div className="mb-3 space-y-2">
       {filteredRequests.map((request) => {
+        if (request.status === 'unknown') {
+          return (
+            <div key={request.requestId} role="status" className="rounded-lg border border-border bg-muted/50 p-3">
+              <p className="font-medium text-foreground">{t('permissionCard.unknownTitle')}</p>
+              <p className="mt-1 text-sm text-muted-foreground">{t('permissionCard.unknownGuidance')}</p>
+            </div>
+          );
+        }
         const CustomPanel = getPermissionPanel(request.toolName);
-        if (CustomPanel) {
+        const permissionOnly = request.context !== null && typeof request.context === 'object'
+          && (request.context as { source?: unknown }).source === 'sdk-permission';
+        if (CustomPanel && !permissionOnly) {
           return (
             <CustomPanel
               key={request.requestId}
@@ -109,7 +119,7 @@ export default function PermissionRequestsBanner({
             <ConfirmationActions className="flex-wrap">
               <ConfirmationAction
                 variant="outline"
-                onClick={() => handlePermissionDecision(request.requestId, { allow: false, message: 'User denied tool use' })}
+                onClick={() => handlePermissionDecision(request.requestId, { allow: false })}
               >
                 {t('permissionCard.deny')}
               </ConfirmationAction>
@@ -118,7 +128,7 @@ export default function PermissionRequestsBanner({
                   variant="outline"
                   data-action="always-deny"
                   title={t('permissionCard.alwaysDenyHint')}
-                  onClick={() => handlePermissionDecision(request.requestId, { allow: false, always: true, message: 'User denied tool use (always)' })}
+                  onClick={() => handlePermissionDecision(request.requestId, { allow: false, always: true })}
                 >
                   {t('permissionCard.alwaysDeny', { tool: request.toolName })}
                 </ConfirmationAction>

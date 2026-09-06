@@ -145,6 +145,14 @@ export class GjcHerdrAutomationBroker {
     const cap = this.capabilities.get(p.sourceOperationId);
     if (!cap || p.operation.phase !== 'awaiting_reattach_approval' || p.operation.approvalRequestId !== c.approvalRequestId || cap.capabilityGeneration !== c.capabilityGeneration || cap.targetContext !== c.identity.targetContext || cap.policyRevision !== c.identity.policyRevision) return false;
     const operation = p.operation;
+    if (c.type === 'resume-denied') {
+      // Consume the exact request before publishing a fresh one. A competing
+      // approval carrying the old request ID therefore cannot dispatch, while
+      // the original SDK callback remains pending for a later explicit reply.
+      operation.approvalRequestId = randomUUID();
+      await this.publish(p);
+      return true;
+    }
     const attempt: HerdrManagedBridgeAttempt = { identity: structuredClone(operation.identity), originalCapabilityGeneration: cap.capabilityGeneration, requestId: randomUUID(), bridgeInstanceId: cap.bridgeInstanceId, sourceOperationId: p.sourceOperationId, targetBinding: structuredClone(cap.targetBinding) };
     p.record.attempt = attempt;
     operation.argumentsRef = randomUUID();

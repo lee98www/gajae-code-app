@@ -25,6 +25,14 @@ test('a lone queued message says it goes out when the turn finishes', () => {
   assert.doesNotMatch(html, /input\.queue\.willFollow/);
 });
 
+test('recovered drafts offer editing without promising automatic host dispatch', () => {
+  const html = render({ manualSend: true });
+  assert.match(html, /input\.queue\.recovered/);
+  assert.match(html, /input\.queue\.reviewBeforeSending/);
+  assert.doesNotMatch(html, /input\.queue\.willSend|input\.queue\.willFollow/);
+  assert.match(html, /aria-label="input\.queue\.edit"/);
+});
+
 test('a single message shows no reorder controls, because there is nothing to reorder', () => {
   const html = render();
 

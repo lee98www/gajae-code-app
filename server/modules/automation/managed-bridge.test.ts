@@ -9,6 +9,7 @@ import { canonicalManagedInvocation, hashManagedInvocation, type HerdrManagedBri
 
 import { AutomationService } from './automation.service.js';
 import { AutomationGrantStore } from './automation-grants.js';
+import { CuaTransportError } from './cua-client.js';
 import { ManagedBridgeLedger } from './managed-bridge-ledger.js';
 
 function rpc(service: AutomationService, body: Record<string, unknown>): Promise<any> {
@@ -122,7 +123,7 @@ test('managed Unix bridge resolves actual targets and durably arbitrates exact a
     const failed = attempt(await resolve());
     failure = true;
     const failedResult = await rpc(service, { type: 'managed-dispatch', attempt: failed, invocation });
-    assert.deepEqual(failedResult.response, { ok: false, error: 'executor failed' });
+    assert.equal(failedResult.status, 'unknown');
     await service.shutdown();
     service = await create();
     assert.deepEqual(await rpc(service, { type: 'managed-lookup', attempt: failed }), failedResult);
@@ -194,6 +195,88 @@ test('managed Unix bridge resolves actual targets and durably arbitrates exact a
     await assert.rejects(resolve({ surface: 'computer', sessionId: 's', tool: 'move_cursor', arguments: {} }), /unresolved/);
   } finally {
     await service!.shutdown();
+    if (oldSocket === undefined) delete process.env.GAJAE_AUTOMATION_SOCKET;
+    else process.env.GAJAE_AUTOMATION_SOCKET = oldSocket;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('managed dispatch preserves unknown driver outcomes and commits verified rejection once', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'managed-bridge-outcome-')));
+  const oldSocket = process.env.GAJAE_AUTOMATION_SOCKET;
+  process.env.GAJAE_AUTOMATION_SOCKET = join(root, 'bridge.sock');
+  const service = new AutomationService(root);
+  let mode: 'lost' | 'rejected' = 'lost';
+  let effects = 0;
+  Object.defineProperty(service, 'supported', { value: true });
+  Object.defineProperty(service, 'grants', { value: new AutomationGrantStore({ get: () => null, set: () => {} }) });
+  service.browser.shutdown = async () => {};
+  service.cua.shutdown = async () => {};
+  service.cua.call = async (tool) => {
+    if (tool === 'list_apps') return { apps: [{ pid: 42, bundle_id: 'real.app', name: 'Actual App' }] };
+    if (tool === 'start_session') return { ok: true };
+    if (tool === 'click') {
+      if (mode === 'lost') {
+        effects += 1;
+        throw new CuaTransportError('CUA Driver request timed out.', 'possibly_dispatched');
+      }
+      if (mode === 'rejected') return { isError: true, content: [{ type: 'text', text: 'session_suspended' }] };
+      effects += 1;
+      return { clicked: true };
+    }
+    return {};
+  };
+  const invocation = { surface: 'computer', sessionId: 's', tool: 'click', arguments: { pid: 42 } };
+  let sequence = 0;
+  const resolve = async () => {
+    const sourceOperationId = `source-${++sequence}`;
+    const identity = {
+      generation: 'g', provider: 'p', turn: 't', toolCallId: 'tool', index: 0,
+      operationId: sourceOperationId, argumentsHash: await hashManagedInvocation(invocation),
+      policyRevision: 1, targetContext: 'unresolved',
+    };
+    return rpc(service, {
+      type: 'managed-resolve-target',
+      requestId: `resolve-${sequence}`,
+      identity,
+      sourceOperationId,
+      bridgeInstanceId: service.managedBridgeCapability()!.bridgeInstanceId,
+      invocation,
+    }) as Promise<HerdrManagedBridgeResolveResponse>;
+  };
+  const attempt = (target: HerdrManagedBridgeResolveResponse): HerdrManagedBridgeAttempt => ({
+    identity: {
+      ...target.identity,
+      operationId: `bound-${sequence}`,
+      targetContext: canonicalManagedInvocation(target.targetBinding),
+    },
+    originalCapabilityGeneration: 'cap',
+    requestId: `dispatch-${sequence}`,
+    bridgeInstanceId: target.bridgeInstanceId,
+    sourceOperationId: target.sourceOperationId,
+    targetBinding: target.targetBinding,
+  });
+  const dispatch = (value: HerdrManagedBridgeAttempt) => rpc(service, {
+    type: 'managed-dispatch', attempt: value, invocation,
+  });
+  try {
+    await service.startBridge();
+    const lost = attempt(await resolve());
+    assert.equal((await dispatch(lost)).status, 'unknown');
+    assert.equal((await rpc(service, { type: 'managed-lookup', attempt: lost })).status, 'unknown');
+    assert.equal((await rpc(service, { type: 'managed-fence', attempt: lost })).status, 'unknown');
+    assert.equal((await dispatch(lost)).status, 'unknown');
+    assert.equal(effects, 1, 'reserved unknown operation is never replayed');
+
+    mode = 'rejected';
+    const rejected = attempt(await resolve());
+    const completed = await dispatch(rejected);
+    assert.equal(completed.status, 'completed');
+    assert.deepEqual(completed.response, { ok: false, error: 'session_suspended' });
+    assert.deepEqual(await dispatch(rejected), completed);
+    assert.equal(effects, 1, 'verified structured rejection has no side effect');
+  } finally {
+    await service.shutdown();
     if (oldSocket === undefined) delete process.env.GAJAE_AUTOMATION_SOCKET;
     else process.env.GAJAE_AUTOMATION_SOCKET = oldSocket;
     await rm(root, { recursive: true, force: true });

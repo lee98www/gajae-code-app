@@ -58,6 +58,14 @@ test('every runtime builtin has exactly one recorded policy decision', () => {
   }
 });
 
+test('App ask notifications never alter the user terminal notification setting', async () => {
+  const userSettings = Settings.isolated({ 'ask.notify': 'on' });
+  const sessionSettings = await userSettings.cloneForCwd('/project');
+  applyGjcToolSettingsPolicy(sessionSettings);
+  assert.equal(sessionSettings.get('ask.notify'), 'off');
+  assert.equal(userSettings.get('ask.notify'), 'on');
+});
+
 test('the SDK settings policy suppresses implicit tool additions', () => {
   const settings = Settings.isolated({
     'goal.enabled': true,

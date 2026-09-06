@@ -13,6 +13,8 @@ import { HerdrManagedAttachClient, HerdrManagedChatService } from '../../modules
 import { handleChatConnection } from '../../modules/websocket/services/chat-websocket.service.js';
 import type { HerdrTaskHostBootstrap } from '../../gjc-herdr-task-host.js';
 
+import { FAKE_HERDR_PLACEMENT as placement } from './herdr-fake-endpoint.js';
+
 const root = process.argv[2]!;
 const appSessionId = 'lifetime-session';
 process.env.DATABASE_PATH = path.join(root, 'app.sqlite');
@@ -21,7 +23,9 @@ const bootstrapFile = path.join(root, 'bootstrap.json');
 if (!db.get(appSessionId)) {
   sessionsDb.createAppSession(appSessionId, 'gjc', root);
   db.registerNewSession(appSessionId, root);
-  const record = db.reserve(appSessionId, { name: 'test-owned', canonicalPath: path.join(root, 'unused-herdr.sock'), dev: 1, inode: 1 }, root);
+  // The harness owns the fake Herdr endpoint for the whole test; the App only records its identity.
+  const endpoint = JSON.parse(await readFile(path.join(root, 'herdr-endpoint.json'), 'utf8')) as { name: string; canonicalPath: string; dev: number; inode: number };
+  const record = db.reserve(appSessionId, endpoint, root);
   db.cas(appSessionId, record.ownerGeneration, 'reserved', 'layout_requested');
   const bootstrap: HerdrTaskHostBootstrap = {
     appSessionId, ownerGeneration: record.ownerGeneration, claimNonce: record.claimNonce,
@@ -33,7 +37,7 @@ if (!db.get(appSessionId)) {
   await mkdir(bootstrap.agentDir!, { recursive: true });
   await writeFile(bootstrapFile, JSON.stringify(bootstrap), { mode: 0o600 });
   // Test-owned placement receipt only; no Herdr RPC or fake SDK owner.
-  db.cas(appSessionId, record.ownerGeneration, 'layout_requested', 'layout_created', 'workspace', { sessionName: 'test-owned', workspaceId: 'workspace', tabId: 'tab', paneId: 'pane', terminalId: 'terminal' });
+  db.cas(appSessionId, record.ownerGeneration, 'layout_requested', 'layout_created', placement.workspaceId, { sessionName: 'test-owned', workspaceId: placement.workspaceId, tabId: placement.tabId, paneId: placement.paneId, terminalId: placement.terminalId });
 }
 const bootstrap: HerdrTaskHostBootstrap = JSON.parse(await readFile(bootstrapFile, 'utf8'));
 const clients = new Set<HerdrManagedAttachClient>();

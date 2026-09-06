@@ -96,8 +96,12 @@ function ChatInterface({
     onNavigateToSession?.(id);
   }, [onNavigateToSession, onSessionEstablished, setCurrentSessionId]);
 
+  const displayedSessionId = selectedSession?.id || session.currentSessionId;
+  const managedSession = !displayedSessionId ? true
+    : session.sessionState?.sessionId === displayedSessionId && typeof session.sessionState.managed === 'boolean'
+      ? session.sessionState.managed : undefined;
   const composer = useChatComposerState({
-    managedSession: session.sessionState?.managed === true,
+    managedSession,
     selectedProject,
     selectedSession,
     currentSessionId: session.currentSessionId,
@@ -248,6 +252,7 @@ function ChatInterface({
     <>
     <ManagedHerdrSelection state={composer.managedSelection} />
     <ComposerSurface
+      isResolvingSession={managedSession === undefined}
       pendingPermissionRequests={pendingPermissionRequests}
       handlePermissionDecision={composer.handlePermissionDecision}
       isLoading={session.isProcessing}

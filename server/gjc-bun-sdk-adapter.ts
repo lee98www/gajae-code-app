@@ -14,7 +14,7 @@ import { initTheme, theme } from '@gajae-code/coding-agent/modes/theme/theme';
 import { generateSessionTitle } from '@gajae-code/coding-agent/utils/title-generator';
 import { getSupportedEfforts } from '@gajae-code/ai/model-thinking';
 
-import type { HerdrManagedChildAutomationControl, ManagedChildTurnOptions } from '../shared/herdr-managed-child-protocol.js';
+import type { HerdrManagedChildAutomationControl, ManagedChildIdentity, ManagedChildTurnOptions } from '../shared/herdr-managed-child-protocol.js';
 
 import { GjcHerdrAutomationBroker } from './gjc-herdr-automation-broker.js';
 import { appendImagesInputTag } from './shared/image-attachments.js';
@@ -115,6 +115,12 @@ const MODEL_ID_EFFORT = /-(off|minimal|low|medium|high|xhigh|max)(?:-fast)?$/;
  * long done; a hung title request must not hold the turn's terminal frame.
  */
 const SESSION_TITLE_GRACE_MS = 10_000;
+/**
+ * Managed children keep the first prompt's identity alive for one title event
+ * after that prompt settles. This is an in-process marker only: the child
+ * consumes it before serializing the event, so the private protocol stays v1.
+ */
+const MANAGED_TITLE_SCOPE = Symbol.for('gajae.managed.session-title-scope');
 /** The runtime's own opt-out, honoured so one environment silences both the TUI and the app. */
 function sessionTitlesDisabled(): boolean {
   return Boolean(process.env.GJC_NO_TITLE || process.env.PI_NO_TITLE);
@@ -131,6 +137,10 @@ const RUNTIME_CREDENTIAL_ENV_VARS = new Set([
 ]);
 
 export function applyGjcToolSettingsPolicy(settings: Settings): void {
+  // The App renders and notifies asks. The SDK's terminal notification writes
+  // BEL directly to stdout, which belongs exclusively to the private protocol.
+  settings.override('ask.notify', 'off');
+
   // Goal mode writes artifacts the app cannot display, then injects hidden
   // continuation turns until completion. The app projects no goal state, so
   // users have no badge, pause, or cancel control for that self-restarting loop.
@@ -158,6 +168,60 @@ function isAppOAuthCommand(message: string): boolean {
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+type AskQuestion = { question: string; options: Array<Record<string, unknown>>; multi?: unknown; multiSelect?: unknown };
+
+function hasSecretTag(value: unknown, seen = new Set<object>()): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some(child => hasSecretTag(child, seen));
+  const record = value as Record<string, unknown>;
+  if (record.secret === true || record.sensitive === true || record.format === 'password' || record.type === 'password') return true;
+  return Object.values(record).some(child => hasSecretTag(child, seen));
+}
+
+/**
+ * The managed callback is one `ExtensionUIContext.select/editor` invocation.
+ * AskTool 0.15.6 owns question sequencing and multi-select toggling, so a
+ * managed request must contain exactly the one question represented by this
+ * callback and must never advertise a batch/multi answer shape.
+ */
+function askQuestion(value: unknown): AskQuestion | null {
+  if (!object(value) || !Array.isArray(value.questions) || value.questions.length !== 1) return null;
+  const question = value.questions[0];
+  if (!object(question)
+    || typeof question.question !== 'string'
+    || !Array.isArray(question.options)
+    || (question.multi !== undefined && typeof question.multi !== 'boolean')
+    || (question.multiSelect !== undefined && typeof question.multiSelect !== 'boolean')
+    || (question.multi !== undefined && question.multiSelect !== undefined && question.multi !== question.multiSelect)
+    || question.multi === true
+    || question.multiSelect === true
+    || question.options.some(option => !object(option) || typeof option.label !== 'string')) return null;
+  return question as AskQuestion;
+}
+
+function validateAskDecision(input: unknown, decision: Record<string, unknown>, secretOverride = false): boolean {
+  const question = askQuestion(input);
+  // The installed SDK persists AskTool's answer-bearing result in native
+  // history. Without a supported no-echo/no-history hook, a tagged ask is
+  // fail-closed: only cancellation/skip (handled by the caller) is allowed.
+  if (!question || secretOverride || hasSecretTag(input)) return false;
+  if (decision.updatedInput !== undefined) {
+    if (decision.message !== undefined || !object(decision.updatedInput)
+      || Object.keys(decision.updatedInput).some(key => key !== 'answers')) return false;
+    const answers = decision.updatedInput.answers;
+    if (!object(answers) || Object.keys(answers).length !== 1 || !Object.hasOwn(answers, question.question)) return false;
+    const answer = answers[question.question];
+    if (typeof answer !== 'string' || !answer.trim()) return false;
+    const labels = question.options.map(option => option.label as string);
+    return labels.length === 0 || labels.includes(answer.trim());
+  }
+  if (typeof decision.message !== 'string' || decision.message.trim().length === 0) return false;
+  const labels = question.options.map(option => option.label as string);
+  return labels.length === 0 || labels.includes(decision.message.trim());
 }
 
 function exactCredentialRef(value: unknown): value is ExactCredentialRef {
@@ -438,7 +502,7 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
   async initializeManagedGjcSession(runId: string, options: Record<string, unknown>, writer: GjcWorkerWriter, managed?: { generation: string; flush(): Promise<void> }): Promise<{
     automationControl(control: HerdrManagedChildAutomationControl): Promise<boolean>;
     operationStatus(id: string): 'in_flight' | 'completed' | 'not_found';
-    setAutomationTurn(turn: string): void;
+    setAutomationTurn(turn: string, identity?: ManagedChildIdentity): void;
     providerSessionId: string;
     prompt(message: string, turnOptions?: ManagedChildTurnOptions): Promise<void>;
     steer(message: string): Promise<boolean>;
@@ -458,6 +522,7 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
     let resetAsk: (() => void) | undefined;
     let configureTurn: (options: ManagedChildTurnOptions) => Promise<void> = async () => { throw new Error(FAILURE); };
     let executeTurn: (message: string) => Promise<void> = async () => { throw new Error(FAILURE); };
+    let managedTitleIdentity: ManagedChildIdentity | undefined;
     const pendingAsks = new Map<string, Record<string, unknown>>();
     const downstream = writer;
     writer = {
@@ -692,11 +757,19 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
         if (!titleStarted) {
           titleStarted = true;
           if (!sessionManager.getSessionName() && !sessionTitlesDisabled()) {
+            const titleIdentity = managedTitleIdentity && { ...managedTitleIdentity };
             titleTask = Promise.resolve()
               .then(() => (this.options.generateSessionTitle ?? runtimeSessionTitle)(message, this.modelRegistry, settings, result.session.model ?? model))
               .then(async title => {
                 if (!title || !(await sessionManager.setSessionName(title, 'auto'))) return;
-                writer.send({ kind: 'session_title', title: sessionManager.getSessionName(), source: 'auto', sessionId: sessionManager.getSessionId() });
+                const event: Record<string, unknown> = {
+                  kind: 'session_title',
+                  title: sessionManager.getSessionName(),
+                  source: 'auto',
+                  sessionId: sessionManager.getSessionId(),
+                };
+                if (titleIdentity) Object.defineProperty(event, MANAGED_TITLE_SCOPE, { value: titleIdentity });
+                writer.send(event);
               }).catch(() => {});
           }
         }
@@ -740,26 +813,20 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
           && Array.isArray(options) && options.includes(once);
       }
       if (decision.always !== undefined) return false;
-      if (!decision.allow) return decision.message === undefined && decision.updatedInput === undefined;
-      let answer = typeof decision.message === 'string' ? decision.message.trim() : undefined;
-      if (decision.updatedInput !== undefined) {
-        if (answer !== undefined || !object(decision.updatedInput)
-          || Object.keys(decision.updatedInput).some((key) => key !== 'answers')
-          || !object(decision.updatedInput.answers)) return false;
-        const answers = Object.values(decision.updatedInput.answers);
-        if (answers.length !== 1 || typeof answers[0] !== 'string') return false;
-        answer = answers[0].trim();
-      }
-      if (!answer || !object(ask.input) || !Array.isArray(ask.input.questions) || ask.input.questions.length !== 1) return false;
-      const question = ask.input.questions[0];
-      if (!object(question) || !Array.isArray(question.options)) return false;
-      return question.options.length === 0
-        || question.options.some((option) => object(option) && option.label === answer);
+      if (!decision.allow) return decision.updatedInput === undefined;
+      return validateAskDecision(
+        ask.input,
+        decision,
+        object(ask.context) && ask.context.inputMode === 'non-echo',
+      );
     };
     return {
       automationControl: (control) => broker!.control(control),
       operationStatus: (id) => broker!.status(id),
-      setAutomationTurn: (turn) => broker!.setTurn(turn),
+      setAutomationTurn: (turn, identity) => {
+        broker!.setTurn(turn);
+        managedTitleIdentity = identity;
+      },
       providerSessionId: retained.sessionManager.getSessionId(),
       prompt: async (nextMessage, turnOptions = {}) => {
         if (disposed || prompting || isAppOAuthCommand(nextMessage)) throw new Error(FAILURE);

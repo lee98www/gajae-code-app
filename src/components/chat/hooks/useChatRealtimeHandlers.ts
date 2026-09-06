@@ -11,8 +11,8 @@ import type { SessionStore, NormalizedMessage } from '../../../stores/useSession
 import { assembleManagedTransfer, acceptManagedSequence, MANAGED_CHAT_MAX_FRAME_BYTES } from '../../../../shared/herdr-managed-chat';
 import type { ManagedChatCursor, ManagedChatProjection, ManagedSnapshotFrame, ManagedUIStatus, ManagedLiveEvent } from '../../../../shared/herdr-managed-chat';
 
-const requiresDecision = (request: { toolName?: unknown } | null | undefined) => request?.toolName !== 'ExitPlanMode' && request?.toolName !== 'exit_plan_mode';
-const hasDecision = (requests: Array<{ toolName?: unknown }> | null | undefined) => Array.isArray(requests) && requests.some(requiresDecision);
+const requiresDecision = (request: { toolName?: unknown; status?: unknown } | null | undefined) => Boolean(request) && request?.status !== 'unknown' && request?.toolName !== 'ExitPlanMode' && request?.toolName !== 'exit_plan_mode';
+const hasDecision = (requests: Array<{ toolName?: unknown; status?: unknown }> | null | undefined) => Array.isArray(requests) && requests.some(requiresDecision);
 
 interface UseChatRealtimeHandlersArgs {
   subscribe: (listener: (event: ServerEvent) => void) => () => void;
@@ -31,7 +31,7 @@ interface UseChatRealtimeHandlersArgs {
   onSessionIdle?: MarkSessionIdle;
   onWebSocketReconnect?: () => void;
   onSteerResult?: (content: string, steered: boolean) => void;
-  onManagedActionResult?: (actionId: string) => void;
+  onManagedActionResult?: (actionId: string, accepted: boolean) => void;
   sessionStore: SessionStore;
 }
 
@@ -96,7 +96,7 @@ export function useChatRealtimeHandlers({
         ? (status.status as { text: string }).text : status.lifecycle, canInterrupt: Boolean(status.activeTurnId) && status.lifecycle !== 'unknown' });
       if (id !== displayedSession.current) return;
       setTokenBudget(status.usage as Record<string, unknown> | null);
-      setSessionState?.(() => ({ ...((status.configuration ?? {}) as Record<string, unknown>), managed: true, managedLifecycle: status.lifecycle, managedQueue: status.queue }));
+      setSessionState?.(() => ({ ...((status.configuration ?? {}) as Record<string, unknown>), sessionId: status.sessionId, managed: true, managedLifecycle: status.lifecycle, managedQueue: status.queue }));
     };
     const applyProjection = (projection: ManagedChatProjection) => {
       const m = projection.metadata;
@@ -118,8 +118,8 @@ export function useChatRealtimeHandlers({
       if (!id) return;
       if (event.kind === 'managed_command_result') {
         const result = event.result as { receipt?: { state?: string }; error?: string; ok?: boolean } | undefined;
-        if (typeof event.actionId === 'string' && result?.receipt && result.receipt.state !== 'unknown') {
-          onManagedActionResult?.(event.actionId);
+        if (typeof event.actionId === 'string' && result?.receipt && ['admitted', 'executing', 'settled', 'rejected'].includes(result.receipt.state ?? '')) {
+          onManagedActionResult?.(event.actionId, result.receipt.state !== 'rejected');
         }
         if (result?.ok === false && typeof result.error === 'string') {
           onSessionProcessing?.(id, { statusText: result.error, canInterrupt: false });
@@ -130,7 +130,7 @@ export function useChatRealtimeHandlers({
         const status = event as unknown as ManagedUIStatus;
         if (typeof status.ownerGeneration !== 'string') {
           onSessionProcessing?.(id, { statusText: typeof event.context === 'string' ? event.context : String(event.status ?? 'Managed host unavailable'), canInterrupt: false });
-          if (id === displayedSession.current) setSessionState?.(previous => ({ ...previous, managed: true }));
+          if (id === displayedSession.current) setSessionState?.(previous => ({ ...previous, sessionId: id, managed: true }));
           return;
         }
         const cursor = managedCursors.current.get(id);
@@ -189,6 +189,7 @@ export function useChatRealtimeHandlers({
       }
       if (event.kind === 'chat_subscribed') {
         if (!sessionId) return;
+        if (sessionId === visible) setSessionState?.(previous => ({ ...previous, sessionId, managed: false }));
         if (event.isProcessing) {
           onSessionProcessing?.(sessionId);
         } else {
@@ -299,7 +300,7 @@ export function useChatRealtimeHandlers({
         if (event.text === 'token_budget' && event.tokenBudget && sessionId === visible) {
           setTokenBudget(event.tokenBudget as Record<string, unknown>);
         } else if (event.text === 'session_state' && event.sessionState && sessionId === visible) {
-          setSessionState?.((previous) => ({ ...(previous ?? {}), ...(event.sessionState as Record<string, unknown>) }));
+          setSessionState?.((previous) => ({ ...(previous ?? {}), ...(event.sessionState as Record<string, unknown>), sessionId }));
         } else if (typeof event.text === 'string' && sessionId) {
           onSessionProcessing?.(sessionId, { statusText: event.text || null, canInterrupt: event.canInterrupt !== false });
         }

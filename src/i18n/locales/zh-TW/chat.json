@@ -74,6 +74,8 @@
     },
     "scrollToBottom": "跳轉至最新",
     "queue": {
+      "recovered": "已儲存的草稿",
+      "reviewBeforeSending": "編輯後手動傳送；尚未加入主機佇列",
       "sendNext": "佇列另一則訊息",
       "label": "已佇列",
       "paused": "佇列已暫停",
@@ -210,6 +212,10 @@
     }
   },
   "permissionCard": {
+    "secretUnavailableTitle": "不支援輸入機密回答",
+    "secretUnavailableGuidance": "此執行環境無法保證機密回答不會儲存到歷史記錄。請勿輸入憑證；拒絕此要求並使用獨立的驗證流程。",
+    "unknownTitle": "決定的處理結果不明",
+    "unknownGuidance": "重新連線以確認結果，或在可用時停止工作。請勿再次提交相同決定。",
     "title": "需要權限",
     "tool": "工具：",
     "viewInput": "檢視工具輸入",

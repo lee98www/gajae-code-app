@@ -12,11 +12,15 @@ import { closeConnection, initializeDatabase, sessionsDb, herdrManagedProvisionD
 import { herdrManagedDb } from '@/modules/database/repositories/herdr-managed.db.js';
 
 import { HERDR_MANAGED_PROTOCOL_VERSION, type HerdrManagedCommand, type HerdrManagedCommandReceipt } from '../shared/herdr-managed-protocol.js';
+import { type HerdrManagedBridgeRequest } from '../shared/herdr-managed-bridge.js';
 import { projectManagedState } from '../shared/herdr-managed-chat.js';
 
 import { commandHash, HerdrTaskHost, initializeManagedChildSession, runHerdrTaskHostStdio, type ManagedSdkSessionFactory } from './gjc-herdr-task-host.js';
+import { GjcHerdrAutomationBroker } from './gjc-herdr-automation-broker.js';
 import { parseConsoleLine, sanitizeConsoleText } from './gjc-herdr-task-console.js';
+import { ManagedBridgeLedger } from './modules/automation/managed-bridge-ledger.js';
 import { HerdrManagedAttachClient } from './modules/herdr/index.js';
+import { HerdrAgentReporter } from './modules/herdr/services/herdr-agent-reporter.js';
 
 async function withManagedDatabase(action: (tmp: string) => void | Promise<void>): Promise<void> {
   const previous = process.env.DATABASE_PATH;
@@ -134,12 +138,15 @@ test('independent host publishes actual native ownership through the real databa
       const provision = herdrManagedProvisionDb.reserve('reported-app', {
         name: 'selected', canonicalPath: socketPath, dev: socketStat.dev, inode: socketStat.ino,
       }, directory);
-      assert.equal(herdrManagedProvisionDb.cas('reported-app', provision.ownerGeneration, 'reserved', 'layout_requested'), true);
+      assert.equal(herdrManagedProvisionDb.cas('reported-app', provision.ownerGeneration, 'reserved', 'workspace_requested', 'w1'), true);
+      assert.equal(herdrManagedProvisionDb.cas('reported-app', provision.ownerGeneration, 'workspace_requested', 'workspace_created', 'w1'), true);
+      assert.equal(herdrManagedProvisionDb.cas('reported-app', provision.ownerGeneration, 'workspace_created', 'layout_requested', 'w1'), true);
       let started = false;
       host = new HerdrTaskHost({
         bootstrap: { appSessionId: 'reported-app', ownerGeneration: provision.ownerGeneration, herdrInstanceId: 'selected',
           projectPath: directory, sessionRoot: directory, databasePath: path.join(tmp, 'app.sqlite'), claimNonce: provision.claimNonce,
           attachSocketPath: path.join(directory, 'attach.sock'), attachSecret: 's'.repeat(32) },
+        launchEnvironment: { HERDR_WORKSPACE_ID: 'w1', HERDR_TAB_ID: 'w1:t1', HERDR_PANE_ID: 'w1:p1' },
         createSession: ({ onEvent }) => ({
           providerSessionId: 'actual-native-id',
           async prompt(_text, actionId) {
@@ -157,11 +164,9 @@ test('independent host publishes actual native ownership through the real databa
         }),
       });
       await host.initialize();
-      assert.equal(host.agentPublication?.status, 'pending');
-      assert.equal(calls.length, 0, 'SDK readiness alone cannot guess a placement');
-      assert.equal(herdrManagedProvisionDb.cas('reported-app', provision.ownerGeneration, 'layout_requested', 'layout_created', 'w1',
-        { sessionName: 'selected', workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'terminal-1' }), true);
-      herdrManagedProvisionDb.projectReady('reported-app', provision.ownerGeneration, 'actual-native-id');
+      assert.ok(['pending', 'published'].includes(host.agentPublication?.status ?? ''));
+      assert.equal(herdrManagedProvisionDb.get('reported-app')?.placement?.paneId, 'w1:p1');
+      assert.equal(herdrManagedProvisionDb.get('reported-app')?.phase, 'ready');
       await host.startPrivateAttachServer();
       await wait(() => calls.some(call => call.params.state === 'idle'));
       viewer = new HerdrManagedAttachClient({ appSessionId: 'reported-app', ownerGeneration: provision.ownerGeneration,
@@ -208,6 +213,106 @@ test('independent host publishes actual native ownership through the real databa
       await promptTask?.catch(() => {});
       for (const socket of peers) socket.destroy();
       await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+});
+
+test('production host rejects inherited identity before constructing the SDK', async () => {
+  await withManagedDatabase(async tmp => {
+    sessionsDb.createAppSession('host-identity', 'gjc', tmp);
+    herdrManagedProvisionDb.registerNewSession('host-identity', tmp);
+    const provision = herdrManagedProvisionDb.reserve('host-identity', {
+      name: 'selected', canonicalPath: path.join(tmp, 'missing.sock'), dev: 1, inode: 1,
+    }, tmp);
+    assert.equal(herdrManagedProvisionDb.cas('host-identity', provision.ownerGeneration, 'reserved', 'workspace_requested', 'w1'), true);
+    assert.equal(herdrManagedProvisionDb.cas('host-identity', provision.ownerGeneration, 'workspace_requested', 'layout_requested', 'w1'), true);
+    let sdkCalls = 0;
+    const host = new HerdrTaskHost({
+      bootstrap: {
+        appSessionId: 'host-identity',
+        ownerGeneration: provision.ownerGeneration,
+        herdrInstanceId: 'selected',
+        projectPath: tmp,
+        sessionRoot: tmp,
+        databasePath: path.join(tmp, 'app.sqlite'),
+        claimNonce: provision.claimNonce,
+      },
+      launchEnvironment: { HERDR_WORKSPACE_ID: 'w2', HERDR_TAB_ID: 'w2:t1', HERDR_PANE_ID: 'w2:p1' },
+      createSession: () => { sdkCalls++; return { providerSessionId: 'must-not-start', async prompt() {} }; },
+    });
+    await assert.rejects(host.initialize(), /workspace intent mismatch/);
+    assert.equal(sdkCalls, 0);
+  });
+});
+
+test('production host rejects an inherited tab or pane that disagrees with the durable receipt', async () => {
+  await withManagedDatabase(async tmp => {
+    for (const [suffix, launchEnvironment] of [
+      ['tab', { HERDR_WORKSPACE_ID: 'w1', HERDR_TAB_ID: 'w1:t2', HERDR_PANE_ID: 'w1:p1' }],
+      ['pane', { HERDR_WORKSPACE_ID: 'w1', HERDR_TAB_ID: 'w1:t1', HERDR_PANE_ID: 'w1:p2' }],
+    ] as const) {
+      const id = `host-identity-${suffix}`;
+      sessionsDb.createAppSession(id, 'gjc', tmp);
+      herdrManagedProvisionDb.registerNewSession(id, tmp);
+      const provision = herdrManagedProvisionDb.reserve(id, { name: 'selected', canonicalPath: path.join(tmp, `${suffix}.sock`), dev: 1, inode: 1 }, tmp);
+      assert.equal(herdrManagedProvisionDb.cas(id, provision.ownerGeneration, 'reserved', 'workspace_requested', 'w1'), true);
+      assert.equal(herdrManagedProvisionDb.cas(id, provision.ownerGeneration, 'workspace_requested', 'layout_requested', 'w1'), true);
+      herdrManagedProvisionDb.recordLayoutReceipt(id, provision.ownerGeneration, {
+        sessionName: 'selected', workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1',
+      });
+      let sdkCalls = 0;
+      const host = new HerdrTaskHost({
+        bootstrap: { appSessionId: id, ownerGeneration: provision.ownerGeneration, herdrInstanceId: 'selected', projectPath: tmp, sessionRoot: tmp, databasePath: path.join(tmp, 'app.sqlite'), claimNonce: provision.claimNonce },
+        launchEnvironment: { ...launchEnvironment },
+        createSession: () => { sdkCalls++; return { providerSessionId: 'must-not-start', async prompt() {} }; },
+      });
+      await assert.rejects(host.initialize(), /placement intent mismatch/);
+      assert.equal(sdkCalls, 0);
+    }
+  });
+});
+
+test('production host fences readiness when the terminal is replaced after SDK initialization', async () => {
+  await withManagedDatabase(async tmp => {
+    const directory = await fs.realpath(tmp);
+    // macOS's per-user tmpdir leaves too little of sun_path for a descriptive socket name.
+    const socketDirectory = await fs.realpath(await fs.mkdtemp(path.join(process.platform === 'darwin' ? '/tmp' : os.tmpdir(), 'hs-')));
+    const socketPath = path.join(socketDirectory, 'herdr.sock');
+    let snapshots = 0;
+    const server = net.createServer(socket => {
+      socket.on('data', chunk => {
+        const request = JSON.parse(String(chunk)) as { id: string; method: string };
+        if (request.method !== 'session.snapshot') return;
+        snapshots++;
+        const terminalId = snapshots === 1 ? 'term-1' : 'term-2';
+        socket.end(JSON.stringify({ id: request.id, result: { type: 'session_snapshot', snapshot: {
+          version: 'fixture-19', protocol: 19, layouts: [], agents: [],
+          workspaces: [{ workspace_id: 'w1', number: 1, label: 'Owned', focused: false, pane_count: 1, tab_count: 1, active_tab_id: 'w1:t1', agent_status: 'idle' }],
+          tabs: [{ workspace_id: 'w1', tab_id: 'w1:t1', number: 1, label: 'Owned', focused: false, pane_count: 1, agent_status: 'idle' }],
+          panes: [{ workspace_id: 'w1', tab_id: 'w1:t1', pane_id: 'w1:p1', terminal_id: terminalId, focused: false, agent: null, agent_status: 'idle', tokens: {} }],
+        } } }) + '\n');
+      });
+    });
+    try {
+      await new Promise<void>(resolve => server.listen(socketPath, resolve));
+      const socketStat = await fs.lstat(socketPath);
+      sessionsDb.createAppSession('terminal-replaced', 'gjc', directory);
+      herdrManagedProvisionDb.registerNewSession('terminal-replaced', directory);
+      const provision = herdrManagedProvisionDb.reserve('terminal-replaced', { name: 'selected', canonicalPath: socketPath, dev: socketStat.dev, inode: socketStat.ino }, directory);
+      assert.equal(herdrManagedProvisionDb.cas('terminal-replaced', provision.ownerGeneration, 'reserved', 'workspace_requested', 'w1'), true);
+      assert.equal(herdrManagedProvisionDb.cas('terminal-replaced', provision.ownerGeneration, 'workspace_requested', 'layout_requested', 'w1'), true);
+      let sdkCalls = 0;
+      const host = new HerdrTaskHost({
+        bootstrap: { appSessionId: 'terminal-replaced', ownerGeneration: provision.ownerGeneration, herdrInstanceId: 'selected', projectPath: directory, sessionRoot: directory, databasePath: path.join(tmp, 'app.sqlite'), claimNonce: provision.claimNonce },
+        launchEnvironment: { HERDR_WORKSPACE_ID: 'w1', HERDR_TAB_ID: 'w1:t1', HERDR_PANE_ID: 'w1:p1' },
+        createSession: () => { sdkCalls++; return { providerSessionId: 'provider-replaced', async prompt() {} }; },
+      });
+      await assert.rejects(host.initialize(), /placement changed/);
+      assert.equal(sdkCalls, 1);
+      assert.notEqual(herdrManagedProvisionDb.get('terminal-replaced')?.phase, 'ready');
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      await fs.rm(socketDirectory, { recursive: true, force: true });
     }
   });
 });
@@ -319,6 +424,30 @@ test('task-host stdio launcher uses protected bootstrap and fixture factory with
     assert.equal(host.snapshot().commands['ack-a1'], undefined);
     assert.doesNotMatch(stdout, /"snapshot"|"events"|"providerSessionId"|\{/);
     assert.equal(herdrManagedDb.eventsSince('managed-session', 'owner-gen-1', 0).some((event) => event.kind === 'sdk.event'), false);
+    await host.close();
+  });
+});
+
+test('console status exposes safe session, active-turn, queue and request identities', async () => {
+  await withManagedDatabase(async tmp => {
+    herdrManagedDb.reserve({ appSessionId: 'managed-session', projectPath: '/tmp/project', herdrInstanceId: 'herdr-main', ownerGeneration: 'owner-gen-1' });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    output.setEncoding('utf8');
+    let stdout = '';
+    output.on('data', chunk => { stdout += String(chunk); });
+    const host = await runHerdrTaskHostStdio({
+      bootstrap: { appSessionId: 'managed-session', ownerGeneration: 'owner-gen-1', herdrInstanceId: 'herdr-main', projectPath: '/tmp/project', sessionRoot: tmp },
+      input,
+      output,
+      createSession: () => ({ providerSessionId: 'provider-session-1', async prompt() {} }),
+    });
+    const start = stdout.length;
+    input.write(':status\n');
+    for (let index = 0; index < 100 && !stdout.slice(start).includes('activeTurnId='); index++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.match(stdout.slice(start), /STATUS idle \d+ appSessionId=managed-session ownerGeneration=owner-gen-1 providerSessionId=provider-session-1 activeTurnId=- queue=- requests=-/);
     await host.close();
   });
 });
@@ -469,6 +598,360 @@ test('false SDK approval becomes unknown; stale controls never reach the SDK', a
     finish();
     await running;
     await host.close();
+  });
+});
+
+test('prompt failure commits unknown command, unknown turn and lifecycle fence atomically', async () => {
+  await withManagedDatabase(async () => {
+    herdrManagedDb.reserve({ appSessionId: 'managed-session', projectPath: '/tmp/project', herdrInstanceId: 'herdr-main', ownerGeneration: 'owner-gen-1' });
+    const host = new HerdrTaskHost({
+      bootstrap: { appSessionId: 'managed-session', ownerGeneration: 'owner-gen-1', herdrInstanceId: 'herdr-main', projectPath: '/tmp/project', sessionRoot: '/tmp/gjc' },
+      createSession: () => ({
+        providerSessionId: 'provider-session-1',
+        async prompt() { throw new Error('private child lost'); },
+      }),
+    });
+    await host.initialize();
+    await assert.rejects(host.dispatch(promptCommand('unknown-turn', 'ambiguous')));
+    const snapshot = host.snapshot();
+    assert.equal(snapshot.lifecycle, 'unknown');
+    assert.equal(snapshot.activeTurnId, null);
+    assert.equal(snapshot.commands['unknown-turn']?.state, 'unknown');
+    assert.equal(snapshot.turns['unknown-turn']?.status, 'unknown');
+    assert.equal(snapshot.turns['unknown-turn']?.outcome, 'unknown');
+    assert.equal(snapshot.queue.paused, true);
+    assert.equal(herdrManagedDb.eventsSince('managed-session', 'owner-gen-1', 0).some(event =>
+      event.kind === 'command.unknown' && (event.payload as { actionId?: string }).actionId === 'unknown-turn'), true);
+    await host.close();
+  });
+});
+
+test('deny-first resume consumes the old approval across authenticated clients and requires a fresh approval', async () => {
+  await withManagedDatabase(async tmp => {
+    const identity = { appSessionId: 'resume-session', ownerGeneration: 'resume-owner' };
+    const bridgePath = path.join(tmp, 'resume-bridge.sock');
+    const bridgeToken = 'a'.repeat(64);
+    const invocation = { surface: 'browser', payload: { url: 'https://resume.test', command: 'observe' } };
+    const targetBinding = { kind: 'browser-origin' as const, origin: 'https://resume.test', tabId: 'resume-tab' };
+    // The ledger rejects symlinked ancestors such as macOS's /var; use the canonical path.
+    const ledger = new ManagedBridgeLedger(await fs.realpath(tmp));
+    const sockets = new Set<net.Socket>();
+    let dispatches = 0;
+    const bridge = net.createServer(socket => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+      socket.on('error', () => {});
+      let buffer = '';
+      socket.on('data', chunk => {
+        buffer += chunk.toString('utf8');
+        const newline = buffer.indexOf('\n');
+        if (newline < 0) return;
+        const request = JSON.parse(buffer.slice(0, newline)) as HerdrManagedBridgeRequest & { id: string; token: string };
+        assert.equal(request.token, bridgeToken);
+        const send = (result: unknown) => socket.end(JSON.stringify({ id: request.id, ok: true, result }) + '\n');
+        if (request.type === 'managed-resolve-target') {
+          send({
+            type: 'managed-target',
+            requestId: request.requestId,
+            identity: request.identity,
+            sourceOperationId: request.sourceOperationId,
+            bridgeInstanceId: request.bridgeInstanceId,
+            invocationHash: request.identity.argumentsHash,
+            targetBinding,
+          });
+        } else if (request.type === 'managed-dispatch') {
+          dispatches++;
+          const reservation = ledger.reserveDispatch(request.attempt);
+          send(reservation.status === 'reserved'
+            ? ledger.completeDispatch(request.attempt, reservation.reservationId, { ok: true, result: { resumed: true } })
+            : reservation.receipt);
+        } else {
+          send(ledger.lookupOutcome(request.attempt));
+        }
+      });
+    });
+    await new Promise<void>(resolve => bridge.listen(bridgePath, resolve));
+    const clients: HerdrManagedAttachClient[] = [];
+    let releaseDenial!: () => void;
+    let denialEntered = false;
+    let callbackSettled = false;
+    let callbackResult: unknown;
+    let callbackPromise: Promise<unknown> | undefined;
+    herdrManagedDb.reserve({ ...identity, projectPath: tmp, herdrInstanceId: 'resume-herdr' });
+    const host = new HerdrTaskHost({
+      bootstrap: {
+        ...identity,
+        herdrInstanceId: 'resume-herdr',
+        projectPath: tmp,
+        sessionRoot: tmp,
+        attachSocketPath: path.join(tmp, 'resume-attach.sock'),
+        attachSecret: 's'.repeat(32),
+      },
+      createSession: ({ onEvent }) => {
+        let eventSeq = 0;
+        let events = Promise.resolve();
+        const broker = new GjcHerdrAutomationBroker({
+          generation: identity.ownerGeneration,
+          provider: 'resume-provider',
+          policyRevision: 0,
+          emit: event => {
+            events = events.then(() => onEvent({
+              version: 1,
+              generation: identity.ownerGeneration,
+              requestId: 'resume-turn',
+              runId: 'resume-turn',
+              type: 'event',
+              eventSeq: ++eventSeq,
+              event,
+            }));
+          },
+          flush: () => events,
+        });
+        broker.setTurn('resume-turn');
+        const denialGate = new Promise<void>(resolve => { releaseDenial = resolve; });
+        return {
+          providerSessionId: 'resume-provider',
+          async prompt() {
+            callbackPromise = broker.dispatch({ toolCallId: 'resume-tool', index: 0, request: invocation })
+              .then(value => { callbackResult = value; return value; });
+            await callbackPromise;
+            callbackSettled = true;
+          },
+          async automationControl(control) {
+            if (control.type === 'resume-denied') {
+              denialEntered = true;
+              await denialGate;
+            }
+            return broker.control(control);
+          },
+          async dispose() { broker.abort(); },
+        };
+      },
+    });
+    try {
+      await host.initialize();
+      await host.startPrivateAttachServer();
+      const connect = async () => {
+        const client = new HerdrManagedAttachClient({
+          ...identity,
+          socketPath: path.join(tmp, 'resume-attach.sock'),
+          attachSecret: 's'.repeat(32),
+        });
+        clients.push(client);
+        await client.connect();
+        return client;
+      };
+      const owner = await connect();
+      const observer = await connect();
+      const payload = { text: 'resume task' };
+      const running = host.dispatch({
+        protocolVersion: HERDR_MANAGED_PROTOCOL_VERSION,
+        ...identity,
+        actionId: 'resume-turn',
+        kind: 'prompt',
+        payload,
+        payloadHash: commandHash(payload),
+      });
+      const waitFor = async (predicate: () => boolean) => {
+        for (let index = 0; index < 2_000 && !predicate(); index++) await new Promise(resolve => setTimeout(resolve, 2));
+        assert.equal(predicate(), true, 'resume host observation deadline');
+      };
+      await waitFor(() => Object.values(host.snapshot().automation).some(operation => operation.phase === 'waiting_attachment'));
+      const waiting = Object.values(host.snapshot().automation).find(operation => operation.phase === 'waiting_attachment')!;
+      const currentTransport = {
+        transportLocator: bridgePath,
+        transportToken: bridgeToken,
+        ownerConnectionId: 'caller',
+        bridgeInstanceId: 'resume-bridge',
+      };
+      const bind = await owner.automationControl({
+        type: 'bind-capability',
+        actionId: 'resume-bind',
+        identity: waiting.identity,
+        currentTransport,
+      });
+      assert.equal(bind.type, 'automation-control');
+      assert.equal(bind.accepted, true);
+      await waitFor(() => Object.values(host.snapshot().automation).some(operation => operation.phase === 'awaiting_reattach_approval'));
+      const offered = Object.values(host.snapshot().automation).find(operation => operation.phase === 'awaiting_reattach_approval')!;
+      const oldApproval = {
+        identity: offered.identity,
+        capabilityGeneration: offered.capabilityGeneration,
+        approvalRequestId: offered.approvalRequestId,
+        decision: 'deny' as const,
+      };
+      const command = (actionId: string, approval: Omit<typeof oldApproval, 'decision'> & { decision: 'approve' | 'deny' }): HerdrManagedCommand => ({
+        protocolVersion: HERDR_MANAGED_PROTOCOL_VERSION,
+        ...identity,
+        actionId,
+        kind: 'resume',
+        payload: approval,
+        payloadHash: commandHash(approval),
+      });
+      const deny = owner.command(command('deny-old', oldApproval));
+      await waitFor(() => denialEntered && host.snapshot().commands['deny-old']?.state === 'executing');
+      const approveOld = observer.command(command('approve-old', { ...oldApproval, decision: 'approve' }));
+      releaseDenial();
+      const [denied, staleApproval] = await Promise.all([deny, approveOld]);
+      assert.equal(denied.type, 'receipt');
+      assert.equal(staleApproval.type, 'receipt');
+      if (denied.type === 'receipt') assert.equal(denied.receipt.state, 'settled');
+      if (staleApproval.type === 'receipt') assert.equal(staleApproval.receipt.state, 'rejected');
+      assert.equal(dispatches, 0);
+      assert.equal(callbackSettled, false);
+      assert.equal(callbackResult, undefined);
+      const renewed = Object.values(host.snapshot().automation).find(operation => operation.identity.operationId === offered.identity.operationId)!;
+      assert.equal(renewed.phase, 'awaiting_reattach_approval');
+      assert.notEqual(renewed.approvalRequestId, oldApproval.approvalRequestId);
+      const freshApproval = {
+        identity: renewed.identity,
+        capabilityGeneration: renewed.capabilityGeneration,
+        approvalRequestId: renewed.approvalRequestId,
+        decision: 'approve' as const,
+      };
+      const fresh = await owner.command(command('approve-fresh', freshApproval));
+      assert.equal(fresh.type, 'receipt');
+      if (fresh.type === 'receipt') assert.equal(fresh.receipt.state, 'settled');
+      await running;
+      assert.equal(dispatches, 1);
+      assert.equal(callbackSettled, true);
+      assert.deepEqual(callbackResult, { resumed: true });
+    } finally {
+      for (const client of clients) client.close();
+      await host.close();
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>(resolve => bridge.close(() => resolve()));
+      ledger.close();
+    }
+  });
+});
+
+test('failed attach bootstrap fences only the claimed generation and disposes its SDK owner', async () => {
+  await withManagedDatabase(async tmp => {
+    herdrManagedDb.reserve({ appSessionId: 'managed-session', projectPath: '/tmp/project', herdrInstanceId: 'herdr-main', ownerGeneration: 'owner-gen-1' });
+    let disposed = 0;
+    const host = new HerdrTaskHost({
+      bootstrap: {
+        appSessionId: 'managed-session',
+        ownerGeneration: 'owner-gen-1',
+        herdrInstanceId: 'herdr-main',
+        projectPath: '/tmp/project',
+        sessionRoot: tmp,
+        attachSocketPath: path.join(tmp, 'already-owned.sock'),
+        attachSecret: 's'.repeat(32),
+      },
+      createSession: () => ({
+        providerSessionId: 'provider-session-1',
+        async prompt() {},
+        async dispose() { disposed++; },
+      }),
+    });
+    await host.initialize();
+    await fs.writeFile(path.join(tmp, 'already-owned.sock'), 'foreign');
+    await assert.rejects(host.startPrivateAttachServer(), /already exists/);
+    assert.equal(disposed, 1);
+    assert.equal(host.snapshot().lifecycle, 'interrupted');
+    assert.equal(host.snapshot().identity.ownerGeneration, 'owner-gen-1');
+    await host.close();
+  });
+});
+
+test('createSession initialization failure fences the claimed generation without a live owner', async () => {
+  await withManagedDatabase(async () => {
+    herdrManagedDb.reserve({ appSessionId: 'managed-session', projectPath: '/tmp/project', herdrInstanceId: 'herdr-main', ownerGeneration: 'owner-gen-1' });
+    let attempts = 0;
+    const host = new HerdrTaskHost({
+      bootstrap: { appSessionId: 'managed-session', ownerGeneration: 'owner-gen-1', herdrInstanceId: 'herdr-main', projectPath: '/tmp/project', sessionRoot: '/tmp/gjc' },
+      createSession: async () => {
+        attempts++;
+        throw new Error('SDK initialization failed');
+      },
+    });
+    await assert.rejects(host.initialize(), /SDK initialization failed/);
+    assert.equal(attempts, 1);
+    assert.equal(host.snapshot().lifecycle, 'interrupted');
+    assert.equal(host.session, null);
+    await host.close();
+  });
+});
+
+test('close rejects with sanitized unconfirmed closure when the owned child cannot close', async () => {
+  await withManagedDatabase(async () => {
+    herdrManagedDb.reserve({ appSessionId: 'managed-session', projectPath: '/tmp/project', herdrInstanceId: 'herdr-main', ownerGeneration: 'owner-gen-1' });
+    let disposeCalls = 0;
+    const host = new HerdrTaskHost({
+      bootstrap: { appSessionId: 'managed-session', ownerGeneration: 'owner-gen-1', herdrInstanceId: 'herdr-main', projectPath: '/tmp/project', sessionRoot: '/tmp/gjc' },
+      createSession: () => ({
+        providerSessionId: 'provider-session-1',
+        async prompt() {},
+        async dispose() { disposeCalls++; throw new Error('native child close detail'); },
+      }),
+    });
+    await host.initialize();
+    const first = host.close();
+    assert.strictEqual(first, host.close(), 'close callers share the rejected closure promise');
+    await assert.rejects(first, error => {
+      assert.equal((error as Error).message, 'Managed owner closure unconfirmed.');
+      assert.doesNotMatch((error as Error).message, /native child close detail/);
+      return true;
+    });
+    assert.equal(disposeCalls, 1);
+    assert.equal(host.snapshot().lifecycle, 'interrupted');
+    await assert.rejects(host.close(), /Managed owner closure unconfirmed/);
+  });
+});
+
+test('close rejects and fences when reporter cleanup is lost', async () => {
+  await withManagedDatabase(async () => {
+    herdrManagedDb.reserve({ appSessionId: 'managed-session', projectPath: '/tmp/project', herdrInstanceId: 'herdr-main', ownerGeneration: 'owner-gen-1' });
+    const originalRelease = HerdrAgentReporter.prototype.release;
+    let releaseCalls = 0;
+    HerdrAgentReporter.prototype.release = async function() {
+      releaseCalls++;
+      return false;
+    };
+    try {
+      const host = new HerdrTaskHost({
+        bootstrap: { appSessionId: 'managed-session', ownerGeneration: 'owner-gen-1', herdrInstanceId: 'herdr-main', projectPath: '/tmp/project', sessionRoot: '/tmp/gjc' },
+        createSession: () => ({ providerSessionId: 'provider-session-1', async prompt() {} }),
+      });
+      await host.initialize();
+      await assert.rejects(host.close(), error => {
+        assert.equal((error as Error).message, 'Managed owner closure unconfirmed.');
+        assert.doesNotMatch((error as Error).message, /reporter/);
+        return true;
+      });
+      assert.equal(releaseCalls, 1);
+      assert.equal(host.snapshot().lifecycle, 'interrupted');
+    } finally {
+      HerdrAgentReporter.prototype.release = originalRelease;
+    }
+  });
+});
+
+test('close rejects and fences when the closed lifecycle write fails', async () => {
+  await withManagedDatabase(async () => {
+    herdrManagedDb.reserve({ appSessionId: 'managed-session', projectPath: '/tmp/project', herdrInstanceId: 'herdr-main', ownerGeneration: 'owner-gen-1' });
+    const originalSetLifecycle = herdrManagedDb.setLifecycle;
+    herdrManagedDb.setLifecycle = ((appSessionId, ownerGeneration, lifecycle) => {
+      if (lifecycle === 'closed') throw new Error('sqlite closure detail');
+      return originalSetLifecycle.call(herdrManagedDb, appSessionId, ownerGeneration, lifecycle);
+    }) as typeof originalSetLifecycle;
+    try {
+      const host = new HerdrTaskHost({
+        bootstrap: { appSessionId: 'managed-session', ownerGeneration: 'owner-gen-1', herdrInstanceId: 'herdr-main', projectPath: '/tmp/project', sessionRoot: '/tmp/gjc' },
+        createSession: () => ({ providerSessionId: 'provider-session-1', async prompt() {} }),
+      });
+      await host.initialize();
+      await assert.rejects(host.close(), error => {
+        assert.equal((error as Error).message, 'Managed owner closure unconfirmed.');
+        assert.doesNotMatch((error as Error).message, /sqlite closure detail/);
+        return true;
+      });
+      assert.equal(host.snapshot().lifecycle, 'interrupted');
+    } finally {
+      herdrManagedDb.setLifecycle = originalSetLifecycle;
+    }
   });
 });
 

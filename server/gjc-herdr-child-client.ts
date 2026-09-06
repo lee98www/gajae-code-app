@@ -2,6 +2,8 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 
 import { HERDR_MANAGED_CHILD_LIMITS as limits, parseManagedChildOutput, parseManagedChildRequest, type ManagedChildEvent, type ManagedChildRequest, type ManagedChildResponse } from '../shared/herdr-managed-child-protocol.js';
 
+const titleScopeKey = (requestId: string, runId: string): string => `${requestId}\u0000${runId}`;
+
 /** Private transport: event persistence completes before the cumulative acknowledgement is written. */
 export class ManagedChildTransport {
   #buffer: Buffer = Buffer.alloc(0);
@@ -15,6 +17,9 @@ export class ManagedChildTransport {
   #exit: Promise<void>;
   #closing = false;
   #responses = new Set<string>();
+  #promptScopes = new Map<string, { requestId: string; runId: string }>();
+  /** The first title-eligible prompt may publish once after its response settles. */
+  #titleScope: { requestId: string; runId: string; published: boolean } | null = null;
 
   constructor(private readonly child: ChildProcessWithoutNullStreams, private readonly generation: string, private readonly onEvent: (event: ManagedChildEvent) => void | Promise<void>) {
     this.#exit = new Promise((resolve, reject) => {
@@ -41,6 +46,7 @@ export class ManagedChildTransport {
       if (request.type === 'init' || request.type === 'prompt') {
         if ([...this.#pending.values()].some(p => p.request.type === 'init' || p.request.type === 'prompt')) throw new Error('Managed child already has an active event stream.');
         this.#eventIdentity = request;
+        if (request.type === 'prompt') this.#promptScopes.set(titleScopeKey(request.requestId, request.runId), { requestId: request.requestId, runId: request.runId });
       }
       return new Promise((resolve, reject) => {
         this.#pending.set(request.requestId, { request, resolve, reject });
@@ -85,9 +91,26 @@ export class ManagedChildTransport {
         const frame = parseManagedChildOutput(line);
         if (frame.generation !== this.generation) throw new Error('Managed child generation mismatch.');
         if (frame.type === 'event') {
-          if (this.#responses.has(frame.requestId)) throw new Error('Managed child event followed terminal response.');
-          if (frame.requestId !== this.#eventIdentity?.requestId || frame.runId !== this.#eventIdentity.runId || frame.eventSeq !== this.#eventSeq + 1) throw new Error('Managed child event identity mismatch.');
-          if (!this.#pending.has(frame.requestId) && !['managed.automation', 'managed.automation-record-chunk'].includes(String(frame.event.kind))) throw new Error('Managed child idle event rejected.');
+          const currentIdentity = frame.requestId === this.#eventIdentity?.requestId && frame.runId === this.#eventIdentity.runId;
+          const isTitle = frame.event.kind === 'session_title';
+          const promptScope = isTitle ? this.#promptScopes.get(titleScopeKey(frame.requestId, frame.runId)) : undefined;
+          const titleIdentity = Boolean(promptScope)
+            && (!this.#titleScope
+              || (frame.requestId === this.#titleScope.requestId && frame.runId === this.#titleScope.runId));
+          if (isTitle && titleIdentity && !this.#titleScope) {
+            this.#titleScope = { ...promptScope!, published: false };
+          }
+          if (this.#responses.has(frame.requestId) && !(isTitle && titleIdentity && !this.#titleScope?.published)) {
+            throw new Error('Managed child event followed terminal response.');
+          }
+          if (frame.eventSeq !== this.#eventSeq + 1
+            || (!currentIdentity && !(isTitle && titleIdentity))
+            || (isTitle && (!titleIdentity || this.#titleScope?.published))) {
+            throw new Error('Managed child event identity mismatch.');
+          }
+          const lateTitle = isTitle && Boolean(titleIdentity);
+          if (!this.#pending.has(frame.requestId) && !lateTitle && !['managed.automation', 'managed.automation-record-chunk'].includes(String(frame.event.kind))) throw new Error('Managed child idle event rejected.');
+          if (lateTitle && this.#titleScope) this.#titleScope.published = true;
           this.#eventSeq = frame.eventSeq;
           const bytes = Buffer.byteLength(line);
           if (++this.#eventCount > limits.pendingEvents || (this.#eventBytes += bytes) > limits.pendingBytes) throw new Error('Managed child event limit exceeded.');
@@ -124,6 +147,8 @@ export class ManagedChildTransport {
     this.#pending.clear();
     this.#responses.clear();
     this.#eventIdentity = null;
+    this.#promptScopes.clear();
+    this.#titleScope = null;
     this.#buffer = Buffer.alloc(0);
     if (!this.#closing || this.child.exitCode === null) this.child.kill();
   }

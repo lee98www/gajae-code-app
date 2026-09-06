@@ -27,6 +27,14 @@ const canonical = (value: unknown): string => {
   return JSON.stringify(value) ?? 'null';
 };
 const identity = (frame: ManagedChildIdentity): ManagedChildIdentity => ({ version: frame.version, generation: frame.generation, requestId: frame.requestId, runId: frame.runId });
+const managedTitleScope = Symbol.for('gajae.managed.session-title-scope');
+/** Automation records live across turns; everything else needs an active prompt. */
+const IDLE_EVENT_KINDS = new Set(['managed.automation', 'managed.automation-record-chunk']);
+const sameIdentity = (left: ManagedChildIdentity | undefined, right: ManagedChildIdentity | undefined): boolean =>
+  left?.version === right?.version
+  && left?.generation === right?.generation
+  && left?.requestId === right?.requestId
+  && left?.runId === right?.runId;
 
 /** Resolves only after close/owner-pipe death and SDK disposal. Input is never serialized behind a prompt. */
 export async function runManagedChild(options: RunManagedChildOptions = {}): Promise<void> {
@@ -37,6 +45,9 @@ export async function runManagedChild(options: RunManagedChildOptions = {}): Pro
   let generation: string | undefined;
   let eventIdentity: ManagedChildIdentity | undefined;
   let activePrompt: ManagedChildIdentity | undefined;
+  let titleIdentity: ManagedChildIdentity | undefined;
+  let titlePublished = false;
+  const promptIdentities = new Map<string, ManagedChildIdentity>();
   let sequence = 0;
   let acknowledged = 0;
   let pendingBytes = 0;
@@ -80,9 +91,9 @@ export async function runManagedChild(options: RunManagedChildOptions = {}): Pro
     }
     output.write(line);
   };
-  const emit = (event: Record<string, unknown>) => {
-    if (!eventIdentity || stopped) return;
-    const frame = { ...eventIdentity, type: 'event' as const, eventSeq: sequence + 1, event };
+  const emit = (event: Record<string, unknown>, scopedIdentity = eventIdentity) => {
+    if (!scopedIdentity || stopped) return;
+    const frame = { ...scopedIdentity, type: 'event' as const, eventSeq: sequence + 1, event };
     const bytes = Buffer.byteLength(JSON.stringify(frame)) + 1;
     if (!Number.isSafeInteger(frame.eventSeq) || pending.size >= limits.pendingEvents || pendingBytes + bytes > limits.pendingBytes || bytes > limits.frameBytes) {
       onDeath();
@@ -104,7 +115,38 @@ export async function runManagedChild(options: RunManagedChildOptions = {}): Pro
       initializing = (async () => {
         const adapter = await (options.createAdapter ?? createManagedGjcBunSdkAdapter)(frame.agentDir);
         owner = await adapter.initializeManagedGjcSession(`${frame.generation}:managed`, { ...frame.runConfig, appSessionId: frame.appSessionId }, {
-          send: (event) => emit(event as Record<string, unknown>),
+          send: (event) => {
+            const record = event !== null && typeof event === 'object' && !Array.isArray(event)
+              ? event as Record<string, unknown>
+              : undefined;
+            const scoped = record ? Reflect.get(record, managedTitleScope) : undefined;
+            if (record?.kind === 'session_title') {
+              const scopedIdentity = scoped !== null && typeof scoped === 'object' && !Array.isArray(scoped)
+                ? scoped as ManagedChildIdentity
+                : undefined;
+              const knownIdentity = scopedIdentity && promptIdentities.get(`${scopedIdentity.requestId}\u0000${scopedIdentity.runId}`);
+              if (!scopedIdentity || !knownIdentity || titlePublished
+                || (titleIdentity && !sameIdentity(scopedIdentity, titleIdentity))
+                || !sameIdentity(scopedIdentity, knownIdentity)) {
+                onDeath();
+                throw new Error('Managed child title scope rejected.');
+              }
+              titleIdentity = knownIdentity;
+              titlePublished = true;
+              emit(record, scopedIdentity);
+              return;
+            }
+            if (scoped !== undefined || !record) {
+              onDeath();
+              throw new Error('Managed child event scope rejected.');
+            }
+            // Between turns the SDK may still report background state (a late
+            // title attempt, disposal bookkeeping). No turn can own such an
+            // event, so it is dropped here rather than presented to the owner
+            // under a settled identity, which would fail the private stream.
+            if (owner && !activePrompt && !IDLE_EVENT_KINDS.has(String(record.kind))) return;
+            emit(record);
+          },
           setSessionId: (providerSessionId) => emit({ kind: 'session', providerSessionId }),
           setCredential: () => {},
           setModel: (modelId) => emit({ kind: 'model', modelId }),
@@ -119,7 +161,8 @@ export async function runManagedChild(options: RunManagedChildOptions = {}): Pro
       if (activePrompt) return { ok: false, error: 'busy' };
       activePrompt = identity(frame);
       eventIdentity = activePrompt;
-      owner.setAutomationTurn(frame.actionId);
+      promptIdentities.set(`${activePrompt.requestId}\u0000${activePrompt.runId}`, activePrompt);
+      owner.setAutomationTurn(frame.actionId, activePrompt);
       let ok = true;
       try {
         try { await owner.prompt(frame.text, frame.turnOptions); } catch { ok = false; }

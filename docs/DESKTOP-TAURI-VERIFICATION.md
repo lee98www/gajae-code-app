@@ -79,8 +79,19 @@ node scripts/release/smoke-packaged-server.mjs --tauri-app "/Applications/Gajae 
       private canonical bundle identity and predispatch revalidation, not an
       arbitrary name. Verify installed resolution and identity-change rejection
       separately from rendered browser and screen execution.
+- [ ] Throttle a real WebSocket while transferring more than 4 MiB of history;
+      finish the immutable snapshot and preserve concurrent journal updates.
+- [ ] Exercise delayed title publication after turn settlement, post-action
+      driver reply loss, deny-first competing approval, and failed host cleanup.
+      Unknown outcomes must remain fenced, not become successful completion.
+- [ ] Confirm unresolved session mode never invokes legacy queue/steer paths;
+      drafts survive rejection and unknown decisions have no active reply controls.
+- [ ] SDK 0.15.6 has no supported no-save secret-answer hook. Verify tagged ask
+      answers are rejected without an editable secret field, while ordinary
+      multi-question/multi-select flows use the SDK's scalar callback sequence.
 - [ ] Verify protected bootstrap/tokens/private paths stay out of browser
-      payloads and logs, fail-closed loopback exposure, and delete/archive fences.
+      payloads and logs, fail-closed loopback exposure, and permanent-delete fences.
+      Archiving may hide a conversation but must not terminate its owner.
 
 No installed-App, live-Herdr, live-provider, or current packaged proof is claimed
 here. Unknown needs status/ACK and authoritative proof, not restart-and-retry.

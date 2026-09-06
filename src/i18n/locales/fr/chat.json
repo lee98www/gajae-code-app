@@ -74,6 +74,8 @@
     },
     "scrollToBottom": "Aller au dernier",
     "queue": {
+      "recovered": "Brouillon conservé",
+      "reviewBeforeSending": "Modifier puis envoyer manuellement ; non mis en file sur l’hôte",
       "sendNext": "Mettre un autre message en file d'attente",
       "label": "En file d'attente",
       "paused": "File d’attente en pause",
@@ -210,6 +212,10 @@
     }
   },
   "permissionCard": {
+    "secretUnavailableTitle": "Les réponses secrètes ne sont pas prises en charge",
+    "secretUnavailableGuidance": "Cet environnement ne garantit pas l’absence des réponses secrètes dans l’historique. Ne saisissez aucun identifiant secret ; refusez cette demande et utilisez une procédure d’authentification distincte.",
+    "unknownTitle": "Résultat de la décision inconnu",
+    "unknownGuidance": "Reconnectez-vous pour récupérer le résultat, ou arrêtez la tâche si possible. Ne renvoyez pas cette décision.",
     "title": "Permission requise",
     "tool": "Outil :",
     "viewInput": "Voir l’entrée de l’outil",

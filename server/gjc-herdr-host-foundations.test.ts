@@ -258,7 +258,12 @@ await runManagedChild({ createAdapter: async () => ({ initializeManagedGjcSessio
       const payload = { identity: current.identity, capabilityGeneration: current.capabilityGeneration, approvalRequestId: current.approvalRequestId, decision: 'approve' };
       assert.equal((await host.dispatch(command('old-approval', 'resume', { ...payload, approvalRequestId: offered.approvalRequestId }))).state, 'rejected');
       assert.equal((await host.dispatch(command('deny', 'resume', { ...payload, decision: 'deny' }))).state, 'settled'); assert.equal(dispatches, 0);
-      const approval = command('approve', 'resume', payload);
+      // A denial consumes its request: the same ID can no longer approve, and a fresh request is offered.
+      assert.equal((await host.dispatch(command('approve-consumed', 'resume', payload))).state, 'rejected'); assert.equal(dispatches, 0);
+      await wait(() => host.snapshot().automation[current.identity.operationId].approvalRequestId !== current.approvalRequestId);
+      const renewed = host.snapshot().automation[current.identity.operationId];
+      assert.equal(renewed.phase, 'awaiting_reattach_approval');
+      const approval = command('approve', 'resume', { ...payload, approvalRequestId: renewed.approvalRequestId });
       const receipts = await Promise.all([host.dispatch(approval), host.dispatch(approval)]); assert.deepEqual(receipts[0], receipts[1]); assert.equal(receipts[0].state, 'settled');
       await running; assert.equal(dispatches, 1);
       assert.equal(await host.session!.operationStatus!(current.identity.operationId), 'completed');

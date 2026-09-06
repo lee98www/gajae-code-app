@@ -74,6 +74,8 @@
     },
     "scrollToBottom": "Jump to latest",
     "queue": {
+      "recovered": "Saved draft",
+      "reviewBeforeSending": "Edit and send manually; not queued with the host",
       "sendNext": "Queue another message",
       "label": "Queued",
       "paused": "Queue paused",
@@ -210,6 +212,10 @@
     }
   },
   "permissionCard": {
+    "secretUnavailableTitle": "Secret answers are not supported",
+    "secretUnavailableGuidance": "This runtime cannot guarantee that a secret answer stays out of history. Do not enter credentials; decline this request and use a separate credential flow.",
+    "unknownTitle": "Decision outcome unknown",
+    "unknownGuidance": "Reconnect to recover the outcome, or stop the task when available. Do not submit this decision again.",
     "title": "Permission required",
     "tool": "Tool:",
     "viewInput": "View tool input",

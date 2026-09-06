@@ -68,6 +68,7 @@ interface ChatComposerProps {
   handlePermissionDecision: (requestIds: string | string[], decision: PermissionDecision) => void;
   /** A run is in flight for the viewed session: the primary button is Stop, Enter queues. */
   isLoading: boolean;
+  isResolvingSession?: boolean;
   onAbortSession: () => void;
   sessionState: Record<string, unknown> | null;
   onShowTokenUsage: () => void;
@@ -148,6 +149,7 @@ export default function ChatComposer({
   pendingPermissionRequests,
   handlePermissionDecision,
   isLoading,
+  isResolvingSession = false,
   onAbortSession,
   sessionState,
   onShowTokenUsage,
@@ -318,8 +320,9 @@ export default function ChatComposer({
         </div>
       )}
 
-      {!managed && queuedDrafts.map((draft, index) => (
+      {queuedDrafts.map((draft, index) => (
         <QueuedMessageCard
+          manualSend={managed || isResolvingSession}
           key={`${index}:${draft.content}`}
           content={draft.content}
           imageCount={draft.images.length}
@@ -520,6 +523,7 @@ export default function ChatComposer({
             {canSteer && (
               <PromptInputButton
                 onClick={onSteer}
+                disabled={isResolvingSession}
                 tooltip={{ content: t('input.queue.steerNow') }}
                 aria-label={t('input.queue.steerNow')}
                 className="shrink-0 rounded-full border border-border/70 bg-background/70 text-muted-foreground hover:border-primary/30 hover:text-foreground"
@@ -568,7 +572,7 @@ export default function ChatComposer({
                       }
                     : undefined
                 }
-                disabled={isRecording ? false : isTranscribing ? true : !input.trim()}
+                disabled={isRecording ? false : isTranscribing ? true : isResolvingSession || !input.trim()}
                 aria-label={t('input.send')}
                 title={t('input.send')}
                 data-run-control="send"

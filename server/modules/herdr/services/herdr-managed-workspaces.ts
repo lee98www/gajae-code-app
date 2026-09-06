@@ -100,20 +100,29 @@ export class HerdrManagedWorkspacesService {
     if (record.phase === 'ready' && record.providerSessionId && record.placement) return { status: 'ready', appSessionId: record.appSessionId, providerSessionId: record.providerSessionId, ownerGeneration: record.ownerGeneration, placement: record.placement };
     return { status: record.phase === 'unknown' ? 'unknown' : 'provisioning', appSessionId: record.appSessionId, providerSessionId: record.providerSessionId, ownerGeneration: record.ownerGeneration, selectedSessionName: record.selectedSessionName };
   }
+  #uncertain(record: ProvisionRecord): EnsureManagedConversationResult {
+    return { status: 'unknown', appSessionId: record.appSessionId, providerSessionId: record.providerSessionId, ownerGeneration: record.ownerGeneration, selectedSessionName: record.selectedSessionName };
+  }
   async #ensure(id: string, options: HerdrManagedTrustedOptions): Promise<EnsureManagedConversationResult> {
     const projectPath = this.#db.projectPath(id);
     if (!projectPath) throw new Error('Session is not registered as managed.');
     if (Object.keys(options).some(key => !['modelId', 'model', 'modelProfile', 'effort'].includes(key)) || Object.values(options).some(value => value !== undefined && typeof value !== 'string')) throw new Error('Untrusted managed configuration override.');
     const old = this.#db.get(id);
     if (old) {
-      if (old.placement) { try { await this.attach(id); } catch { this.#db.cas(id, old.ownerGeneration, old.phase, 'unknown'); } }
-      else {
-        // Another process may still be executing the recorded intent, or its
-        // reply may have been lost. Neither case permits replaying the mutation.
-        return { status: 'unknown', appSessionId: id, providerSessionId: old.providerSessionId,
-          ownerGeneration: old.ownerGeneration, selectedSessionName: old.selectedSessionName };
+      if (old.placement) {
+        try {
+          await this.attach(id);
+          return this.#result(this.#db.get(id)!);
+        } catch {
+          // A private attach failure does not prove owner death. Preserve the
+          // claimed target so the reporter can still clean it up and a later
+          // attach can recover the same owner.
+          return this.#uncertain(this.#db.get(id)!);
+        }
       }
-      return this.#result(this.#db.get(id)!);
+      // Another process may still be executing the recorded intent, or its
+      // reply may have been lost. Neither case permits replaying create/layout.
+      return this.#uncertain(old);
     }
     const selection = await this.selection();
     if (!selection.selectedSessionName || selection.status === 'unavailable') return { status: selection.status === 'selection_required' ? 'selection_required' : 'unavailable', appSessionId: id, providerSessionId: null, ownerGeneration: null, selectedSessionName: selection.selectedSessionName };
@@ -136,19 +145,20 @@ export class HerdrManagedWorkspacesService {
       const key = createHash('sha256').update(JSON.stringify([this.#db.installId(), handle.identity])).digest('hex');
       if (!this.#db.cas(id, generation, 'reserved', 'workspace_requested')) throw new Error('Provision ownership conflict.');
       const workspaceId = await this.#ownedWorkspace(key, handle, projectPath);
-      if (!this.#db.cas(id, generation, 'workspace_requested', 'workspace_created', workspaceId) || !this.#db.cas(id, generation, 'workspace_created', 'layout_requested')) throw new Error('Provision phase conflict.');
+      if (!this.#db.cas(id, generation, 'workspace_requested', 'workspace_created', workspaceId) || !this.#db.cas(id, generation, 'workspace_created', 'layout_requested', workspaceId)) throw new Error('Provision phase conflict.');
       const receipt = await handle.applyLayout(workspaceId, hostArgv(bootstrapPath), projectPath);
       if (receipt.workspaceId !== workspaceId || !receipt.tabId || !receipt.paneId || !receipt.terminalId) throw new Error('Managed layout receipt mismatch.');
-      if (!this.#db.cas(id, generation, 'layout_requested', 'layout_created', workspaceId, { sessionName: record.selectedSessionName, ...receipt })) throw new Error('Provision receipt conflict.');
+      this.#db.recordLayoutReceipt(id, generation, { sessionName: record.selectedSessionName, ...receipt });
       const deadline = Date.now() + this.#timeout;
       for (;;) {
         try { await this.attach(id); break; } catch { if (Date.now() >= deadline) throw new Error('Managed readiness unknown.'); await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now())))); }
       }
     } catch {
-      const current = this.#db.get(id)!;
-      this.#db.cas(id, generation, current.phase, 'unknown');
+      const current = this.#db.get(id);
+      if (current && !current.placement && current.phase !== 'ready') this.#db.cas(id, generation, current.phase, 'unknown');
     }
-    return this.#result(this.#db.get(id)!);
+    const final = this.#db.get(id)!;
+    return this.#result(final);
   }
   #ownedWorkspace(key: string, handle: HerdrProvisioningHandle, projectPath: string): Promise<string> {
     const pending = this.#workspacePending.get(key);
@@ -185,6 +195,8 @@ export class HerdrManagedWorkspacesService {
     try {
       const state = await Promise.race([(async () => { if (fresh) await client.connect(); return client.recover(); })(), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Managed attach timed out.')), this.#timeout); })]);
       if (state.identity.appSessionId !== id || state.identity.ownerGeneration !== record.ownerGeneration || !state.providerSessionId) throw new Error('Managed host identity mismatch.');
+      const current = this.#db.get(id);
+      if (!current?.placement || (current.providerSessionId !== null && current.providerSessionId !== state.providerSessionId)) throw new Error('Managed host placement is not published.');
       this.#db.projectReady(id, record.ownerGeneration, state.providerSessionId);
       this.#clients.set(id, client); return client;
     } catch (error) { client.close(); this.#clients.delete(id); throw error; }

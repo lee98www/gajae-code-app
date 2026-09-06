@@ -421,6 +421,8 @@ export class HerdrClient {
       const workspaceId = herdrPaneIdSchema.parse(workspace.workspace_id);
       const tabId = herdrPaneIdSchema.parse(tab.tab_id);
       if (tab.workspace_id !== workspaceId || pane.workspace_id !== workspaceId || pane.tab_id !== tabId || workspace.active_tab_id !== tabId ||
+        workspace.focused || tab.focused || pane.focused ||
+        (pane.cwd !== '' && pane.cwd !== cwd) ||
         !tabId.startsWith(`${workspaceId}:t`) || !pane.pane_id.startsWith(`${workspaceId}:p`)) throw new Error('Workspace receipt mapping mismatch.');
       return Object.freeze({ workspaceId, tabId, paneId: pane.pane_id, terminalId: pane.terminal_id });
     }, signal, guard);
@@ -453,7 +455,8 @@ export class HerdrClient {
     const tabs = snapshot.tabs.filter((t) => t.tab_id === receipt.tabId);
     const panes = snapshot.panes.filter((p) => p.pane_id === receipt.paneId);
     if (workspaces.length !== 1 || tabs.length !== 1 || tabs[0]!.workspace_id !== workspaceId || panes.length !== 1 ||
-      panes[0]!.workspace_id !== workspaceId || panes[0]!.tab_id !== receipt.tabId) {
+      panes[0]!.workspace_id !== workspaceId || panes[0]!.tab_id !== receipt.tabId || workspaces[0]!.focused || tabs[0]!.focused ||
+      panes[0]!.focused || (panes[0]!.cwd !== '' && panes[0]!.cwd !== cwd)) {
       throw new HerdrError('HERDR_INVALID_RESPONSE', 502, 'Herdr layout mapping is unknown.');
     }
     return Object.freeze({ workspaceId, ...receipt, terminalId: panes[0]!.terminal_id });

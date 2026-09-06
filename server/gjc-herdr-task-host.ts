@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { lstatSync, realpathSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
@@ -11,7 +12,7 @@ import { closeConnection, getConnection, getDatabasePath } from '@/modules/datab
 import { herdrManagedDb } from '@/modules/database/repositories/herdr-managed.db.js';
 import { herdrManagedProvisionDb } from '@/modules/database/repositories/herdr-managed-provision.db.js';
 import { herdrManagedSnapshotsDb } from '@/modules/database/repositories/herdr-managed-snapshots.db.js';
-import { HerdrAgentReporter, type HerdrAgentReporterStatus } from '@/modules/herdr/index.js';
+import { HerdrAgentReporter, HerdrClient, type HerdrAgentReporterStatus, type HerdrWireSnapshot } from '@/modules/herdr/index.js';
 
 import { verifyManagedBridgeReceipt, verifyManagedBridgeTarget, type HerdrManagedBridgeResolveRequest } from '../shared/herdr-managed-bridge.js';
 import type { HerdrManagedChildAutomationControl, ManagedChildEvent, ManagedChildRequest, ManagedChildTurnOptions } from '../shared/herdr-managed-child-protocol.js';
@@ -35,6 +36,7 @@ import { ManagedAutomationStore, automationCanonical } from './gjc-herdr-automat
 import { ManagedChildTransport } from './gjc-herdr-child-client.js';
 import { acquireConsoleTerminal, ConsoleInputDecoder, ConsoleOutputWriter, parseConsoleLine, renderConsoleReceipt, renderConsoleReject, renderRequest, renderEvent } from './gjc-herdr-task-console.js';
 
+const MANAGED_UNCONFIRMED_CLOSURE = 'Managed owner closure unconfirmed.';
 
 export type ManagedSdkSession = {
   providerSessionId: string;
@@ -73,17 +75,91 @@ export type HerdrTaskHostBootstrap = {
 export type HerdrTaskHostOptions = {
   bootstrap: HerdrTaskHostBootstrap;
   createSession?: ManagedSdkSessionFactory;
+  /** Import-only seam; production main captures its inherited launch environment. */
+  launchEnvironment?: NodeJS.ProcessEnv;
 };
+
+type ManagedLaunchIdentity = Readonly<{ workspaceId: string; tabId: string; paneId: string }>;
+
+const HERDR_WORKSPACE_ID_ENV = 'HERDR_WORKSPACE_ID';
+const HERDR_TAB_ID_ENV = 'HERDR_TAB_ID';
+const HERDR_PANE_ID_ENV = 'HERDR_PANE_ID';
+const HERDR_PUBLIC_ID = '[1-9A-HJKMNP-TV-Z0]+';
+const HERDR_WORKSPACE_ID = new RegExp(`^w${HERDR_PUBLIC_ID}$`);
+const HERDR_TERMINAL_ID = /^[A-Za-z0-9._:-]{1,240}$/;
+
+function launchIdentity(environment: NodeJS.ProcessEnv): ManagedLaunchIdentity {
+  const workspaceId = environment[HERDR_WORKSPACE_ID_ENV];
+  const tabId = environment[HERDR_TAB_ID_ENV];
+  const paneId = environment[HERDR_PANE_ID_ENV];
+  if (typeof workspaceId !== 'string' || typeof tabId !== 'string' || typeof paneId !== 'string'
+    || workspaceId.length > 160 || tabId.length > 160 || paneId.length > 160
+    || !HERDR_WORKSPACE_ID.test(workspaceId)
+    || !new RegExp(`^${workspaceId}:t${HERDR_PUBLIC_ID}$`).test(tabId)
+    || !new RegExp(`^${workspaceId}:p${HERDR_PUBLIC_ID}$`).test(paneId)) {
+    throw new Error('Managed Herdr launch identity is missing or invalid.');
+  }
+  return Object.freeze({ workspaceId, tabId, paneId });
+}
+
+function endpointIdentity(endpoint: { canonicalPath: string; dev: number; inode: number }): void {
+  let stat: ReturnType<typeof lstatSync>;
+  try {
+    stat = lstatSync(endpoint.canonicalPath);
+    if (!path.isAbsolute(endpoint.canonicalPath) || realpathSync(endpoint.canonicalPath) !== endpoint.canonicalPath
+      || !stat.isSocket() || (typeof process.getuid === 'function' && stat.uid !== process.getuid())
+      || stat.dev !== endpoint.dev || stat.ino !== endpoint.inode) throw new Error('Managed Herdr endpoint identity changed.');
+  } catch {
+    throw new Error('Managed Herdr endpoint identity changed.');
+  }
+}
+
+type ManagedPlacement = { sessionName: string; workspaceId: string; tabId: string; paneId: string; terminalId: string };
+type ManagedObservedPlacement =
+  | { pending: true; placement: null }
+  | { pending: false; placement: ManagedPlacement };
+
+function sameLaunchPlacement(left: ManagedPlacement, right: ManagedPlacement): boolean {
+  return left.sessionName === right.sessionName
+    && left.workspaceId === right.workspaceId
+    && left.tabId === right.tabId
+    && left.paneId === right.paneId
+    && left.terminalId === right.terminalId;
+}
+
+function placementFromSnapshot(snapshot: HerdrWireSnapshot, identity: ManagedLaunchIdentity, sessionName: string): ManagedObservedPlacement {
+  const workspaces = snapshot.workspaces.filter(workspace => workspace.workspace_id === identity.workspaceId);
+  const tabs = snapshot.tabs.filter(tab => tab.tab_id === identity.tabId);
+  const panes = snapshot.panes.filter(pane => pane.pane_id === identity.paneId);
+  if (workspaces.length === 0 || tabs.length === 0 || panes.length === 0) return { pending: true, placement: null };
+  if (workspaces.length !== 1 || tabs.length !== 1 || panes.length !== 1
+    || tabs[0]!.workspace_id !== identity.workspaceId
+    || panes[0]!.workspace_id !== identity.workspaceId
+    || panes[0]!.tab_id !== identity.tabId
+    || !HERDR_TERMINAL_ID.test(panes[0]!.terminal_id)) throw new Error('Managed Herdr launch placement mismatch.');
+  return {
+    pending: false,
+    placement: {
+      sessionName,
+      workspaceId: identity.workspaceId,
+      tabId: identity.tabId,
+      paneId: identity.paneId,
+      terminalId: panes[0]!.terminal_id,
+    },
+  };
+}
 
 export class HerdrTaskHost {
   readonly #bootstrap: HerdrTaskHostBootstrap;
   readonly #createSession: ManagedSdkSessionFactory;
   #session: ManagedSdkSession | null = null;
   #attachServer: net.Server | null = null;
+  #attachSocketIdentity: { dev: number; ino: number } | null = null;
   #clients = new Map<net.Socket, { connectionId: string; cursor: number | null; snapshotId: string | null; blocked: boolean }>();
   #connections = new Set<net.Socket>();
   #closed = false;
   #closeTask: Promise<void> | null = null;
+  #failedStartupTask: Promise<void> | null = null;
   readonly #closeResources = new Set<() => void>();
   readonly #turnTasks = new Set<Promise<HerdrManagedCommandReceipt>>();
   #abortFence = 0;
@@ -101,10 +177,16 @@ export class HerdrTaskHost {
   #listeners = new Set<(event: HerdrManagedEvent) => void>();
   #broadcastSeq = 0;
   #dispatching = new Map<string, { command: HerdrManagedCommand; result: Promise<HerdrManagedCommandReceipt> }>();
+  #sessionClosed = false;
+  #claimStarted = false;
+  readonly #launchEnvironment: NodeJS.ProcessEnv;
 
   constructor(options: HerdrTaskHostOptions) {
     this.#bootstrap = options.bootstrap;
     this.#createSession = options.createSession ?? createManagedGjcSdkSessionFactory(options.bootstrap);
+    // Copy synchronously so a production launcher cannot observe a later
+    // mutation of process.env while the durable claim is being acquired.
+    this.#launchEnvironment = { ...(options.launchEnvironment ?? process.env) };
   }
 
   get session(): ManagedSdkSession | null { return this.#session; }
@@ -112,77 +194,148 @@ export class HerdrTaskHost {
 
   async initialize(): Promise<HerdrManagedHostHello> {
     if (this.#session) throw new Error('Managed Herdr task host already initialized.');
-    if (this.#bootstrap.databasePath) {
-      if (path.resolve(getDatabasePath()) !== this.#bootstrap.databasePath) throw new Error('Managed database identity mismatch.');
-      // Normal App startup owns migrations. A detached host checks the existing
-      // schema and claim only; it must never migrate storage while App is absent.
-      const database = getConnection({ existingOnly: true });
-      for (const sql of [
-        'SELECT owner_generation, provider_session_id, lifecycle, last_seq FROM herdr_managed_bindings LIMIT 0',
-        'SELECT owner_generation, state_json FROM herdr_managed_state LIMIT 0',
-        'SELECT claim_nonce, launch_claimed, phase FROM herdr_managed_provisions LIMIT 0',
-        'SELECT owner_generation, request_json, policy_revision, status FROM herdr_managed_decisions LIMIT 0',
-        'SELECT owner_generation, action_id, payload_hash, state FROM herdr_managed_commands LIMIT 0',
-        'SELECT owner_generation, seq, payload_json FROM herdr_managed_events LIMIT 0',
-        'SELECT snapshot_id, pages_json, lease_expires_at FROM herdr_managed_snapshots LIMIT 0',
-        'SELECT project_path, revision FROM project_permission_revisions LIMIT 0',
-      ]) database.prepare(sql).all();
-      if (!this.#bootstrap.claimNonce) throw new Error('Managed launch nonce is required.');
-      herdrManagedProvisionDb.claimLaunch(this.#bootstrap.appSessionId, this.#bootstrap.ownerGeneration, this.#bootstrap.claimNonce);
-    } else {
-      await initializeDatabase();
+    try {
+      const production = Boolean(this.#bootstrap.databasePath);
+      let launch: ManagedLaunchIdentity | null = null;
+      if (this.#bootstrap.databasePath) {
+        if (path.resolve(getDatabasePath()) !== this.#bootstrap.databasePath) throw new Error('Managed database identity mismatch.');
+        // Normal App startup owns migrations. A detached host checks the existing
+        // schema and claim only; it must never migrate storage while App is absent.
+        const database = getConnection({ existingOnly: true });
+        for (const sql of [
+          'SELECT owner_generation, provider_session_id, lifecycle, last_seq FROM herdr_managed_bindings LIMIT 0',
+          'SELECT owner_generation, state_json FROM herdr_managed_state LIMIT 0',
+          'SELECT claim_nonce, launch_claimed, phase FROM herdr_managed_provisions LIMIT 0',
+          'SELECT owner_generation, request_json, policy_revision, status FROM herdr_managed_decisions LIMIT 0',
+          'SELECT owner_generation, action_id, payload_hash, state FROM herdr_managed_commands LIMIT 0',
+          'SELECT owner_generation, seq, payload_json FROM herdr_managed_events LIMIT 0',
+          'SELECT snapshot_id, pages_json, lease_expires_at FROM herdr_managed_snapshots LIMIT 0',
+          'SELECT project_path, revision FROM project_permission_revisions LIMIT 0',
+        ]) database.prepare(sql).all();
+        if (!this.#bootstrap.claimNonce) throw new Error('Managed launch nonce is required.');
+        // Validate the captured launch identity before consuming the nonce, but
+        // preserve schema-only startup diagnostics for incompatible storage.
+        launch = launchIdentity(this.#launchEnvironment);
+        herdrManagedProvisionDb.claimLaunch(this.#bootstrap.appSessionId, this.#bootstrap.ownerGeneration, this.#bootstrap.claimNonce);
+      } else {
+        await initializeDatabase();
+      }
+      herdrManagedDb.beginClaim(this.#bootstrap.appSessionId, this.#bootstrap.ownerGeneration);
+      this.#claimStarted = true;
+      const placement = production && launch ? await this.#captureHostPlacement(launch) : null;
+      const session = await this.#createSession({
+        appSessionId: this.#bootstrap.appSessionId,
+        ownerGeneration: this.#bootstrap.ownerGeneration,
+        cwd: this.#bootstrap.projectPath,
+        sessionRoot: this.#bootstrap.sessionRoot,
+        onEvent: (event) => this.#journalEvent(event),
+      });
+      this.#session = session;
+      this.#providerSessionId = session.providerSessionId;
+      if (production && launch && placement) await this.#verifyHostPlacement(launch, placement);
+      const hello = {
+        protocolVersion: HERDR_MANAGED_PROTOCOL_VERSION,
+        appSessionId: this.#bootstrap.appSessionId,
+        ownerGeneration: this.#bootstrap.ownerGeneration,
+        providerSessionId: session.providerSessionId,
+      } satisfies HerdrManagedHostHello;
+      herdrManagedDb.claim(hello);
+      if (production) herdrManagedProvisionDb.projectReady(hello.appSessionId, hello.ownerGeneration, hello.providerSessionId);
+      herdrManagedDb.appendEvent({ appSessionId: hello.appSessionId, ownerGeneration: hello.ownerGeneration, kind: 'host.ready', payload: { providerSessionId: hello.providerSessionId } });
+      herdrManagedDb.setLifecycle(hello.appSessionId, hello.ownerGeneration, 'idle');
+      this.#agentReporter = new HerdrAgentReporter({
+        appSessionId: hello.appSessionId,
+        ownerGeneration: hello.ownerGeneration,
+        providerSessionId: hello.providerSessionId,
+      });
+      this.#agentReporter.start();
+      this.#broadcast();
+      this.#policyTimer = setInterval(() => { void this.#refreshPolicy(); }, 1000);
+      this.#policyTimer.unref();
+      return hello;
+    } catch (error) {
+      await this.#cleanupFailedStartup();
+      throw error;
     }
-    herdrManagedDb.beginClaim(this.#bootstrap.appSessionId, this.#bootstrap.ownerGeneration);
-    const session = await this.#createSession({
-      appSessionId: this.#bootstrap.appSessionId,
-      ownerGeneration: this.#bootstrap.ownerGeneration,
-      cwd: this.#bootstrap.projectPath,
-      sessionRoot: this.#bootstrap.sessionRoot,
-      onEvent: (event) => this.#journalEvent(event),
-    });
-    this.#session = session;
-    this.#providerSessionId = session.providerSessionId;
-    const hello = {
-      protocolVersion: HERDR_MANAGED_PROTOCOL_VERSION,
-      appSessionId: this.#bootstrap.appSessionId,
-      ownerGeneration: this.#bootstrap.ownerGeneration,
-      providerSessionId: session.providerSessionId,
-    } satisfies HerdrManagedHostHello;
-    herdrManagedDb.claim(hello);
-    herdrManagedDb.appendEvent({ appSessionId: hello.appSessionId, ownerGeneration: hello.ownerGeneration, kind: 'host.ready', payload: { providerSessionId: hello.providerSessionId } });
-    herdrManagedDb.setLifecycle(hello.appSessionId, hello.ownerGeneration, 'idle');
-    this.#agentReporter = new HerdrAgentReporter({
-      appSessionId: hello.appSessionId,
-      ownerGeneration: hello.ownerGeneration,
-      providerSessionId: hello.providerSessionId,
-    });
-    this.#agentReporter.start();
-    this.#broadcast();
-    this.#policyTimer = setInterval(() => { void this.#refreshPolicy(); }, 1000);
-    this.#policyTimer.unref();
-    return hello;
   }
 
   async startPrivateAttachServer(): Promise<string> {
-    if (!this.#bootstrap.attachSocketPath || !this.#bootstrap.attachSecret) throw new Error('Managed Herdr attach socket is not configured.');
-    if (this.#attachServer) return this.#bootstrap.attachSocketPath;
-    const parent = path.dirname(this.#bootstrap.attachSocketPath);
-    await fs.mkdir(parent, { recursive: true, mode: 0o700 });
-    const stat = await fs.lstat(parent);
-    if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || (process.getuid && stat.uid !== process.getuid())) throw new Error('Unsafe attach directory.');
-    try {
-      await fs.lstat(this.#bootstrap.attachSocketPath);
-      throw new Error('Attach target already exists.');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    if (!this.#bootstrap.attachSocketPath || !this.#bootstrap.attachSecret) {
+      const error = new Error('Managed Herdr attach socket is not configured.');
+      await this.#cleanupFailedStartup();
+      throw error;
     }
-    this.#attachServer = net.createServer((socket) => this.#handleAttach(socket));
-    await new Promise<void>((resolve, reject) => {
-      this.#attachServer?.once('error', reject);
-      this.#attachServer?.listen(this.#bootstrap.attachSocketPath, () => resolve());
-    });
-    await fs.chmod(this.#bootstrap.attachSocketPath, 0o600);
-    return this.#bootstrap.attachSocketPath;
+    if (this.#attachServer) return this.#bootstrap.attachSocketPath;
+    try {
+      // Some platforms silently truncate over-long sun_path values, which would bind a
+      // different file than the one recorded in the private bootstrap.
+      if (Buffer.byteLength(this.#bootstrap.attachSocketPath) > (process.platform === 'darwin' ? 103 : 107)) throw new Error('Managed attach socket path is too long.');
+      const parent = path.dirname(this.#bootstrap.attachSocketPath);
+      await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+      const stat = await fs.lstat(parent);
+      if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || (process.getuid && stat.uid !== process.getuid())) throw new Error('Unsafe attach directory.');
+      try {
+        await fs.lstat(this.#bootstrap.attachSocketPath);
+        throw new Error('Attach target already exists.');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      this.#attachServer = net.createServer((socket) => this.#handleAttach(socket));
+      await new Promise<void>((resolve, reject) => {
+        this.#attachServer?.once('error', reject);
+        this.#attachServer?.listen(this.#bootstrap.attachSocketPath, () => resolve());
+      });
+      const socketStat = await fs.lstat(this.#bootstrap.attachSocketPath);
+      if (!socketStat.isSocket()) throw new Error('Managed attach target is not a socket.');
+      this.#attachSocketIdentity = { dev: socketStat.dev, ino: socketStat.ino };
+      await fs.chmod(this.#bootstrap.attachSocketPath, 0o600);
+      return this.#bootstrap.attachSocketPath;
+    } catch (error) {
+      await this.#cleanupFailedStartup();
+      throw error;
+    }
+  }
+
+  async #captureHostPlacement(identity: ManagedLaunchIdentity): Promise<ManagedPlacement> {
+    // The process-injected IDs are the only launch provenance available to the
+    // detached owner. App labels, focus and pane metadata never participate.
+    const record = herdrManagedProvisionDb.get(this.#bootstrap.appSessionId);
+    if (!record || record.ownerGeneration !== this.#bootstrap.ownerGeneration || !record.workspaceId
+      || record.workspaceId !== identity.workspaceId || record.selectedSessionName !== this.#bootstrap.herdrInstanceId) {
+      throw new Error('Managed launch workspace intent mismatch.');
+    }
+    if (record.placement && (record.placement.workspaceId !== identity.workspaceId
+      || record.placement.tabId !== identity.tabId || record.placement.paneId !== identity.paneId)) {
+      throw new Error('Managed launch placement intent mismatch.');
+    }
+    endpointIdentity(record.endpoint);
+    const client = new HerdrClient(record.endpoint.canonicalPath);
+    const guard = { admit: async () => { endpointIdentity(record.endpoint); }, check: () => { endpointIdentity(record.endpoint); } };
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      endpointIdentity(record.endpoint);
+      const snapshot = await client.snapshot(undefined, guard);
+      endpointIdentity(record.endpoint);
+      const observed = placementFromSnapshot(snapshot, identity, record.selectedSessionName);
+      if (!observed.pending) {
+        herdrManagedProvisionDb.recordHostPlacement(this.#bootstrap.appSessionId, this.#bootstrap.ownerGeneration, observed.placement);
+        return observed.placement;
+      }
+      if (Date.now() >= deadline) throw new Error('Managed launch placement is not visible.');
+      await new Promise(resolve => setTimeout(resolve, Math.min(50, Math.max(1, deadline - Date.now()))));
+    }
+  }
+
+  async #verifyHostPlacement(identity: ManagedLaunchIdentity, expected: ManagedPlacement): Promise<void> {
+    const record = herdrManagedProvisionDb.get(this.#bootstrap.appSessionId);
+    if (!record || record.ownerGeneration !== this.#bootstrap.ownerGeneration || !record.workspaceId
+      || record.workspaceId !== identity.workspaceId || record.selectedSessionName !== expected.sessionName) throw new Error('Managed launch workspace intent mismatch.');
+    endpointIdentity(record.endpoint);
+    const guard = { admit: async () => { endpointIdentity(record.endpoint); }, check: () => { endpointIdentity(record.endpoint); } };
+    const snapshot = await new HerdrClient(record.endpoint.canonicalPath).snapshot(undefined, guard);
+    endpointIdentity(record.endpoint);
+    const observed = placementFromSnapshot(snapshot, identity, expected.sessionName);
+    if (observed.pending || !sameLaunchPlacement(observed.placement, expected)) throw new Error('Managed launch placement changed.');
   }
 
   async dispatch(command: HerdrManagedCommand): Promise<HerdrManagedCommandReceipt> {
@@ -265,6 +418,54 @@ export class HerdrTaskHost {
     return task;
   }
 
+  /**
+   * A failed prompt has an ambiguous SDK outcome. Keep the command and turn
+   * receipt in the same SQLite write as the owner fence, with the receipt
+   * transition first while the owner is still writable. This prevents an
+   * executing command from being stranded when the subsequent writer fence
+   * correctly rejects ordinary SDK events.
+   */
+  #recordUnknownTurn(parsed: HerdrManagedCommand): HerdrManagedCommandReceipt {
+    let receipt: HerdrManagedCommandReceipt | undefined;
+    getConnection().transaction(() => {
+      receipt = herdrManagedDb.transitionCommand({
+        appSessionId: parsed.appSessionId,
+        ownerGeneration: parsed.ownerGeneration,
+        actionId: parsed.actionId,
+        state: 'unknown',
+        message: 'Prompt outcome is unknown.',
+      });
+      const state = herdrManagedDb.snapshot(parsed.appSessionId, parsed.ownerGeneration);
+      if (state.activeTurnId === parsed.actionId) {
+        herdrManagedDb.appendEvent({
+          appSessionId: parsed.appSessionId,
+          ownerGeneration: parsed.ownerGeneration,
+          kind: 'managed.turn',
+          payload: {
+            turnId: parsed.actionId,
+            state: { ...(state.turns[parsed.actionId] ?? {}), status: 'unknown', outcome: 'unknown' },
+          },
+        });
+        herdrManagedDb.appendEvent({
+          appSessionId: parsed.appSessionId,
+          ownerGeneration: parsed.ownerGeneration,
+          kind: 'managed.session',
+          payload: { activeTurnId: null },
+        });
+      }
+      herdrManagedDb.pauseQueue(parsed.appSessionId, parsed.ownerGeneration);
+      herdrManagedDb.appendEvent({
+        appSessionId: parsed.appSessionId,
+        ownerGeneration: parsed.ownerGeneration,
+        kind: 'command.unknown',
+        payload: { actionId: parsed.actionId },
+      });
+      herdrManagedDb.setLifecycle(parsed.appSessionId, parsed.ownerGeneration, 'unknown');
+    }).immediate();
+    if (!receipt) throw new Error('Managed unknown command receipt was not committed.');
+    return receipt;
+  }
+
   async #run(parsed: HerdrManagedCommand): Promise<HerdrManagedCommandReceipt> {
     try {
       this.#broadcast();
@@ -281,9 +482,7 @@ export class HerdrTaskHost {
         herdrManagedDb.finishTurn(parsed.appSessionId, parsed.ownerGeneration, parsed.actionId, { aborted: true });
         return settled;
       }
-      herdrManagedDb.setLifecycle(parsed.appSessionId, parsed.ownerGeneration, 'unknown');
-      herdrManagedDb.transitionCommand({ appSessionId: parsed.appSessionId, ownerGeneration: parsed.ownerGeneration, actionId: parsed.actionId, state: 'unknown', message: 'Prompt outcome is unknown.' });
-      herdrManagedDb.appendEvent({ appSessionId: parsed.appSessionId, ownerGeneration: parsed.ownerGeneration, kind: 'command.unknown', payload: { actionId: parsed.actionId } });
+      this.#recordUnknownTurn(parsed);
       throw error;
     } finally {
       this.#broadcast();
@@ -510,19 +709,46 @@ export class HerdrTaskHost {
     return { identity: operation.identity, capabilityGeneration: capability, approvalRequestId: operation.approvalRequestId, decision };
   }
 
-  async #resume(command: HerdrManagedCommand): Promise<HerdrManagedCommandReceipt> {
-    await this.#capabilityControls;
+  #resume(command: HerdrManagedCommand): Promise<HerdrManagedCommandReceipt> {
+    const result = this.#capabilityControls.then(() => this.#resumeNow(command));
+    this.#capabilityControls = result.catch(() => {});
+    return result;
+  }
+
+  async #resumeNow(command: HerdrManagedCommand): Promise<HerdrManagedCommandReceipt> {
     const payload = isObject(command.payload) ? command.payload : {};
     const identity = isObject(payload.identity) ? payload.identity : {};
     const operation = this.snapshot().automation[String(identity.operationId)];
     const reject = () => herdrManagedDb.recordCommand({ ...command, state: 'rejected' as const, message: 'Resume target invalid or stale.' });
     if (!operation || operation.phase !== 'awaiting_reattach_approval' || automationCanonical(operation.identity) !== automationCanonical(identity) || payload.approvalRequestId !== operation.approvalRequestId || payload.capabilityGeneration !== operation.capabilityGeneration || operation.identity.policyRevision !== herdrManagedDb.currentPolicy(command.appSessionId, command.ownerGeneration).revision) return reject();
-    if (payload.decision === 'deny') return herdrManagedDb.recordCommand({ ...command, state: 'settled', message: 'Resume denied; operation remains waiting.' });
     const capability = this.#operationCapabilities.get(operation.identity.operationId);
-    if (payload.decision !== 'approve' || !capability || !this.#session?.automationControl || capability.capabilityGeneration !== operation.capabilityGeneration) return reject();
+    if (!capability || !this.#session?.automationControl || capability.capabilityGeneration !== operation.capabilityGeneration) return reject();
+    const approvalRequestId = operation.approvalRequestId;
+    if (payload.decision === 'deny') {
+      herdrManagedDb.recordCommand({ ...command, state: 'executing', message: 'Resume denial dispatched.' });
+      let consumed = false;
+      try {
+        consumed = await this.#session.automationControl({
+          type: 'resume-denied',
+          actionId: command.actionId,
+          identity: operation.identity,
+          capabilityGeneration: operation.capabilityGeneration!,
+          approvalRequestId: approvalRequestId!,
+        });
+      } catch {
+        // The genuine approval ID was not durably consumed; never report a
+        // settled denial that could race a competing approval.
+      }
+      return herdrManagedDb.transitionCommand({
+        ...command,
+        state: consumed ? 'settled' : 'unknown',
+        message: consumed ? 'Resume denied; operation remains waiting.' : 'Resume denial outcome unknown.',
+      });
+    }
+    if (payload.decision !== 'approve') return reject();
     herdrManagedDb.recordCommand({ ...command, state: 'executing', message: 'Resume dispatched.' });
     let accepted = false;
-    try { accepted = await this.#session.automationControl({ type: 'resume-approved', actionId: command.actionId, identity: operation.identity, capabilityGeneration: operation.capabilityGeneration!, approvalRequestId: operation.approvalRequestId! }); } catch {
+    try { accepted = await this.#session.automationControl({ type: 'resume-approved', actionId: command.actionId, identity: operation.identity, capabilityGeneration: operation.capabilityGeneration!, approvalRequestId: approvalRequestId! }); } catch {
       // A possibly dispatched automation operation must not be retried or called settled.
     }
     return herdrManagedDb.transitionCommand({ ...command, state: accepted ? 'settled' : 'unknown', message: accepted ? 'Resume accepted.' : 'Resume outcome unknown.' });
@@ -669,6 +895,98 @@ export class HerdrTaskHost {
     return herdrManagedDb.snapshot(this.#bootstrap.appSessionId, this.#bootstrap.ownerGeneration);
   }
 
+  async #disposeOwnedSession(): Promise<boolean> {
+    if (this.#sessionClosed) return true;
+    if (!this.#session) {
+      this.#sessionClosed = true;
+      return true;
+    }
+    try {
+      await this.#session.dispose?.();
+      this.#sessionClosed = true;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  #fenceInterrupted(): void {
+    if (!this.#claimStarted) return;
+    const binding = (() => {
+      try { return herdrManagedDb.get(this.#bootstrap.appSessionId, this.#bootstrap.ownerGeneration); }
+      catch { return null; }
+    })();
+    if (!binding || binding.lifecycle === 'closed') return;
+    if (binding.providerSessionId !== null && binding.providerSessionId !== this.#providerSessionId) return;
+    try { herdrManagedDb.setLifecycle(this.#bootstrap.appSessionId, this.#bootstrap.ownerGeneration, 'interrupted'); } catch { /* An existing unknown/closed fence remains authoritative. */ }
+  }
+
+  #ownsBinding(): boolean {
+    try {
+      const binding = herdrManagedDb.get(this.#bootstrap.appSessionId, this.#bootstrap.ownerGeneration);
+      return Boolean(binding && binding.lifecycle !== 'closed' && this.#providerSessionId
+        && binding.providerSessionId === this.#providerSessionId);
+    } catch { return false; }
+  }
+
+  #closureProof(): {
+    appSessionId: string;
+    ownerGeneration: string;
+    providerSessionId: string;
+    childClosed: true;
+  } | undefined {
+    if (!this.#providerSessionId || !this.#sessionClosed) return undefined;
+    return {
+      appSessionId: this.#bootstrap.appSessionId,
+      ownerGeneration: this.#bootstrap.ownerGeneration,
+      providerSessionId: this.#providerSessionId,
+      childClosed: true,
+    };
+  }
+
+  async #removeOwnedAttachSocket(): Promise<void> {
+    const socketPath = this.#bootstrap.attachSocketPath;
+    const identity = this.#attachSocketIdentity;
+    if (!socketPath || !identity) return;
+    this.#attachSocketIdentity = null;
+    try {
+      const stat = await fs.lstat(socketPath);
+      if (stat.isSocket() && stat.dev === identity.dev && stat.ino === identity.ino) await fs.unlink(socketPath);
+    } catch { /* A replaced or already absent socket is never unlinked. */ }
+  }
+
+  async #cleanupFailedStartup(): Promise<void> {
+    if (this.#failedStartupTask) return this.#failedStartupTask;
+    const task = (async () => {
+      this.#closed = true;
+      for (const dispose of this.#closeResources) {
+        try { dispose(); } catch { /* Failed startup cleanup remains fenced below. */ }
+      }
+      this.#closeResources.clear();
+      if (this.#policyTimer) clearInterval(this.#policyTimer);
+      await this.#agentReporter?.quiesce();
+      for (const client of this.#connections) client.destroy();
+      await new Promise<void>((resolve) => this.#attachServer?.close(() => resolve()) ?? resolve());
+      await this.#removeOwnedAttachSocket();
+      await this.#capabilityControls;
+      const childClosed = await this.#disposeOwnedSession();
+      await Promise.allSettled([...this.#turnTasks, ...[...this.#dispatching.values()].map(value => value.result)]);
+      if (childClosed) {
+        const proof = this.#closureProof();
+        if (proof) {
+          try { await this.#agentReporter?.release(proof); } catch { /* Reporter failure remains fenced below. */ }
+        }
+      }
+      this.#store?.capability(null);
+      this.#store?.close();
+      // Startup failure is an interrupted owner, never a synthetic closed
+      // claim. Exact generation/provider checks fence only this owner.
+      this.#fenceInterrupted();
+    })();
+    this.#failedStartupTask = task;
+    return task;
+  }
+
   close(): Promise<void> {
     return this.#closeTask ??= this.#close();
   }
@@ -682,23 +1000,45 @@ export class HerdrTaskHost {
   async #close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    let cleanupFailed = false;
     for (const dispose of this.#closeResources) {
-      try { dispose(); } catch { /* Resource cleanup cannot replace the owner close result. */ }
+      try { dispose(); } catch { cleanupFailed = true; }
     }
     this.#closeResources.clear();
     if (this.#policyTimer) clearInterval(this.#policyTimer);
-    await this.#agentReporter?.quiesce();
+    try { await this.#agentReporter?.quiesce(); } catch { cleanupFailed = true; }
     for (const client of this.#connections) client.destroy();
     await new Promise<void>((resolve) => this.#attachServer?.close(() => resolve()) ?? resolve());
-    await this.#capabilityControls;
-    await this.#session?.dispose?.();
+    await this.#removeOwnedAttachSocket();
+    try { await this.#capabilityControls; } catch { cleanupFailed = true; }
+    let childClosed = false;
+    try { childClosed = await this.#disposeOwnedSession(); } catch { cleanupFailed = true; }
     await Promise.allSettled([...this.#turnTasks, ...[...this.#dispatching.values()].map(value => value.result)]);
-    this.#store?.capability(null);
-    this.#store?.close();
-    herdrManagedDb.setLifecycle(this.#bootstrap.appSessionId, this.#bootstrap.ownerGeneration, 'closed');
-    // Native writer and private child closure are confirmed before releasing
-    // only this generation's source. A replaced/missing pane is never touched.
-    await this.#agentReporter?.release();
+    try { this.#store?.capability(null); } catch { cleanupFailed = true; }
+    try { this.#store?.close(); } catch { cleanupFailed = true; }
+    // Native writer/child closure and exact reporter cleanup must precede the
+    // closed lifecycle admission. A failed cleanup remains visibly fenced.
+    let reporterClean = !this.#agentReporter;
+    if (this.#agentReporter && childClosed) {
+      try { reporterClean = await this.#agentReporter.release(this.#closureProof()); }
+      catch { reporterClean = false; cleanupFailed = true; }
+    }
+    const ownsBinding = this.#ownsBinding();
+    let lifecycleClosed = false;
+    if (childClosed && reporterClean && ownsBinding) {
+      try {
+        herdrManagedDb.setLifecycle(this.#bootstrap.appSessionId, this.#bootstrap.ownerGeneration, 'closed');
+        lifecycleClosed = true;
+      } catch {
+        cleanupFailed = true;
+      }
+    }
+    if (!lifecycleClosed) {
+      this.#fenceInterrupted();
+    }
+    if (!childClosed || !reporterClean || !ownsBinding || cleanupFailed || !lifecycleClosed) {
+      throw new Error(MANAGED_UNCONFIRMED_CLOSURE);
+    }
   }
 }
 
@@ -743,7 +1083,24 @@ export function createManagedGjcSdkSessionFactory(bootstrap: HerdrTaskHostBootst
     const bunPath = fileURLToPath(new URL(compiled ? '../../dist-native/bun' : '../dist-native/bun', import.meta.url));
     const childPath = fileURLToPath(new URL(compiled ? './gjc-herdr-managed-child.js' : './gjc-herdr-managed-child.ts', import.meta.url));
     const child = spawn(bunPath, [childPath], { stdio: ['pipe', 'pipe', 'pipe'], env: managedChildEnvironment(process.env) });
-    return initializeManagedChildSession(child, { appSessionId, ownerGeneration, onEvent, agentDir: bootstrap.agentDir, runConfig: bootstrap.runConfig });
+    try {
+      return await initializeManagedChildSession(child, { appSessionId, ownerGeneration, onEvent, agentDir: bootstrap.agentDir, runConfig: bootstrap.runConfig });
+    } catch (error) {
+      // The factory owns the child even when initialization never returns a
+      // session object. Confirm its exit before the host fences the claim.
+      if (child.exitCode === null) {
+        child.kill();
+        await new Promise<void>(resolve => {
+          const timer = setTimeout(() => {
+            if (child.exitCode === null) child.kill('SIGKILL');
+            resolve();
+          }, 5_000);
+          timer.unref();
+          child.once('exit', () => { clearTimeout(timer); resolve(); });
+        });
+      }
+      throw error;
+    }
   };
 }
 
@@ -799,11 +1156,11 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-export async function runHerdrTaskHostStdio(options: { bootstrap: HerdrTaskHostBootstrap; createSession?: ManagedSdkSessionFactory; input?: NodeJS.ReadableStream & { setEncoding?: (encoding: BufferEncoding) => void }; output?: NodeJS.WritableStream; error?: NodeJS.WritableStream }): Promise<HerdrTaskHost> {
+export async function runHerdrTaskHostStdio(options: { bootstrap: HerdrTaskHostBootstrap; createSession?: ManagedSdkSessionFactory; launchEnvironment?: NodeJS.ProcessEnv; input?: NodeJS.ReadableStream & { setEncoding?: (encoding: BufferEncoding) => void }; output?: NodeJS.WritableStream; error?: NodeJS.WritableStream }): Promise<HerdrTaskHost> {
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stdout;
   const terminal = acquireConsoleTerminal(input, output);
-  const host = new HerdrTaskHost({ bootstrap: options.bootstrap, createSession: options.createSession ?? createManagedGjcSdkSessionFactory(options.bootstrap) });
+  const host = new HerdrTaskHost({ bootstrap: options.bootstrap, createSession: options.createSession ?? createManagedGjcSdkSessionFactory(options.bootstrap), launchEnvironment: options.launchEnvironment });
   host.registerCloseResource(terminal.restore);
   let hello: Awaited<ReturnType<HerdrTaskHost['initialize']>>;
   try {
@@ -853,10 +1210,15 @@ export async function runHerdrTaskHostStdio(options: { bootstrap: HerdrTaskHostB
         }
         if (parsed.type === 'query') {
           if (parsed.query === 'status') {
-            writer.write(`STATUS ${host.snapshot().lifecycle} ${host.snapshot().watermark}`, 'critical');
+            const state = host.snapshot();
+            const queue = state.queue.entries.map(entry => entry.command.actionId).join(',') || '-';
+            const requests = Object.values(state.requests)
+              .filter(request => request.scope.status === undefined || request.scope.status === 'pending')
+              .map(request => request.requestId).join(',') || '-';
+            writer.write(`STATUS ${state.lifecycle} ${state.watermark} appSessionId=${state.identity.appSessionId} ownerGeneration=${state.identity.ownerGeneration} providerSessionId=${state.providerSessionId ?? '-'} activeTurnId=${state.activeTurnId ?? '-'} queue=${queue} requests=${requests}`, 'critical');
             if (terminal.active && host.agentPublication) writer.write(`HERDR_PUBLICATION ${host.agentPublication.status} ${host.agentPublication.seq}`, 'critical');
           }
-          else if (parsed.query === 'help') writer.write('COMMANDS prompt followup steer abort answer permission resume status ack', 'critical');
+          else if (parsed.query === 'help') writer.write('COMMANDS :prompt <id> <revision> "<text>" :followup <id> "<text>" :steer <id> <turn> "<text>" :abort <id> <turn> :answer :permission :resume :status :ack <id>', 'critical');
           else {
             const receipt = herdrManagedDb.getCommand(hello.appSessionId, hello.ownerGeneration, parsed.actionId!);
             writer.write(receipt ? renderConsoleReceipt(receipt.actionId, receipt.state, receipt.seq) : renderConsoleReject(parsed.actionId!, 'receipt_not_found'), 'critical');
@@ -915,10 +1277,13 @@ export function installHerdrTaskHostShutdown(host: HerdrTaskHost): () => void {
 async function main() {
   const bootstrapPath = process.argv[2];
   if (!bootstrapPath) throw new Error('Usage: gjc-herdr-task-host <bootstrap.json>');
+  // Herdr writes the pane identity into this process before exec. Capture it
+  // before any await/claim; the child SDK receives a strict whitelist instead.
+  const launchEnvironment = { ...process.env };
   const bootstrap = await readBootstrap(bootstrapPath);
   if (!bootstrap.databasePath || !bootstrap.claimNonce || !bootstrap.runConfig || !bootstrap.agentDir || !bootstrap.attachSocketPath || !bootstrap.attachSecret) throw new Error('Incomplete managed production bootstrap.');
   process.env.DATABASE_PATH = bootstrap.databasePath;
-  const host = await runHerdrTaskHostStdio({ bootstrap });
+  const host = await runHerdrTaskHostStdio({ bootstrap, launchEnvironment });
   installHerdrTaskHostShutdown(host);
 }
 

@@ -67,7 +67,17 @@ export type ManagedSdkRequest = {
   toolName?: string;
   options?: { optionId: string; kind: string }[];
 };
-export type ManagedDecision = { allow: boolean; always?: boolean; message?: string; updatedInput?: unknown };
+export type ManagedDecision = {
+  allow: boolean;
+  always?: boolean;
+  message?: string;
+  updatedInput?: unknown;
+  /** Durable metadata for a secret-tagged decision; never supplied by a caller. */
+  secret?: true;
+  secretPayloadHash?: string;
+  answerPresent?: boolean;
+  winnerActionId?: string;
+};
 export type ManagedPendingRequest = ManagedRequestIdentity & ManagedSdkRequest & {
   policyRevision: number;
   status: 'pending' | 'decided' | 'settled' | 'unknown' | 'cancelled';
@@ -89,6 +99,73 @@ function publicRequestSchema(value: unknown): unknown {
   return Object.fromEntries(Object.entries(record).map(([key, child]) => [key, publicRequestSchema(child)]));
 }
 
+type AskQuestion = { question: string; options: Array<Record<string, unknown>>; multi?: unknown; multiSelect?: unknown };
+
+function object(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** Secret tags are an explicit schema boundary, not a best-effort text scan. */
+function hasSecretTag(value: unknown, seen = new Set<object>()): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some(child => hasSecretTag(child, seen));
+  const record = value as Record<string, unknown>;
+  if (record.secret === true || record.sensitive === true || record.format === 'password' || record.type === 'password') return true;
+  return Object.values(record).some(child => hasSecretTag(child, seen));
+}
+
+/**
+ * One managed request corresponds to one ExtensionUIContext callback. The SDK
+ * 0.15.6 AskTool performs multi-question sequencing and multi-select toggles
+ * itself by calling this callback repeatedly; no batch answer is supported
+ * across the managed boundary.
+ */
+function askQuestion(schema: unknown): AskQuestion | null {
+  if (!object(schema) || !Array.isArray(schema.questions) || schema.questions.length !== 1) return null;
+  const question = schema.questions[0];
+  if (!object(question)
+    || typeof question.question !== 'string'
+    || !Array.isArray(question.options)
+    || (question.multi !== undefined && typeof question.multi !== 'boolean')
+    || (question.multiSelect !== undefined && typeof question.multiSelect !== 'boolean')
+    || (question.multi !== undefined && question.multiSelect !== undefined && question.multi !== question.multiSelect)
+    || question.multi === true
+    || question.multiSelect === true
+    || question.options.some(option => !object(option) || typeof option.label !== 'string')) return null;
+  return question as AskQuestion;
+}
+
+function canonicalJson(value: unknown, seen = new Set<object>()): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (seen.has(value)) return '"[cycle]"';
+  seen.add(value);
+  if (Array.isArray(value)) return `[${value.map(child => canonicalJson(child, seen)).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(record[key], seen)}`).join(',')}}`;
+}
+
+function secretPayloadHash(decision: ManagedDecision): string {
+  const payload = {
+    ...(decision.message === undefined ? {} : { message: decision.message }),
+    ...(decision.updatedInput === undefined ? {} : { updatedInput: decision.updatedInput }),
+  };
+  return createHash('sha256').update(canonicalJson(payload)).digest('hex');
+}
+
+function persistedDecision(request: ManagedPendingRequest, decision: ManagedDecision, winnerActionId: string): ManagedDecision {
+  if (!hasSecretTag(request.schema)) return decision;
+  return {
+    allow: decision.allow,
+    ...(decision.always === undefined ? {} : { always: decision.always }),
+    secret: true,
+    secretPayloadHash: secretPayloadHash(decision),
+    answerPresent: decision.message !== undefined || decision.updatedInput !== undefined,
+    winnerActionId,
+  };
+}
+
 function validDecision(request: ManagedPendingRequest, decision: ManagedDecision): boolean {
   if (!decision || typeof decision !== 'object' || Array.isArray(decision)
     || Object.keys(decision).some((key) => !['allow', 'always', 'message', 'updatedInput'].includes(key))
@@ -104,21 +181,23 @@ function validDecision(request: ManagedPendingRequest, decision: ManagedDecision
   }
   if (decision.always !== undefined) return false;
   if (!decision.allow) return decision.updatedInput === undefined;
-  const schema = request.schema as { questions?: { question: string; options?: { label: string }[]; multiSelect?: boolean }[] } | null;
-  if (!schema || !Array.isArray(schema.questions) || schema.questions.length !== 1) return false;
-  const question = schema.questions[0];
-  if (!question || !Array.isArray(question.options) || question.multiSelect) return false;
+  const question = askQuestion(request.schema);
+  // 0.15.6 has no supported no-echo/no-history ask hook and persists the
+  // answer-bearing tool result. Never deliver a tagged ask answer live.
+  if (!question || hasSecretTag(request.schema)) return false;
   let answer = decision.message?.trim();
   if (decision.updatedInput !== undefined) {
     if (answer !== undefined || !decision.updatedInput || typeof decision.updatedInput !== 'object' || Array.isArray(decision.updatedInput)
       || Object.keys(decision.updatedInput).some((key) => key !== 'answers')) return false;
     const answers = (decision.updatedInput as { answers?: unknown }).answers;
-    if (!answers || typeof answers !== 'object' || Array.isArray(answers)) return false;
-    const values = Object.values(answers);
-    if (values.length !== 1 || typeof values[0] !== 'string') return false;
-    answer = values[0].trim();
+    if (!object(answers) || Object.keys(answers).length !== 1 || !Object.hasOwn(answers, question.question)) return false;
+    const value = answers[question.question];
+    if (typeof value !== 'string') return false;
+    answer = value.trim();
   }
-  return !!answer && (question.options.length === 0 || question.options.some((option) => option?.label === answer));
+  if (!answer) return false;
+  const labels = question.options.map(option => option.label as string);
+  return labels.length === 0 || labels.includes(answer.trim());
 }
 
 function presentBinding(row: BindingRow | undefined): HerdrManagedBinding | null {
@@ -410,7 +489,12 @@ export const herdrManagedDb = {
       const projectPath = sessionsDb.getSessionById(input.appSessionId)?.project_path;
       if (!projectPath || !input.turnId) throw new Error('Managed SDK event identity missing.');
       if (input.request) {
-        const request = { ...input.request, sdkRequestId: input.request.sdkRequestId ?? input.request.requestId, requestId: randomUUID() };
+        const request = {
+          ...input.request,
+          schema: publicRequestSchema(input.request.schema),
+          sdkRequestId: input.request.sdkRequestId ?? input.request.requestId,
+          requestId: randomUUID(),
+        };
         if (!request.requestId || (request.requestKind !== 'ask' && request.requestKind !== 'permission')) throw new Error('Invalid SDK request.');
         const duplicate = db.prepare(`SELECT 1 FROM herdr_managed_decisions WHERE app_session_id = ? AND owner_generation = ? AND turn_id = ? AND json_extract(request_json, '$.sdkRequestId') = ?`)
           .get(input.appSessionId, input.ownerGeneration, input.turnId, request.sdkRequestId);
@@ -463,7 +547,13 @@ export const herdrManagedDb = {
       requestId: request.requestId, generation: request.ownerGeneration, appSessionId: request.appSessionId,
       providerSessionId: request.providerSessionId, turnId: request.turnId, kind: request.requestKind,
       policyRevision: request.policyRevision, schema: publicRequestSchema(request.schema),
-      scope: { toolName: request.toolName ?? null, options: request.options ?? [], status: request.status, actionId: request.actionId },
+      scope: {
+        toolName: request.toolName ?? null,
+        options: request.options ?? [],
+        status: request.status,
+        actionId: request.actionId,
+        ...(hasSecretTag(request.schema) ? { inputMode: 'non-echo', answerRetention: 'live-only' } : {}),
+      },
       createdAt: new Date().toISOString(),
     } });
   },
@@ -524,10 +614,11 @@ export const herdrManagedDb = {
         WHERE app_session_id = ? AND owner_generation = ? AND decided_by_action_id = ?`)
         .get(input.appSessionId, input.ownerGeneration, input.actionId);
       if (reused) return null;
+      const storedResolution = persistedDecision(request, input.resolution, input.actionId);
       const result = db.prepare(`UPDATE herdr_managed_decisions
         SET status = 'decided', resolution_json = ?, decided_by_action_id = ?, decided_at = CURRENT_TIMESTAMP
         WHERE app_session_id = ? AND owner_generation = ? AND provider_session_id = ? AND turn_id = ? AND request_id = ? AND status = 'pending'`)
-        .run(JSON.stringify(input.resolution), input.actionId, input.appSessionId, input.ownerGeneration,
+        .run(JSON.stringify(storedResolution), input.actionId, input.appSessionId, input.ownerGeneration,
           input.providerSessionId, input.turnId, input.requestId);
       if (result.changes !== 1) return null;
       if (request.requestKind === 'permission' && input.resolution.allow && input.resolution.always && request.toolName) {

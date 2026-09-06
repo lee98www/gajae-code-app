@@ -245,6 +245,7 @@ export const herdrManagedAutomationControlSchema = z.discriminatedUnion('type', 
   z.object({ type: z.literal('bind-capability'), actionId: idSchema, identity: herdrManagedAutomationIdentitySchema, currentTransport: herdrManagedBridgeTransportSchema }).strict(),
   z.object({ type: z.literal('detach-capability'), actionId: idSchema, generation: idSchema, capabilityGeneration: idSchema, ownerConnectionId: idSchema }).strict(),
   z.object({ type: z.literal('resume-approved'), actionId: idSchema, identity: herdrManagedAutomationIdentitySchema, capabilityGeneration: idSchema, approvalRequestId: idSchema }).strict(),
+  z.object({ type: z.literal('resume-denied'), actionId: idSchema, identity: herdrManagedAutomationIdentitySchema, capabilityGeneration: idSchema, approvalRequestId: idSchema }).strict(),
   z.object({ type: z.literal('reconcile'), actionId: idSchema, identity: herdrManagedAutomationIdentitySchema, originalCapabilityGeneration: idSchema, currentTransport: herdrManagedBridgeTransportSchema }).strict(),
 ]);
 export type HerdrManagedAutomationControl = z.infer<typeof herdrManagedAutomationControlSchema>;

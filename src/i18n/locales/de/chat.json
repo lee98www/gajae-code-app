@@ -74,6 +74,8 @@
     },
     "scrollToBottom": "Zum Neuesten springen",
     "queue": {
+      "recovered": "Gespeicherter Entwurf",
+      "reviewBeforeSending": "Bearbeiten und manuell senden; nicht beim Host eingereiht",
       "sendNext": "Eine weitere Nachricht in die Warteschlange stellen",
       "label": "In der Warteschlange",
       "paused": "Warteschlange pausiert",
@@ -210,6 +212,10 @@
     }
   },
   "permissionCard": {
+    "secretUnavailableTitle": "Geheime Antworten werden nicht unterstützt",
+    "secretUnavailableGuidance": "Diese Laufzeit kann nicht garantieren, dass geheime Antworten nicht im Verlauf erscheinen. Keine Zugangsdaten eingeben; diese Anfrage ablehnen und einen separaten Anmeldeweg verwenden.",
+    "unknownTitle": "Ergebnis der Entscheidung unbekannt",
+    "unknownGuidance": "Erneut verbinden, um das Ergebnis abzurufen, oder die Aufgabe nach Möglichkeit stoppen. Diese Entscheidung nicht erneut senden.",
     "title": "Berechtigung erforderlich",
     "tool": "Werkzeug:",
     "viewInput": "Werkzeugeingabe anzeigen",

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import fs from 'node:fs/promises';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -11,6 +12,8 @@ import { sessionsDb } from '../modules/database/repositories/sessions.db.js';
 import { herdrManagedDb } from '../modules/database/repositories/herdr-managed.db.js';
 import { herdrManagedProvisionDb as db } from '../modules/database/repositories/herdr-managed-provision.db.js';
 import type { HerdrManagedPublicSelection } from '../../shared/herdr-managed-provision-protocol.js';
+import { HerdrTaskHost, type HerdrTaskHostBootstrap } from '../gjc-herdr-task-host.js';
+import { parseConsoleLine } from '../gjc-herdr-task-console.js';
 import { HerdrManagedWorkspacesService, HerdrManagedAttachClient } from '../modules/herdr/index.js';
 
 async function fixture(run: (root: string) => Promise<void>) {
@@ -21,6 +24,10 @@ async function fixture(run: (root: string) => Promise<void>) {
   finally { closeConnection(); if (previous === undefined) delete process.env.DATABASE_PATH; else process.env.DATABASE_PATH = previous; await fs.rm(root, { recursive: true, force: true }); }
 }
 const endpoint = { name: 'chosen', canonicalPath: '/owned/herdr.sock', dev: 1, inode: 2 };
+/** macOS's per-user tmpdir plus a UUID directory exceeds sun_path; real sockets need a short base. */
+async function socketRoot(): Promise<string> {
+  return fs.realpath(await fs.mkdtemp(path.join(process.platform === 'darwin' ? '/tmp' : os.tmpdir(), 'mp-')));
+}
 function selection(names: string[], selected: string | null): HerdrManagedPublicSelection {
   const name = selected ?? (names.length === 1 ? names[0]! : null);
   return { selectedSessionName: name, status: name ? names.includes(name) ? 'unknown' : 'unavailable' : 'selection_required', instances: names.map(name => ({ name, label: name, status: 'available' })) };
@@ -48,7 +55,7 @@ test('one layout per intent, shared workspace, protected bootstrap and provider 
     sessions: {
       provisioningSelection: async selected => selection(['chosen'], selected),
       openProvisioningHandle: async () => ({ identity: endpoint,
-        createWorkspace: async () => { creates++; return { workspaceId: 'workspace', tabId: 'initial', paneId: 'initial', terminalId: 'initial' }; },
+        createWorkspace: async () => { creates++; return { workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'terminal-1' }; },
         applyLayout: async (workspaceId, argv) => {
           const layout = ++layouts;
           const file = argv[argv.length - 1]!;
@@ -69,7 +76,7 @@ test('one layout per intent, shared workspace, protected bootstrap and provider 
           assert.throws(() => db.claimLaunch(id, generation, bootstrap.claimNonce as string));
           herdrManagedDb.beginClaim(id, generation);
           herdrManagedDb.claim({ protocolVersion: 1, appSessionId: id, ownerGeneration: generation, providerSessionId: `provider-${id}` });
-          return { workspaceId, tabId: `tab-${layout}`, paneId: `pane-${layout}`, terminalId: `terminal-${layout}` };
+          return { workspaceId, tabId: `w1:t${layout}`, paneId: `w1:p${layout}`, terminalId: `terminal-${layout}` };
         },
       }),
     },
@@ -98,7 +105,7 @@ for (const lost of ['create', 'layout']) test(`lost ${lost} response never repla
   const service = new HerdrManagedWorkspacesService({ privateRoot: path.join(root, 'private'),
     enrich: async options => options,
     sessions: { provisioningSelection: async selected => selection(['chosen'], selected), openProvisioningHandle: async () => ({ identity: endpoint,
-      createWorkspace: async () => { creates++; if (lost === 'create') throw new Error('response lost'); return { workspaceId: 'w', tabId: 't', paneId: 'p', terminalId: 'term' }; },
+      createWorkspace: async () => { creates++; if (lost === 'create') throw new Error('response lost'); return { workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }; },
       applyLayout: async () => { layouts++; throw new Error('response lost'); },
     }) },
   });
@@ -107,3 +114,225 @@ for (const lost of ['create', 'layout']) test(`lost ${lost} response never repla
   assert.equal((await service.ensure('a', {})).status, 'unknown');
   assert.equal(creates, 1); assert.equal(layouts, lost === 'layout' ? 1 : 0);
 }));
+
+test('keeps a dropped create unknown when a foreign same-cwd workspace is concurrently present', async () => fixture(async root => {
+  let creates = 0; let layouts = 0;
+  let foreignWorkspace: { workspaceId: string; cwd: string } | null = null;
+  const service = new HerdrManagedWorkspacesService({ privateRoot: path.join(root, 'private'),
+    enrich: async options => options,
+    sessions: { provisioningSelection: async selected => selection(['chosen'], selected), openProvisioningHandle: async () => ({ identity: endpoint,
+      createWorkspace: async () => {
+        creates++; foreignWorkspace = { workspaceId: 'foreign', cwd: '/project' };
+        throw new Error('workspace.create reply lost');
+      },
+      applyLayout: async () => { layouts++; throw new Error('must not adopt foreign workspace'); },
+    }) },
+  });
+  sessionsDb.createAppSession('a', 'gjc', '/project'); service.registerNewSession('a', '/project');
+  assert.equal((await service.ensure('a', {})).status, 'unknown');
+  assert.deepEqual(foreignWorkspace, { workspaceId: 'foreign', cwd: '/project' });
+  assert.equal((await service.ensure('a', {})).status, 'unknown');
+  assert.equal(creates, 1); assert.equal(layouts, 0);
+}));
+
+test('keeps a dropped layout unknown despite a live claimed owner and an unlinked pane', async () => fixture(async root => {
+  let creates = 0; let layouts = 0;
+  let liveClaimedOwner = false; let unlinkedPane: { workspaceId: string; paneId: string; cwd: string } | null = null;
+  const service = new HerdrManagedWorkspacesService({ privateRoot: path.join(root, 'private'),
+    enrich: async options => options,
+    sessions: { provisioningSelection: async selected => selection(['chosen'], selected), openProvisioningHandle: async () => ({ identity: endpoint,
+      createWorkspace: async () => { creates++; return { workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }; },
+      applyLayout: async (_workspaceId, argv) => {
+        layouts++; liveClaimedOwner = true; unlinkedPane = { workspaceId: 'w1', paneId: 'w1:p9', cwd: '/project' };
+        const bootstrap = JSON.parse(await fs.readFile(argv[argv.length - 1]!, 'utf8')) as Record<string, unknown>;
+        const id = bootstrap.appSessionId as string; const generation = bootstrap.ownerGeneration as string;
+        db.claimLaunch(id, generation, bootstrap.claimNonce as string);
+        herdrManagedDb.beginClaim(id, generation);
+        herdrManagedDb.claim({ protocolVersion: 1, appSessionId: id, ownerGeneration: generation, providerSessionId: 'provider-a' });
+        throw new Error('layout.apply reply lost after owner claim');
+      },
+    }) },
+  });
+  sessionsDb.createAppSession('a', 'gjc', '/project'); service.registerNewSession('a', '/project');
+  assert.equal((await service.ensure('a', {})).status, 'unknown');
+  assert.equal(liveClaimedOwner, true);
+  assert.deepEqual(unlinkedPane, { workspaceId: 'w1', paneId: 'w1:p9', cwd: '/project' });
+  assert.equal((await service.ensure('a', {})).status, 'unknown');
+  assert.equal(creates, 1); assert.equal(layouts, 1);
+}));
+
+test('dropped layout reply recovers through the actual host-owned placement and private attach', { timeout: 20_000 }, async () => fixture(async () => {
+  const root = await socketRoot();
+  const herdrSocket = path.join(root, 'herdr.sock');
+  const sockets = new Set<net.Socket>();
+  let releaseSnapshot!: () => void;
+  const snapshotGate = new Promise<void>(resolve => { releaseSnapshot = resolve; });
+  let snapshotRequested = false;
+  let resolveSnapshotRequested!: () => void;
+  const snapshotObserved = new Promise<void>(resolve => { resolveSnapshotRequested = resolve; });
+  let agentState: string | null = null;
+  const tokens: Record<string, string> = {};
+  const herdr = net.createServer(socket => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+    socket.on('error', () => {});
+    let buffer = '';
+    const respond = (id: string, result: unknown) => {
+      if (!socket.destroyed) socket.end(`${JSON.stringify({ id, result })}\n`);
+    };
+    const snapshot = () => ({
+      type: 'session_snapshot',
+      snapshot: {
+        version: 'fixture-19',
+        protocol: 19,
+        layouts: [],
+        agents: [],
+        workspaces: [{ workspace_id: 'w1', number: 1, label: 'Owned', focused: false, pane_count: 1, tab_count: 1, active_tab_id: 'w1:t1', agent_status: agentState ?? 'idle' }],
+        tabs: [{ workspace_id: 'w1', tab_id: 'w1:t1', number: 1, label: 'Owned', focused: false, pane_count: 1, agent_status: agentState ?? 'idle' }],
+        panes: [{ workspace_id: 'w1', tab_id: 'w1:t1', pane_id: 'w1:p1', terminal_id: 'term-1', focused: false, agent: agentState ? 'gjc' : null, agent_status: agentState ?? 'idle', tokens: { ...tokens } }],
+      },
+    });
+    const handle = async (request: { id: string; method: string; params?: Record<string, unknown> }) => {
+      if (request.method === 'session.snapshot') {
+        if (!snapshotRequested) {
+          snapshotRequested = true;
+          resolveSnapshotRequested();
+        }
+        await snapshotGate;
+        respond(request.id, snapshot());
+        return;
+      }
+      if (request.method === 'pane.report_metadata') {
+        for (const [key, value] of Object.entries((request.params?.tokens ?? {}) as Record<string, string | null>)) {
+          if (value === null) delete tokens[key];
+          else tokens[key] = value;
+        }
+      } else if (request.method === 'pane.report_agent') {
+        agentState = String(request.params?.state ?? 'unknown');
+      } else if (request.method === 'pane.release_agent') {
+        agentState = null;
+      } else {
+        throw new Error(`Unexpected Herdr RPC ${request.method}`);
+      }
+      respond(request.id, { type: 'ok' });
+    };
+    socket.on('data', chunk => {
+      buffer += chunk.toString('utf8');
+      for (;;) {
+        const newline = buffer.indexOf('\n');
+        if (newline < 0) return;
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        void handle(JSON.parse(line) as { id: string; method: string; params?: Record<string, unknown> }).catch(() => socket.destroy());
+      }
+    });
+  });
+  await new Promise<void>(resolve => herdr.listen(herdrSocket, resolve));
+  let host: HerdrTaskHost | undefined;
+  let hostReady: Promise<void> | undefined;
+  let sdkStarts = 0;
+  let prompts = 0;
+  let layouts = 0;
+  const socketStat = await fs.lstat(herdrSocket);
+  const endpointForTest = { name: 'chosen', canonicalPath: herdrSocket, dev: socketStat.dev, inode: socketStat.ino };
+  const service = new HerdrManagedWorkspacesService({
+    privateRoot: path.join(root, 'private'),
+    readinessTimeoutMs: 5_000,
+    enrich: async options => ({ ...options, credential: { kind: 'stored' }, modelId: 'test', toolNames: [], spawns: '*', bashPolicy: { allowedPrefixes: [] } }),
+    sessions: {
+      provisioningSelection: async selected => selection(['chosen'], selected),
+      openProvisioningHandle: async () => ({
+        identity: endpointForTest,
+        createWorkspace: async () => ({ workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }),
+        applyLayout: async (_workspaceId, argv) => {
+          layouts++;
+          const bootstrap = JSON.parse(await fs.readFile(argv[argv.length - 1]!, 'utf8')) as HerdrTaskHostBootstrap;
+          host = new HerdrTaskHost({
+            bootstrap,
+            launchEnvironment: { HERDR_WORKSPACE_ID: 'w1', HERDR_TAB_ID: 'w1:t1', HERDR_PANE_ID: 'w1:p1' },
+            createSession: () => {
+              sdkStarts++;
+              return { providerSessionId: 'actual-provider', async prompt() { prompts++; }, async dispose() {} };
+            },
+          });
+          hostReady = host.initialize().then(async () => { await host!.startPrivateAttachServer(); });
+          await snapshotObserved;
+          throw new Error('layout reply dropped after host launch');
+        },
+      }),
+    },
+  });
+  sessionsDb.createAppSession('dropped-layout-host', 'gjc', '/project');
+  service.registerNewSession('dropped-layout-host', '/project');
+  try {
+    const first = await service.ensure('dropped-layout-host', {});
+    assert.equal(first.status, 'unknown');
+    assert.equal(first.providerSessionId, null);
+    assert.equal(snapshotRequested, true);
+    const pending = db.get('dropped-layout-host')!;
+    assert.equal(pending.phase, 'unknown');
+    assert.equal(pending.placement, null);
+    assert.equal((getConnection().prepare('SELECT launch_claimed FROM herdr_managed_provisions WHERE app_session_id = ?').get('dropped-layout-host') as { launch_claimed: number }).launch_claimed, 1);
+    assert.equal(sdkStarts, 0);
+    releaseSnapshot();
+    await hostReady;
+    const recovered = db.get('dropped-layout-host')!;
+    assert.equal(recovered.ownerGeneration, pending.ownerGeneration);
+    assert.equal(recovered.providerSessionId, 'actual-provider');
+    assert.equal(recovered.phase, 'ready');
+    assert.deepEqual(recovered.placement, { sessionName: 'chosen', workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' });
+    assert.equal(sdkStarts, 1);
+    // No App attach or normal layout response has acknowledged readiness.
+    // The same host's in-process console can nevertheless admit its own turn.
+    const parsed = parseConsoleLine(':followup offline-bootstrap "continue"', {
+      appSessionId: recovered.appSessionId, ownerGeneration: recovered.ownerGeneration,
+      stateRevision: host!.snapshot().watermark,
+    });
+    assert.ok(parsed.ok && parsed.type === 'command');
+    assert.equal((await host!.dispatch(parsed.command)).state, 'settled');
+    assert.equal(prompts, 1);
+    const second = await service.ensure('dropped-layout-host', {});
+    assert.equal(second.status, 'ready');
+    assert.equal(second.ownerGeneration, pending.ownerGeneration);
+    assert.equal(second.providerSessionId, 'actual-provider');
+    assert.equal(layouts, 1);
+    assert.deepEqual(db.recordLayoutReceipt('dropped-layout-host', pending.ownerGeneration, recovered.placement!).placement, recovered.placement);
+    assert.equal(sdkStarts, 1);
+    await host!.close();
+    assert.equal(herdrManagedDb.get(recovered.appSessionId, recovered.ownerGeneration)?.lifecycle, 'closed');
+  } finally {
+    releaseSnapshot();
+    if (hostReady) await hostReady.catch(() => {});
+    if (host) await host.close().catch(() => {});
+    service.close();
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>(resolve => herdr.close(() => resolve()));
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}));
+
+test('host placement and the normal layout receipt converge idempotently without snapshot adoption', async () => fixture(async root => {
+  sessionsDb.createAppSession('converge', 'gjc', '/project'); db.registerNewSession('converge', '/project');
+  const record = db.reserve('converge', endpoint, path.join(root, 'private'));
+  assert.equal(db.cas('converge', record.ownerGeneration, 'reserved', 'workspace_requested', 'w1'), true);
+  assert.equal(db.cas('converge', record.ownerGeneration, 'workspace_requested', 'workspace_created', 'w1'), true);
+  assert.equal(db.cas('converge', record.ownerGeneration, 'workspace_created', 'layout_requested', 'w1'), true);
+  db.claimLaunch('converge', record.ownerGeneration, record.claimNonce);
+  herdrManagedDb.beginClaim('converge', record.ownerGeneration);
+  const placement = { sessionName: endpoint.name, workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' };
+  const hostRecord = db.recordHostPlacement('converge', record.ownerGeneration, placement);
+  assert.equal(hostRecord.phase, 'layout_created');
+  assert.deepEqual(db.recordLayoutReceipt('converge', record.ownerGeneration, placement).placement, placement);
+  assert.throws(() => db.recordLayoutReceipt('converge', record.ownerGeneration, { ...placement, paneId: 'w1:p2' }), /conflict/);
+  assert.throws(() => db.recordHostPlacement('converge', record.ownerGeneration, { ...placement, terminalId: 'term-2' }), /conflict/);
+}));
+
+test('the original nonce remains claimable after a lost layout reply is fenced unknown', async () => fixture(async root => {
+  sessionsDb.createAppSession('late-host', 'gjc', '/project'); db.registerNewSession('late-host', '/project');
+  const record = db.reserve('late-host', endpoint, path.join(root, 'private'));
+  assert.equal(db.cas('late-host', record.ownerGeneration, 'reserved', 'workspace_requested', 'w1'), true);
+  assert.equal(db.cas('late-host', record.ownerGeneration, 'workspace_requested', 'layout_requested', 'w1'), true);
+  assert.equal(db.cas('late-host', record.ownerGeneration, 'layout_requested', 'unknown'), true);
+  assert.doesNotThrow(() => db.claimLaunch('late-host', record.ownerGeneration, record.claimNonce));
+}));
+
