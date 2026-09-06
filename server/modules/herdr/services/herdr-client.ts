@@ -428,6 +428,19 @@ export class HerdrClient {
     }, signal, guard);
   }
 
+  /**
+   * Whether a previously registered owned workspace still exists under the
+   * exact owned label. `absent` and `foreign` are definitive answers from a
+   * fresh snapshot; an unreadable snapshot throws and stays unknown.
+   */
+  async inspectWorkspace(workspaceId: string, label: string, signal?: AbortSignal, guard?: HerdrDispatchGuard): Promise<'present' | 'absent' | 'foreign'> {
+    herdrPaneIdSchema.parse(workspaceId);
+    const snapshot = await this.snapshot(signal, guard);
+    const matches = snapshot.workspaces.filter((w) => w.workspace_id === workspaceId);
+    if (matches.length === 0) return 'absent';
+    return matches.length === 1 && matches[0]!.label === label ? 'present' : 'foreign';
+  }
+
   async applyLayout(workspaceId: string, argv: readonly string[], cwd: string, signal?: AbortSignal, guard?: HerdrDispatchGuard): Promise<HerdrProvisionReceipt> {
     herdrPaneIdSchema.parse(workspaceId);
     if (!argv.length || argv.some((arg) => typeof arg !== 'string' || arg.includes('\0')) || !argv[0]) {
@@ -441,10 +454,14 @@ export class HerdrClient {
       tabs: s.tabs.filter((t) => t.focused).map((t) => t.tab_id).sort(),
       panes: s.panes.filter((p) => p.focused).map((p) => p.pane_id).sort(),
     });
-    const before = focusOf(await this.snapshot(signal, guard));
-    const receipt = await this.request('layout.apply', {
-      workspace_id: workspaceId, focus: false, root: { type: 'pane', command: [...argv], cwd, env: {} },
-    }, (value) => {
+    const beforeSnapshot = await this.snapshot(signal, guard);
+    const before = focusOf(beforeSnapshot);
+    const panesOf = (s: HerdrWireSnapshot) => s.panes.filter((p) => p.workspace_id === workspaceId).map((p) => p.pane_id).sort();
+    let receipt: { tabId: string; paneId: string };
+    try {
+      receipt = await this.request('layout.apply', {
+        workspace_id: workspaceId, focus: false, root: { type: 'pane', command: [...argv], cwd, env: {} },
+      }, (value) => {
       if (!isObject(value) || value.type !== 'layout_apply' || !isObject(value.layout)) throw new Error('Invalid layout receipt.');
       const layout = value.layout;
       if (layout.workspace_id !== workspaceId || typeof layout.zoomed !== 'boolean' || !isObject(layout.root) || layout.root.type !== 'pane') throw new Error('Invalid layout mapping.');
@@ -457,7 +474,19 @@ export class HerdrClient {
       const paneId = herdrPaneIdSchema.parse(layout.root.pane_id);
       if (!tabId.startsWith(`${workspaceId}:t`) || !paneId.startsWith(`${workspaceId}:p`) || layout.focused_pane_id !== paneId) throw new Error('Invalid layout pane mapping.');
       return { tabId, paneId };
-    }, signal, guard);
+      }, signal, guard);
+    } catch (error) {
+      // A Herdr rejection is a known non-dispatch only when a fresh snapshot
+      // proves it: the target workspace is gone, or its pane set is unchanged.
+      // Anything else (lost reply, timeout, unreadable state) stays unknown.
+      if (error instanceof HerdrRpcError) {
+        const after = await this.snapshot(signal, guard).catch(() => null);
+        if (after && (!after.workspaces.some((w) => w.workspace_id === workspaceId) || JSON.stringify(panesOf(after)) === JSON.stringify(panesOf(beforeSnapshot)))) {
+          throw new HerdrError('HERDR_LAYOUT_NOT_DISPATCHED', 409, 'Herdr rejected the layout; no pane was created.');
+        }
+      }
+      throw error;
+    }
     // LayoutDescription has no terminal id. Resolve only its exact IDs.
     const snapshot = await this.snapshot(signal, guard);
     const workspaces = snapshot.workspaces.filter((w) => w.workspace_id === workspaceId);

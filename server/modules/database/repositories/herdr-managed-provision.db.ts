@@ -101,6 +101,29 @@ export const herdrManagedProvisionDb = {
     return getConnection().prepare('SELECT phase, workspace_id FROM herdr_managed_workspaces WHERE endpoint_key = ?').get(key) as { phase: string; workspace_id: string | null } | undefined ?? null;
   },
   requestWorkspace(key: string): boolean { return getConnection().prepare(`INSERT OR IGNORE INTO herdr_managed_workspaces VALUES (?, 'requested', NULL)`).run(key).changes === 1; },
+  /** Forgets a registered parent that a fresh snapshot proved gone or foreign; only that exact id is replaced. */
+  supersedeWorkspace(key: string, staleWorkspaceId: string): boolean {
+    return getConnection().prepare(`DELETE FROM herdr_managed_workspaces WHERE endpoint_key = ? AND phase = 'ready' AND workspace_id = ?`).run(key, staleWorkspaceId).changes === 1;
+  },
+  /**
+   * Releases a generation whose launch is proven never to have been dispatched.
+   * Only a still-reserved binding with an empty journal qualifies; its rows are
+   * removed so `reserve` can start a fresh generation. Nothing with a
+   * placement, a claimed launch, a later phase or any journal entry is released.
+   */
+  release(id: string, generation: string, phase: ProvisionRecord['phase']): boolean {
+    return getConnection().transaction(() => {
+      const db = getConnection();
+      const binding = db.prepare('SELECT lifecycle, last_seq FROM herdr_managed_bindings WHERE app_session_id = ? AND owner_generation = ?').get(id, generation) as { lifecycle: string; last_seq: number } | undefined;
+      if (!binding || binding.lifecycle !== 'reserved' || binding.last_seq !== 0) return false;
+      if (db.prepare('SELECT 1 FROM herdr_managed_events WHERE app_session_id = ? AND owner_generation = ? LIMIT 1').get(id, generation)) return false;
+      const removed = db.prepare(`DELETE FROM herdr_managed_provisions WHERE app_session_id = ? AND owner_generation = ? AND phase = ? AND placement_json IS NULL AND launch_claimed = 0`).run(id, generation, phase).changes === 1;
+      if (!removed) return false;
+      db.prepare('DELETE FROM herdr_managed_state WHERE app_session_id = ? AND owner_generation = ?').run(id, generation);
+      db.prepare('DELETE FROM herdr_managed_bindings WHERE app_session_id = ? AND owner_generation = ?').run(id, generation);
+      return true;
+    }).immediate();
+  },
   finishWorkspace(key: string, workspaceId: string): void {
     if (getConnection().prepare(`UPDATE herdr_managed_workspaces SET phase = 'ready', workspace_id = ? WHERE endpoint_key = ? AND phase = 'requested'`).run(workspaceId, key).changes !== 1) throw new Error('Workspace receipt conflict.');
   },

@@ -152,6 +152,10 @@ admission/execution/settlement, not necessarily successful task completion.
 After a missing reply, use `:ack ACTION` and `:status` before any retry.
 Unknown needs status and authoritative proof, **not restart-and-retry** or a
 fresh action ID. Do not mutate foreign tasks to recover a managed one.
+Closing the App's own `Gajae <install>` workspace in Herdr is safe: the next
+new conversation notices it is gone and creates a fresh owned workspace. A
+send that Herdr provably never dispatched reports the owner unavailable; send
+again to provision a fresh owner.
 A fenced owner (`unknown`, `interrupted`) still answers `:status` and
 `:ack ACTION` from what it durably knows, and rejects new commands with
 `ACK ACTION rejected SEQ`; those replies are not journaled and nothing is

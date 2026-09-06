@@ -16,7 +16,14 @@ focused-pane guess, or mutation/adoption of imported non-managed tasks.
 A selected unavailable endpoint blocks; no local-spawn fallback is permitted.
 CAS reservations and endpoint/placement identity checks prevent duplicate
 owners. Lost RPC outcomes stay unknown and cannot automatically replay
-workspace/layout creation.
+workspace/layout creation. The registered owned parent workspace is verified
+by a fresh snapshot before every append: present under the exact owned label
+it is reused; definitively absent or relabelled it is superseded by a new owned
+workspace, never adopted; unreadable it stays unknown. A Herdr rejection of
+`layout.apply` is a known non-dispatch only when a fresh snapshot proves the
+workspace is gone or its pane set is unchanged; that empty, unclaimed
+generation is then released for a fresh reservation on the next send instead
+of being fenced unknown.
 
 The pane's independent Node `gjc-herdr-task-host.ts` owns one pinned Bun
 `gjc-herdr-managed-child.ts` SDK session. Readiness requires the real provider

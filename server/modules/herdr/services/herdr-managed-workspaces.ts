@@ -9,6 +9,7 @@ import { herdrManagedSelectionSchema, type HerdrManagedPublicSelection, type Ens
 import { herdrManagedProvisionDb, getConnection, herdrManagedDb, type ProvisionRecord } from '../../database/index.js';
 import { enrichGjcSdkRunOptions } from '../../../gjc-worker-client.js';
 
+import { HerdrError } from './herdr-client.js';
 import { HerdrManagedAttachClient } from './herdr-managed-client.js';
 import { confirmOwnerDeath, type OwnerLiveness } from './herdr-owner-liveness.js';
 import { getProductionHerdrSessionsService, type HerdrSessionsService, type HerdrProvisioningHandle } from './herdr-sessions.js';
@@ -165,7 +166,19 @@ export class HerdrManagedWorkspacesService {
       if (!this.#db.cas(id, generation, 'reserved', 'workspace_requested')) throw new Error('Provision ownership conflict.');
       const workspaceId = await this.#ownedWorkspace(key, handle, projectPath);
       if (!this.#db.cas(id, generation, 'workspace_requested', 'workspace_created', workspaceId) || !this.#db.cas(id, generation, 'workspace_created', 'layout_requested', workspaceId)) throw new Error('Provision phase conflict.');
-      const receipt = await handle.applyLayout(workspaceId, hostArgv(bootstrapPath), projectPath);
+      let receipt: Awaited<ReturnType<HerdrProvisioningHandle['applyLayout']>>;
+      try {
+        receipt = await handle.applyLayout(workspaceId, hostArgv(bootstrapPath), projectPath);
+      } catch (error) {
+        // A proven non-dispatch is a known outcome: nothing was launched for
+        // this generation, so it is released for a fresh reservation rather
+        // than fenced as unknown. Its private files carry nothing yet.
+        if (error instanceof HerdrError && error.code === 'HERDR_LAYOUT_NOT_DISPATCHED' && this.#db.release(id, generation, 'layout_requested')) {
+          await fs.rm(directory, { recursive: true, force: true });
+          return { status: 'unavailable', appSessionId: id, providerSessionId: null, ownerGeneration: null, selectedSessionName: record.selectedSessionName };
+        }
+        throw error;
+      }
       if (receipt.workspaceId !== workspaceId || !receipt.tabId || !receipt.paneId || !receipt.terminalId) throw new Error('Managed layout receipt mismatch.');
       this.#db.recordLayoutReceipt(id, generation, { sessionName: record.selectedSessionName, ...receipt });
       const deadline = Date.now() + this.#timeout;
@@ -183,10 +196,20 @@ export class HerdrManagedWorkspacesService {
     const pending = this.#workspacePending.get(key);
     if (pending) return pending;
     const task = (async () => {
-      const existing = this.#db.workspace(key);
-      if (existing?.phase === 'ready' && existing.workspace_id) return existing.workspace_id;
+      const label = `Gajae ${this.#db.installId()}`;
+      let existing = this.#db.workspace(key);
+      if (existing?.phase === 'ready' && existing.workspace_id) {
+        // The registered parent may have been closed in Herdr since. Only a
+        // fresh snapshot decides: present under the owned label is reused,
+        // definitively absent or relabelled by someone else is superseded
+        // (never adopted), and an unreadable snapshot stays unknown.
+        const status = await handle.inspectWorkspace(existing.workspace_id, label);
+        if (status === 'present') return existing.workspace_id;
+        if (!this.#db.supersedeWorkspace(key, existing.workspace_id)) throw new Error('Workspace outcome is unknown.');
+        existing = null;
+      }
       if (existing || !this.#db.requestWorkspace(key)) throw new Error('Workspace outcome is unknown.');
-      const receipt = await handle.createWorkspace(projectPath, `Gajae ${this.#db.installId()}`);
+      const receipt = await handle.createWorkspace(projectPath, label);
       this.#db.finishWorkspace(key, receipt.workspaceId);
       return receipt.workspaceId;
     })().finally(() => { this.#workspacePending.delete(key); });

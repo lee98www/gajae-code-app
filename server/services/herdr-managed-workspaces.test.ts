@@ -15,7 +15,7 @@ import { herdrManagedProvisionDb as db } from '../modules/database/repositories/
 import type { HerdrManagedPublicSelection } from '../../shared/herdr-managed-provision-protocol.js';
 import { HerdrTaskHost, type HerdrTaskHostBootstrap } from '../gjc-herdr-task-host.js';
 import { parseConsoleLine } from '../gjc-herdr-task-console.js';
-import { HerdrManagedWorkspacesService, HerdrManagedAttachClient } from '../modules/herdr/index.js';
+import { HerdrError, HerdrManagedWorkspacesService, HerdrManagedAttachClient } from '../modules/herdr/index.js';
 import { HerdrManagedChatService } from '../modules/herdr/services/herdr-managed-chat.js';
 import { processStartToken } from '../modules/herdr/services/herdr-owner-liveness.js';
 
@@ -57,7 +57,7 @@ test('one layout per intent, shared workspace, protected bootstrap and provider 
     enrich: async options => ({ ...options, modelId: 'test', toolNames: [], spawns: '*', bashPolicy: { allowedPrefixes: [] } }),
     sessions: {
       provisioningSelection: async selected => selection(['chosen'], selected),
-      openProvisioningHandle: async () => ({ identity: endpoint,
+      openProvisioningHandle: async () => ({ identity: endpoint, inspectWorkspace: async () => 'present' as const,
         createWorkspace: async () => { creates++; return { workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'terminal-1' }; },
         applyLayout: async (workspaceId, argv) => {
           const layout = ++layouts;
@@ -107,7 +107,7 @@ for (const lost of ['create', 'layout']) test(`lost ${lost} response never repla
   let creates = 0; let layouts = 0;
   const service = new HerdrManagedWorkspacesService({ privateRoot: path.join(root, 'private'),
     enrich: async options => options,
-    sessions: { provisioningSelection: async selected => selection(['chosen'], selected), openProvisioningHandle: async () => ({ identity: endpoint,
+    sessions: { provisioningSelection: async selected => selection(['chosen'], selected), openProvisioningHandle: async () => ({ identity: endpoint, inspectWorkspace: async () => 'present' as const,
       createWorkspace: async () => { creates++; if (lost === 'create') throw new Error('response lost'); return { workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }; },
       applyLayout: async () => { layouts++; throw new Error('response lost'); },
     }) },
@@ -118,12 +118,70 @@ for (const lost of ['create', 'layout']) test(`lost ${lost} response never repla
   assert.equal(creates, 1); assert.equal(layouts, lost === 'layout' ? 1 : 0);
 }));
 
+test('a registered parent workspace that vanished or was relabelled is superseded from a fresh snapshot, never adopted or assumed', async () => fixture(async root => {
+  let creates = 0; const layouts: string[] = []; let inspection: 'present' | 'absent' | 'foreign' | 'unreadable' = 'present';
+  const inspected: string[] = [];
+  const service = new HerdrManagedWorkspacesService({ privateRoot: path.join(root, 'private'),
+    enrich: async options => options,
+    sessions: { provisioningSelection: async selected => selection(['chosen'], selected), openProvisioningHandle: async () => ({ identity: endpoint,
+      inspectWorkspace: async (workspaceId: string, label: string) => { inspected.push(`${workspaceId}:${label}`); if (inspection === 'unreadable') throw new Error('snapshot unavailable'); return inspection; },
+      createWorkspace: async () => ({ workspaceId: `w${++creates}`, tabId: `w${creates}:t1`, paneId: `w${creates}:p1`, terminalId: `term-${creates}` }),
+      applyLayout: async (workspaceId: string) => { layouts.push(workspaceId); throw new Error('response lost'); },
+    }) },
+  });
+  const start = async (id: string) => { sessionsDb.createAppSession(id, 'gjc', '/project'); service.registerNewSession(id, '/project'); return service.ensure(id, {}); };
+  assert.equal((await start('a')).status, 'unknown');
+  assert.deepEqual({ creates, layouts, inspected }, { creates: 1, layouts: ['w1'], inspected: [] }, 'first use creates the parent without inspection');
+  const key = getConnection().prepare('SELECT endpoint_key, workspace_id FROM herdr_managed_workspaces').get() as { endpoint_key: string; workspace_id: string };
+  assert.equal(key.workspace_id, 'w1');
+  inspection = 'unreadable';
+  assert.equal((await start('b')).status, 'unknown');
+  assert.equal(creates, 1, 'an unreadable snapshot neither reuses nor replaces the parent');
+  assert.equal(db.workspace(key.endpoint_key)?.workspace_id, 'w1');
+  inspection = 'absent';
+  assert.equal((await start('c')).status, 'unknown');
+  assert.deepEqual({ creates, last: layouts.at(-1) }, { creates: 2, last: 'w2' }, 'a vanished parent is replaced by a fresh owned workspace');
+  assert.equal(db.workspace(key.endpoint_key)?.workspace_id, 'w2');
+  inspection = 'foreign';
+  assert.equal((await start('d')).status, 'unknown');
+  assert.deepEqual({ creates, last: layouts.at(-1) }, { creates: 3, last: 'w3' }, 'a relabelled workspace under the old id is not ours');
+  inspection = 'present';
+  assert.equal((await start('e')).status, 'unknown');
+  assert.deepEqual({ creates, last: layouts.at(-1) }, { creates: 3, last: 'w3' });
+  assert.ok(inspected.every(entry => /^w\d:Gajae [0-9a-f-]{36}$/.test(entry)), 'inspection is by exact id and the owned label');
+  service.close();
+}));
+
+test('a layout Herdr provably never dispatched releases the generation for a fresh reservation', async () => fixture(async root => {
+  let layouts = 0;
+  const service = new HerdrManagedWorkspacesService({ privateRoot: path.join(root, 'private'),
+    enrich: async options => options,
+    sessions: { provisioningSelection: async selected => selection(['chosen'], selected), openProvisioningHandle: async () => ({ identity: endpoint, inspectWorkspace: async () => 'present' as const,
+      createWorkspace: async () => ({ workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }),
+      applyLayout: async () => { layouts++; if (layouts === 1) throw new HerdrError('HERDR_LAYOUT_NOT_DISPATCHED', 409, 'Herdr rejected the layout; no pane was created.'); throw new Error('response lost'); },
+    }) },
+  });
+  sessionsDb.createAppSession('a', 'gjc', '/project'); service.registerNewSession('a', '/project');
+  const first = await service.ensure('a', {});
+  assert.equal(first.status, 'unavailable');
+  assert.equal(first.ownerGeneration, null);
+  assert.equal(db.get('a'), null, 'nothing was launched, so nothing is fenced');
+  assert.deepEqual(getConnection().prepare('SELECT owner_generation FROM herdr_managed_bindings WHERE app_session_id = ?').all('a'), [], 'an empty, undispatched generation leaves no history');
+  assert.deepEqual(await fs.readdir(path.join(root, 'private')), [], 'the unused private directory is removed');
+  const second = await service.ensure('a', {});
+  assert.equal(second.status, 'unknown', 'a lost reply on the fresh generation is still unknown');
+  assert.ok(second.ownerGeneration);
+  assert.equal(layouts, 2);
+  assert.equal(db.get('a')?.phase, 'unknown');
+  service.close();
+}));
+
 test('keeps a dropped create unknown when a foreign same-cwd workspace is concurrently present', async () => fixture(async root => {
   let creates = 0; let layouts = 0;
   let foreignWorkspace: { workspaceId: string; cwd: string } | null = null;
   const service = new HerdrManagedWorkspacesService({ privateRoot: path.join(root, 'private'),
     enrich: async options => options,
-    sessions: { provisioningSelection: async selected => selection(['chosen'], selected), openProvisioningHandle: async () => ({ identity: endpoint,
+    sessions: { provisioningSelection: async selected => selection(['chosen'], selected), openProvisioningHandle: async () => ({ identity: endpoint, inspectWorkspace: async () => 'present' as const,
       createWorkspace: async () => {
         creates++; foreignWorkspace = { workspaceId: 'foreign', cwd: '/project' };
         throw new Error('workspace.create reply lost');
@@ -143,7 +201,7 @@ test('keeps a dropped layout unknown despite a live claimed owner and an unlinke
   let liveClaimedOwner = false; let unlinkedPane: { workspaceId: string; paneId: string; cwd: string } | null = null;
   const service = new HerdrManagedWorkspacesService({ privateRoot: path.join(root, 'private'),
     enrich: async options => options,
-    sessions: { provisioningSelection: async selected => selection(['chosen'], selected), openProvisioningHandle: async () => ({ identity: endpoint,
+    sessions: { provisioningSelection: async selected => selection(['chosen'], selected), openProvisioningHandle: async () => ({ identity: endpoint, inspectWorkspace: async () => 'present' as const,
       createWorkspace: async () => { creates++; return { workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }; },
       applyLayout: async (_workspaceId, argv) => {
         layouts++; liveClaimedOwner = true; unlinkedPane = { workspaceId: 'w1', paneId: 'w1:p9', cwd: '/project' };
@@ -246,6 +304,7 @@ test('dropped layout reply recovers through the actual host-owned placement and 
       provisioningSelection: async selected => selection(['chosen'], selected),
       openProvisioningHandle: async () => ({
         identity: endpointForTest,
+        inspectWorkspace: async () => 'present' as const,
         createWorkspace: async () => ({ workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }),
         applyLayout: async (_workspaceId, argv) => {
           layouts++;
@@ -347,6 +406,7 @@ test('a reopened App recovers an owner fenced unknown read-only, without promoti
     provisioningSelection: async (selected: string | null) => selection(['chosen'], selected),
     openProvisioningHandle: async () => ({
       identity: endpointForTest,
+      inspectWorkspace: async () => 'present' as const,
       createWorkspace: async () => ({ workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }),
       applyLayout: async (_workspaceId: string, argv: readonly string[]) => {
         const bootstrap = JSON.parse(await fs.readFile(argv[argv.length - 1]!, 'utf8')) as HerdrTaskHostBootstrap;
@@ -446,6 +506,7 @@ test('a failed attach fences the generation only on exact confirmed owner death'
     provisioningSelection: async (selected: string | null) => selection(['chosen'], selected),
     openProvisioningHandle: async () => ({
       identity: endpointForTest,
+      inspectWorkspace: async () => 'present' as const,
       createWorkspace: async () => ({ workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }),
       applyLayout: async (_workspaceId: string, argv: readonly string[]) => {
         const bootstrap = JSON.parse(await fs.readFile(argv[argv.length - 1]!, 'utf8')) as HerdrTaskHostBootstrap;

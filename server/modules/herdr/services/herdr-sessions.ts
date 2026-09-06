@@ -12,6 +12,7 @@ const SESSION_NAME = /^[A-Za-z0-9._-]{1,80}$/;
 export type HerdrProvisioningHandle = Readonly<{
   identity: HerdrManagedEndpointIdentity;
   createWorkspace(cwd: string, label: string, signal?: AbortSignal): Promise<HerdrProvisionReceipt>;
+  inspectWorkspace(workspaceId: string, label: string, signal?: AbortSignal): Promise<'present' | 'absent' | 'foreign'>;
   applyLayout(workspaceId: string, argv: readonly string[], cwd: string, signal?: AbortSignal): Promise<HerdrProvisionReceipt>;
 }>;
 const SEND_KEYS = { text: [], 'text-enter': ['Enter'], enter: ['Enter'], escape: ['Escape'] };
@@ -98,7 +99,7 @@ export class HerdrSessionsService {
       if (!current.exists || current.device !== identity.dev || current.inode !== identity.inode) throw stale();
     };
     const client = this.#client(entry);
-    const guarded = async (operation: () => Promise<HerdrProvisionReceipt>, operationSignal?: AbortSignal) => {
+    const guarded = async <T>(operation: () => Promise<T>, operationSignal?: AbortSignal): Promise<T> => {
       checkHerdrAbort(operationSignal);
       await admit();
       const receipt = await operation();
@@ -110,6 +111,8 @@ export class HerdrSessionsService {
       identity,
       createWorkspace: (cwd: string, label: string, operationSignal?: AbortSignal) =>
         guarded(() => client.createWorkspace(cwd, label, operationSignal, { admit, check }), operationSignal),
+      inspectWorkspace: (workspaceId: string, label: string, operationSignal?: AbortSignal) =>
+        guarded(() => client.inspectWorkspace(workspaceId, label, operationSignal, { admit, check }), operationSignal),
       applyLayout: (workspaceId: string, argv: readonly string[], cwd: string, operationSignal?: AbortSignal) =>
         guarded(() => client.applyLayout(workspaceId, argv, cwd, operationSignal, { admit, check }), operationSignal),
     });
