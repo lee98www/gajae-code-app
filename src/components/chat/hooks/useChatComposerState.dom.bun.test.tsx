@@ -25,7 +25,8 @@ const project: Project = {
   origin: 'explicit',
 };
 
-const session = (id: string): ProjectSession => ({ id, summary: `Session ${id}` } as ProjectSession);
+// Production sessions always carry `__provider` (useProjectsState falls back to 'gjc').
+const session = (id: string): ProjectSession => ({ id, summary: `Session ${id}`, __provider: 'gjc' } as ProjectSession);
 
 const baseArgs = {
   managedSession: false,
