@@ -284,7 +284,59 @@ describe('HerdrClient', () => {
     const receipt = await client.applyLayout('w1', argv, '/repo');
     assert.equal(receipt.terminalId, 'term1');
     assert.ok(Object.isFrozen(receipt));
-    assert.deepEqual(methods, ['layout.apply', 'session.snapshot']);
+    assert.deepEqual(methods, ['session.snapshot', 'layout.apply', 'session.snapshot']);
+  });
+
+  it('appending into an already-focused owned workspace keeps the receipt valid', async () => {
+    // The user may have focused the owned workspace; focus:false leaves that
+    // focus exactly where it was and the new tab/pane stay unfocused.
+    const focusedSnapshot = () => ({
+      ...managedSnapshot(),
+      workspaces: [{ workspace_id: 'w1', number: 1, label: 'Owned', focused: true, pane_count: 2, tab_count: 2, active_tab_id: 'w1:t1', agent_status: 'idle' }],
+      tabs: [
+        { tab_id: 'w1:t1', workspace_id: 'w1', number: 1, label: '1', focused: true, pane_count: 1, agent_status: 'idle' },
+        { tab_id: 'w1:t2', workspace_id: 'w1', number: 2, label: '2', focused: false, pane_count: 1, agent_status: 'idle' },
+      ],
+      panes: [
+        { pane_id: 'w1:p1', terminal_id: 'term1', workspace_id: 'w1', tab_id: 'w1:t1', focused: true, agent_status: 'idle' },
+        { pane_id: 'w1:p2', terminal_id: 'term2', workspace_id: 'w1', tab_id: 'w1:t2', focused: false, agent_status: 'idle' },
+      ],
+    });
+    const methods: string[] = [];
+    const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+      const request = JSON.parse(line);
+      methods.push(request.method);
+      socket.reply({ id: request.id, result: request.method === 'layout.apply'
+        ? { type: 'layout_apply', layout: { workspace_id: 'w1', tab_id: 'w1:t2', zoomed: false, focused_pane_id: 'w1:p2', root: { type: 'pane', pane_id: 'w1:p2' } } }
+        : { type: 'session_snapshot', snapshot: focusedSnapshot() } });
+    }));
+    assert.deepEqual(await client.applyLayout('w1', ['bun'], '/repo'), { workspaceId: 'w1', tabId: 'w1:t2', paneId: 'w1:p2', terminalId: 'term2' });
+    assert.deepEqual(methods, ['session.snapshot', 'layout.apply', 'session.snapshot']);
+  });
+
+  it('a layout that moves focus is rejected', async () => {
+    let snapshots = 0;
+    const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+      const request = JSON.parse(line);
+      if (request.method === 'layout.apply') {
+        socket.reply({ id: request.id, result: { type: 'layout_apply', layout: { workspace_id: 'w1', tab_id: 'w1:t2', zoomed: false, focused_pane_id: 'w1:p2', root: { type: 'pane', pane_id: 'w1:p2' } } } });
+        return;
+      }
+      const moved = snapshots++ > 0;
+      socket.reply({ id: request.id, result: { type: 'session_snapshot', snapshot: {
+        ...managedSnapshot(),
+        workspaces: [{ workspace_id: 'w1', number: 1, label: 'Owned', focused: true, pane_count: 2, tab_count: 2, active_tab_id: moved ? 'w1:t2' : 'w1:t1', agent_status: 'idle' }],
+        tabs: [
+          { tab_id: 'w1:t1', workspace_id: 'w1', number: 1, label: '1', focused: !moved, pane_count: 1, agent_status: 'idle' },
+          { tab_id: 'w1:t2', workspace_id: 'w1', number: 2, label: '2', focused: false, pane_count: 1, agent_status: 'idle' },
+        ],
+        panes: [
+          { pane_id: 'w1:p1', terminal_id: 'term1', workspace_id: 'w1', tab_id: 'w1:t1', focused: !moved, agent_status: 'idle' },
+          { pane_id: 'w1:p2', terminal_id: 'term2', workspace_id: 'w1', tab_id: 'w1:t2', focused: false, agent_status: 'idle' },
+        ],
+      } } });
+    }));
+    await assert.rejects(client.applyLayout('w1', ['bun'], '/repo'), /changed focus/);
   });
 
   it('rejects malformed layout receipts without retries or snapshot guesses', async () => {
@@ -295,11 +347,15 @@ describe('HerdrClient', () => {
     ]) {
       let writes = 0;
       const client = new HerdrClient('/unused', () => new FakeSocket((line, socket) => {
+        const request = JSON.parse(line);
         writes++;
-        socket.reply({ id: JSON.parse(line).id, result: { type: 'layout_apply', layout } });
+        socket.reply({ id: request.id, result: request.method === 'layout.apply'
+          ? { type: 'layout_apply', layout }
+          : { type: 'session_snapshot', snapshot: managedSnapshot() } });
       }));
       await assert.rejects(client.applyLayout('w1', ['bun'], '/repo'), { code: 'HERDR_INVALID_RESPONSE' });
-      assert.equal(writes, 1);
+      // The pre-append focus snapshot plus the rejected receipt; no follow-up snapshot, no retry.
+      assert.equal(writes, 2);
     }
   });
 
@@ -315,7 +371,7 @@ describe('HerdrClient', () => {
         : { type: 'session_snapshot', snapshot: snap } });
     }));
     await assert.rejects(client.applyLayout('w1', ['bun'], '/repo'), { code: 'HERDR_INVALID_RESPONSE' });
-    assert.equal(writes, 2);
+    assert.equal(writes, 3);
   });
 
   it('uses one string-id JSON RPC and decodes session snapshots', async () => {

@@ -109,7 +109,7 @@ export class ManagedChildTransport {
             throw new Error('Managed child event identity mismatch.');
           }
           const lateTitle = isTitle && Boolean(titleIdentity);
-          if (!this.#pending.has(frame.requestId) && !lateTitle && !['managed.automation', 'managed.automation-record-chunk'].includes(String(frame.event.kind))) throw new Error('Managed child idle event rejected.');
+          if (!this.#pending.has(frame.requestId) && !lateTitle && !['managed.automation', 'managed.automation-record-chunk', 'managed.idle'].includes(String(frame.event.kind))) throw new Error('Managed child idle event rejected.');
           if (lateTitle && this.#titleScope) this.#titleScope.published = true;
           this.#eventSeq = frame.eventSeq;
           const bytes = Buffer.byteLength(line);

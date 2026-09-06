@@ -30,6 +30,13 @@ const identity = (frame: ManagedChildIdentity): ManagedChildIdentity => ({ versi
 const managedTitleScope = Symbol.for('gajae.managed.session-title-scope');
 /** Automation records live across turns; everything else needs an active prompt. */
 const IDLE_EVENT_KINDS = new Set(['managed.automation', 'managed.automation-record-chunk']);
+/**
+ * Runtime state reported between turns (late background tool updates, notices,
+ * bookkeeping) has no owning prompt. It is journaled as `managed.idle` under the
+ * last settled prompt identity so nothing user-visible vanishes silently; the
+ * count per idle interval is bounded and the bound itself is recorded once.
+ */
+const IDLE_EVENT_LIMIT = 16;
 const sameIdentity = (left: ManagedChildIdentity | undefined, right: ManagedChildIdentity | undefined): boolean =>
   left?.version === right?.version
   && left?.generation === right?.generation
@@ -47,6 +54,8 @@ export async function runManagedChild(options: RunManagedChildOptions = {}): Pro
   let activePrompt: ManagedChildIdentity | undefined;
   let titleIdentity: ManagedChildIdentity | undefined;
   let titlePublished = false;
+  let idleEvents = 0;
+  let lastActionId: string | undefined;
   const promptIdentities = new Map<string, ManagedChildIdentity>();
   let sequence = 0;
   let acknowledged = 0;
@@ -140,11 +149,14 @@ export async function runManagedChild(options: RunManagedChildOptions = {}): Pro
               onDeath();
               throw new Error('Managed child event scope rejected.');
             }
-            // Between turns the SDK may still report background state (a late
-            // title attempt, disposal bookkeeping). No turn can own such an
-            // event, so it is dropped here rather than presented to the owner
-            // under a settled identity, which would fail the private stream.
-            if (owner && !activePrompt && !IDLE_EVENT_KINDS.has(String(record.kind))) return;
+            if (owner && !activePrompt && !IDLE_EVENT_KINDS.has(String(record.kind))) {
+              // No turn owns this; record it as idle instead of presenting it
+              // under a settled identity (stream failure) or dropping it (loss).
+              if (idleEvents < IDLE_EVENT_LIMIT) emit({ kind: 'managed.idle', afterActionId: lastActionId ?? null, event: record });
+              else if (idleEvents === IDLE_EVENT_LIMIT) emit({ kind: 'managed.idle', afterActionId: lastActionId ?? null, omittedAfter: IDLE_EVENT_LIMIT });
+              idleEvents++;
+              return;
+            }
             emit(record);
           },
           setSessionId: (providerSessionId) => emit({ kind: 'session', providerSessionId }),
@@ -161,6 +173,7 @@ export async function runManagedChild(options: RunManagedChildOptions = {}): Pro
       if (activePrompt) return { ok: false, error: 'busy' };
       activePrompt = identity(frame);
       eventIdentity = activePrompt;
+      lastActionId = frame.actionId; idleEvents = 0;
       promptIdentities.set(`${activePrompt.requestId}\u0000${activePrompt.runId}`, activePrompt);
       owner.setAutomationTurn(frame.actionId, activePrompt);
       let ok = true;

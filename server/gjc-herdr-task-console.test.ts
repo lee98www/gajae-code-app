@@ -122,3 +122,29 @@ test('bounded output disconnects on critical overflow and handles drain', () => 
   assert.deepEqual(reasons, ['critical_output_overflow']);
   assert.equal(writer.write('ACK c settled 3', 'critical'), false);
 });
+
+test('display overflow drops blocks behind one omission marker while critical records survive', () => {
+  const pending: (() => void)[] = []; const blocks: string[] = [];
+  const output = new Writable({ highWaterMark: 1, write(chunk, _encoding, callback) { blocks.push(chunk.toString()); pending.push(callback); } });
+  const reasons: string[] = []; const writer = new ConsoleOutputWriter(output, reason => reasons.push(reason));
+  assert.equal(writer.write('ACK a settled 1', 'critical'), true);
+  // The console is stalled: everything past the first line stays queued.
+  let dropped = 0;
+  for (let i = 0; i < 12; i++) if (!writer.write(`display ${i} ${'x'.repeat(8000)}`)) dropped++;
+  assert.ok(dropped > 0 && dropped < 12, 'some display blocks fit, the rest are dropped');
+  assert.equal(writer.write('REQUEST ask a/b/c/d/e 0', 'critical'), true);
+  assert.equal(writer.write('ACK b settled 2', 'critical'), true);
+  assert.deepEqual(reasons, [], 'display overflow never disconnects');
+  // Nothing dropped is reordered in front of the marker once the console catches up.
+  assert.equal(writer.write('display late', 'display'), false); dropped++;
+  for (;;) { const callback = pending.shift(); if (!callback) break; callback(); output.emit('drain'); }
+  const text = blocks.join('');
+  const markers = text.match(/^OMITTED \d+ display blocks$/gm) ?? [];
+  assert.deepEqual(markers, [`OMITTED ${dropped} display blocks`]);
+  const order = ['ACK a settled 1', 'REQUEST ask a/b/c/d/e 0', 'ACK b settled 2'].map(line => text.indexOf(`${line}\n`));
+  assert.ok(order.every((index, i) => index >= 0 && (i === 0 || index > order[i - 1]!)), 'critical lines are preserved in order');
+  assert.equal(text.includes('display late'), false);
+  assert.equal(writer.write('display after drain'), true);
+  assert.equal(blocks.at(-1), 'display after drain\n');
+  assert.deepEqual(reasons, []);
+});

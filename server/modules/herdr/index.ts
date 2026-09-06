@@ -25,3 +25,4 @@ export {
   type HerdrManagedChatOptions, type ManagedChatConnection, type ManagedChatResult,
   type ManagedChatSend, type ManagedChatControl, type ManagedChatPermissionResponse,
 } from './services/herdr-managed-chat.js';
+export { confirmOwnerDeath, recordOwnerProcess, processStartToken, type OwnerLiveness } from './services/herdr-owner-liveness.js';

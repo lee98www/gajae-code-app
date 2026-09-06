@@ -12,7 +12,7 @@ import { closeConnection, getConnection, getDatabasePath } from '@/modules/datab
 import { herdrManagedDb } from '@/modules/database/repositories/herdr-managed.db.js';
 import { herdrManagedProvisionDb } from '@/modules/database/repositories/herdr-managed-provision.db.js';
 import { herdrManagedSnapshotsDb } from '@/modules/database/repositories/herdr-managed-snapshots.db.js';
-import { HerdrAgentReporter, HerdrClient, type HerdrAgentReporterStatus, type HerdrWireSnapshot } from '@/modules/herdr/index.js';
+import { HerdrAgentReporter, HerdrClient, recordOwnerProcess, type HerdrAgentReporterStatus, type HerdrWireSnapshot } from '@/modules/herdr/index.js';
 
 import { verifyManagedBridgeReceipt, verifyManagedBridgeTarget, type HerdrManagedBridgeResolveRequest } from '../shared/herdr-managed-bridge.js';
 import type { HerdrManagedChildAutomationControl, ManagedChildEvent, ManagedChildRequest, ManagedChildTurnOptions } from '../shared/herdr-managed-child-protocol.js';
@@ -21,6 +21,7 @@ import {
   publicManagedTargetContext,
   herdrManagedAttachFrameSchema,
   herdrManagedCommandSchema,
+  herdrManagedCommandReceiptSchema,
   herdrManagedAutomationOperationSchema,
   HERDR_MANAGED_MAX_FRAME_BYTES,
   type HerdrManagedAutomationControl,
@@ -222,6 +223,8 @@ export class HerdrTaskHost {
       }
       herdrManagedDb.beginClaim(this.#bootstrap.appSessionId, this.#bootstrap.ownerGeneration);
       this.#claimStarted = true;
+      // Exact process identity for later death confirmation by a reopened App.
+      if (this.#bootstrap.attachSocketPath) await recordOwnerProcess(path.dirname(this.#bootstrap.attachSocketPath), this.#bootstrap.ownerGeneration);
       const placement = production && launch ? await this.#captureHostPlacement(launch) : null;
       const session = await this.#createSession({
         appSessionId: this.#bootstrap.appSessionId,
@@ -359,14 +362,26 @@ export class HerdrTaskHost {
     const existing = herdrManagedDb.getCommand(parsed.appSessionId, parsed.ownerGeneration, parsed.actionId);
     if (existing) {
       if (existing.kind !== parsed.kind || existing.payloadHash !== parsed.payloadHash) throw new Error('Managed Herdr command action id conflict.');
-      return existing;
+      // The durable record carries its kind/hash; the wire receipt is strict.
+      const { kind: _kind, payloadHash: _payloadHash, ...receipt } = existing;
+      return receipt;
     }
-    if (parsed.kind === 'status') {
-      return herdrManagedDb.recordCommand({ appSessionId: parsed.appSessionId, ownerGeneration: parsed.ownerGeneration, actionId: parsed.actionId, kind: parsed.kind, payloadHash: parsed.payloadHash, state: 'settled', message: `Status ${this.snapshot().lifecycle} seq ${this.snapshot().watermark}.` });
+    if (parsed.kind === 'status' || parsed.kind === 'ack') {
+      const state = this.snapshot();
+      const target = parsed.kind === 'ack' && isObject(parsed.payload) && typeof parsed.payload.actionId === 'string' ? herdrManagedDb.getCommand(parsed.appSessionId, parsed.ownerGeneration, parsed.payload.actionId) : null;
+      const message = parsed.kind === 'status' ? `Status ${state.lifecycle} seq ${state.watermark}.` : target ? `${target.actionId} ${target.state} ${target.seq}` : 'No receipt for action.';
+      // A fenced owner still answers what it durably knows. The query itself is
+      // not journaled there: the writer fence stays intact and nothing is admitted.
+      if (['unknown', 'interrupted', 'closed'].includes(state.lifecycle)) {
+        return { protocolVersion: 1, appSessionId: parsed.appSessionId, ownerGeneration: parsed.ownerGeneration, actionId: parsed.actionId, state: 'settled', seq: state.watermark, message };
+      }
+      return herdrManagedDb.recordCommand({ appSessionId: parsed.appSessionId, ownerGeneration: parsed.ownerGeneration, actionId: parsed.actionId, kind: parsed.kind, payloadHash: parsed.payloadHash, state: 'settled', message });
     }
-    if (parsed.kind === 'ack') {
-      const target = isObject(parsed.payload) && typeof parsed.payload.actionId === 'string' ? herdrManagedDb.getCommand(parsed.appSessionId, parsed.ownerGeneration, parsed.payload.actionId) : null;
-      return herdrManagedDb.recordCommand({ appSessionId: parsed.appSessionId, ownerGeneration: parsed.ownerGeneration, actionId: parsed.actionId, kind: parsed.kind, payloadHash: parsed.payloadHash, state: 'settled', message: target ? `${target.actionId} ${target.state} ${target.seq}` : 'No receipt for action.' });
+    const fenced = this.snapshot().lifecycle;
+    if (['unknown', 'interrupted', 'closed'].includes(fenced)) {
+      // Nothing is admitted to a fenced owner and its journal is not writable,
+      // so the rejection is answered exactly, without being recorded.
+      return { protocolVersion: 1, appSessionId: parsed.appSessionId, ownerGeneration: parsed.ownerGeneration, actionId: parsed.actionId, state: 'rejected', seq: this.snapshot().watermark, message: `Managed owner is ${fenced}; nothing was admitted.` };
     }
     if (parsed.kind === 'steer') return this.#control(parsed, 'steer');
     if (parsed.kind === 'abort') return this.#control(parsed, 'abort');
@@ -495,6 +510,12 @@ export class HerdrTaskHost {
     if (frame.generation !== this.#bootstrap.ownerGeneration) throw new Error('SDK event generation mismatch.');
     let event = frame.event;
     if (event.kind === 'managed.automation-record-chunk') { this.#privateStore().putChunk(event, { provider: this.#providerSessionId, turn: frame.runId }); return; }
+    if (event.kind === 'managed.idle') {
+      // Durable evidence of between-turn runtime state. A fenced owner's journal
+      // is intentionally not writable; the fence itself is that evidence.
+      try { herdrManagedDb.appendEvent({ appSessionId: this.#bootstrap.appSessionId, ownerGeneration: this.#bootstrap.ownerGeneration, kind: 'sdk.idle', payload: { ...event, turnId: frame.runId } }); this.#broadcast(); } catch { /* fenced */ }
+      return;
+    }
     if (event.kind === 'managed.automation') {
       const operation = herdrManagedAutomationOperationSchema.parse(event.payload);
       if (operation.identity.turn !== frame.runId || operation.identity.provider !== this.#providerSessionId) throw new Error('Automation owner mismatch.');
@@ -861,7 +882,7 @@ export class HerdrTaskHost {
           }
           try {
             const { appSessionId, ownerGeneration } = this.#bootstrap;
-            if (frame.type === 'command') this.#send(socket, { type: 'receipt', id: frame.id, receipt: await this.dispatch(frame.value) });
+            if (frame.type === 'command') this.#send(socket, { type: 'receipt', id: frame.id, receipt: herdrManagedCommandReceiptSchema.parse(await this.dispatch(frame.value)) });
             else if (frame.type === 'snapshot') {
               client.cursor = null;
               const snapshot = herdrManagedSnapshotsDb.create(appSessionId, ownerGeneration);
@@ -1087,17 +1108,18 @@ export function createManagedGjcSdkSessionFactory(bootstrap: HerdrTaskHostBootst
       return await initializeManagedChildSession(child, { appSessionId, ownerGeneration, onEvent, agentDir: bootstrap.agentDir, runConfig: bootstrap.runConfig });
     } catch (error) {
       // The factory owns the child even when initialization never returns a
-      // session object. Confirm its exit before the host fences the claim.
-      if (child.exitCode === null) {
+      // session object. Signal dispatch is not exit: the claim is fenced only
+      // after the child's exit is observed, or the escalation deadline passes
+      // with the child still alive, which is reported as such.
+      if (child.exitCode === null && child.signalCode === null) {
         child.kill();
-        await new Promise<void>(resolve => {
-          const timer = setTimeout(() => {
-            if (child.exitCode === null) child.kill('SIGKILL');
-            resolve();
-          }, 5_000);
-          timer.unref();
-          child.once('exit', () => { clearTimeout(timer); resolve(); });
+        const exited = await new Promise<boolean>(resolve => {
+          const escalate = setTimeout(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); }, 5_000);
+          const deadline = setTimeout(() => resolve(false), 10_000);
+          escalate.unref(); deadline.unref();
+          child.once('exit', () => { clearTimeout(escalate); clearTimeout(deadline); resolve(true); });
         });
+        if (!exited) throw new Error('Managed child did not exit after escalation.', { cause: error });
       }
       throw error;
     }

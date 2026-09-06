@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 
 import { parseGjcRunPermissions } from '../gjc-engine.js';
 import { closeConnection, getConnection } from '../modules/database/connection.js';
@@ -15,6 +16,8 @@ import type { HerdrManagedPublicSelection } from '../../shared/herdr-managed-pro
 import { HerdrTaskHost, type HerdrTaskHostBootstrap } from '../gjc-herdr-task-host.js';
 import { parseConsoleLine } from '../gjc-herdr-task-console.js';
 import { HerdrManagedWorkspacesService, HerdrManagedAttachClient } from '../modules/herdr/index.js';
+import { HerdrManagedChatService } from '../modules/herdr/services/herdr-managed-chat.js';
+import { processStartToken } from '../modules/herdr/services/herdr-owner-liveness.js';
 
 async function fixture(run: (root: string) => Promise<void>) {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'managed-provision-')));
@@ -305,6 +308,196 @@ test('dropped layout reply recovers through the actual host-owned placement and 
     if (hostReady) await hostReady.catch(() => {});
     if (host) await host.close().catch(() => {});
     service.close();
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>(resolve => herdr.close(() => resolve()));
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}));
+
+test('a reopened App recovers an owner fenced unknown read-only, without promotion or replay', { timeout: 20_000 }, async () => fixture(async () => {
+  const root = await socketRoot();
+  const herdrSocket = path.join(root, 'herdr.sock');
+  const sockets = new Set<net.Socket>();
+  const herdr = net.createServer(socket => {
+    sockets.add(socket); socket.once('close', () => sockets.delete(socket)); socket.on('error', () => {});
+    let buffer = '';
+    socket.on('data', chunk => {
+      buffer += chunk.toString('utf8');
+      for (;;) {
+        const newline = buffer.indexOf('\n');
+        if (newline < 0) return;
+        const request = JSON.parse(buffer.slice(0, newline)) as { id: string; method: string };
+        buffer = buffer.slice(newline + 1);
+        const result = request.method === 'session.snapshot' ? { type: 'session_snapshot', snapshot: {
+          version: 'fixture-19', protocol: 19, layouts: [], agents: [],
+          workspaces: [{ workspace_id: 'w1', number: 1, label: 'Owned', focused: false, pane_count: 1, tab_count: 1, active_tab_id: 'w1:t1', agent_status: 'idle' }],
+          tabs: [{ workspace_id: 'w1', tab_id: 'w1:t1', number: 1, label: 'Owned', focused: false, pane_count: 1, agent_status: 'idle' }],
+          panes: [{ workspace_id: 'w1', tab_id: 'w1:t1', pane_id: 'w1:p1', terminal_id: 'term-1', focused: false, agent: null, agent_status: 'idle', tokens: {} }],
+        } } : { type: 'ok' };
+        if (!socket.destroyed) socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+      }
+    });
+  });
+  await new Promise<void>(resolve => herdr.listen(herdrSocket, resolve));
+  const socketStat = await fs.lstat(herdrSocket);
+  const endpointForTest = { name: 'chosen', canonicalPath: herdrSocket, dev: socketStat.dev, inode: socketStat.ino };
+  let host: HerdrTaskHost | undefined;
+  let prompts = 0;
+  const sessions = {
+    provisioningSelection: async (selected: string | null) => selection(['chosen'], selected),
+    openProvisioningHandle: async () => ({
+      identity: endpointForTest,
+      createWorkspace: async () => ({ workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }),
+      applyLayout: async (_workspaceId: string, argv: readonly string[]) => {
+        const bootstrap = JSON.parse(await fs.readFile(argv[argv.length - 1]!, 'utf8')) as HerdrTaskHostBootstrap;
+        host = new HerdrTaskHost({
+          bootstrap,
+          launchEnvironment: { HERDR_WORKSPACE_ID: 'w1', HERDR_TAB_ID: 'w1:t1', HERDR_PANE_ID: 'w1:p1' },
+          createSession: () => ({ providerSessionId: 'actual-provider', async prompt() { prompts++; throw new Error('private child failed mid-turn'); }, async dispose() {} }),
+        });
+        await host.initialize(); await host.startPrivateAttachServer();
+        return { workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' };
+      },
+    }),
+  };
+  const options = { privateRoot: path.join(root, 'private'), readinessTimeoutMs: 5_000, sessions,
+    enrich: async (o: Record<string, unknown>) => ({ ...o, credential: { kind: 'stored' }, modelId: 'test', toolNames: [], spawns: '*', bashPolicy: { allowedPrefixes: [] } }) };
+  const first = new HerdrManagedWorkspacesService(options as never);
+  const firstChat = new HerdrManagedChatService({ workspaces: first });
+  const frames: string[] = [];
+  const viewer = { readyState: 1, send: (encoded: string) => { frames.push(encoded); } };
+  sessionsDb.createAppSession('unknown-owner', 'gjc', '/project');
+  first.registerNewSession('unknown-owner', '/project');
+  let second: HerdrManagedWorkspacesService | undefined;
+  let secondChat: HerdrManagedChatService | undefined;
+  try {
+    assert.equal((await first.ensure('unknown-owner', {})).status, 'ready');
+    const generation = db.get('unknown-owner')!.ownerGeneration;
+    const sent = await firstChat.send({ sessionId: 'unknown-owner', actionId: 'turn-1', content: 'run' }, viewer as never);
+    // The owner answers an unconfirmed turn with uncertainty, never a receipt that looks settled.
+    assert.equal(sent.ok, false);
+    assert.match(sent.error ?? '', /outcome unknown/);
+    const acked = await firstChat.status('unknown-owner', 'status-1', 'turn-1');
+    assert.equal(acked.receipt?.state, 'settled');
+    assert.match(acked.receipt?.message ?? '', /^turn-1 unknown \d+$/);
+    assert.equal(prompts, 1);
+    assert.equal(herdrManagedDb.get('unknown-owner', generation)?.lifecycle, 'unknown');
+    // The App goes away; its authenticated client and chat binding are gone.
+    firstChat.close(); first.close();
+    second = new HerdrManagedWorkspacesService(options as never);
+    secondChat = new HerdrManagedChatService({ workspaces: second });
+    const client = await second.attach('unknown-owner');
+    assert.equal(client.state?.lifecycle, 'unknown');
+    assert.equal(client.state?.commands['turn-1']?.state, 'unknown');
+    assert.equal(client.state?.identity.ownerGeneration, generation);
+    assert.equal(client.state?.providerSessionId, 'actual-provider');
+    assert.equal(herdrManagedDb.get('unknown-owner', generation)?.lifecycle, 'unknown', 'recovery never promotes the fenced lifecycle');
+    assert.equal(db.get('unknown-owner')!.phase, 'ready');
+    const reopened = await second.ensure('unknown-owner', {});
+    assert.equal(reopened.status, 'ready');
+    assert.equal(reopened.ownerGeneration, generation);
+    assert.equal((await secondChat.subscribe('unknown-owner', viewer as never)).ok, true);
+    assert.ok(frames.some(frame => frame.includes('"lifecycle":"unknown"')), 'the reopened viewer sees the fenced owner');
+    // Neither the unknown turn nor a fresh prompt is replayed into the fenced owner.
+    const again = await secondChat.send({ sessionId: 'unknown-owner', actionId: 'turn-1', content: 'run' }, viewer as never);
+    assert.equal(again.ok, false); assert.equal(again.receipt?.state, 'unknown');
+    const fresh = await secondChat.send({ sessionId: 'unknown-owner', actionId: 'turn-2', content: 'again' }, viewer as never);
+    assert.equal(fresh.ok, false); assert.equal(fresh.receipt?.state, 'rejected');
+    assert.equal(prompts, 1);
+  } finally {
+    firstChat.close(); first.close(); secondChat?.close(); second?.close();
+    if (host) await host.close().catch(() => {});
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>(resolve => herdr.close(() => resolve()));
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}));
+
+test('a failed attach fences the generation only on exact confirmed owner death', { timeout: 20_000 }, async () => fixture(async () => {
+  const root = await socketRoot();
+  const herdrSocket = path.join(root, 'herdr.sock');
+  const sockets = new Set<net.Socket>();
+  const herdr = net.createServer(socket => {
+    sockets.add(socket); socket.once('close', () => sockets.delete(socket)); socket.on('error', () => {});
+    let buffer = '';
+    socket.on('data', chunk => {
+      buffer += chunk.toString('utf8');
+      for (;;) {
+        const newline = buffer.indexOf('\n');
+        if (newline < 0) return;
+        const request = JSON.parse(buffer.slice(0, newline)) as { id: string; method: string };
+        buffer = buffer.slice(newline + 1);
+        const result = request.method === 'session.snapshot' ? { type: 'session_snapshot', snapshot: {
+          version: 'fixture-19', protocol: 19, layouts: [], agents: [],
+          workspaces: [{ workspace_id: 'w1', number: 1, label: 'Owned', focused: false, pane_count: 1, tab_count: 1, active_tab_id: 'w1:t1', agent_status: 'idle' }],
+          tabs: [{ workspace_id: 'w1', tab_id: 'w1:t1', number: 1, label: 'Owned', focused: false, pane_count: 1, agent_status: 'idle' }],
+          panes: [{ workspace_id: 'w1', tab_id: 'w1:t1', pane_id: 'w1:p1', terminal_id: 'term-1', focused: false, agent: null, agent_status: 'idle', tokens: {} }],
+        } } : { type: 'ok' };
+        if (!socket.destroyed) socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+      }
+    });
+  });
+  await new Promise<void>(resolve => herdr.listen(herdrSocket, resolve));
+  const socketStat = await fs.lstat(herdrSocket);
+  const endpointForTest = { name: 'chosen', canonicalPath: herdrSocket, dev: socketStat.dev, inode: socketStat.ino };
+  let host: HerdrTaskHost | undefined;
+  const sessions = {
+    provisioningSelection: async (selected: string | null) => selection(['chosen'], selected),
+    openProvisioningHandle: async () => ({
+      identity: endpointForTest,
+      createWorkspace: async () => ({ workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' }),
+      applyLayout: async (_workspaceId: string, argv: readonly string[]) => {
+        const bootstrap = JSON.parse(await fs.readFile(argv[argv.length - 1]!, 'utf8')) as HerdrTaskHostBootstrap;
+        host = new HerdrTaskHost({ bootstrap, launchEnvironment: { HERDR_WORKSPACE_ID: 'w1', HERDR_TAB_ID: 'w1:t1', HERDR_PANE_ID: 'w1:p1' },
+          createSession: () => ({ providerSessionId: 'actual-provider', async prompt() {}, async dispose() {} }) });
+        await host.initialize(); await host.startPrivateAttachServer();
+        return { workspaceId: 'w1', tabId: 'w1:t1', paneId: 'w1:p1', terminalId: 'term-1' };
+      },
+    }),
+  };
+  const service = new HerdrManagedWorkspacesService({ privateRoot: path.join(root, 'private'), readinessTimeoutMs: 5_000, sessions,
+    enrich: async (o: Record<string, unknown>) => ({ ...o, credential: { kind: 'stored' }, modelId: 'test', toolNames: [], spawns: '*', bashPolicy: { allowedPrefixes: [] } }) } as never);
+  sessionsDb.createAppSession('dead-owner', 'gjc', '/project');
+  service.registerNewSession('dead-owner', '/project');
+  const stand = spawn('/bin/sleep', ['60'], { stdio: 'ignore' });
+  const exited = new Promise<void>(resolve => stand.once('exit', () => resolve()));
+  try {
+    assert.equal((await service.ensure('dead-owner', {})).status, 'ready');
+    const record = db.get('dead-owner')!;
+    const ownerFile = path.join(record.privateDirectory, 'owner.json');
+    const recorded = JSON.parse(await fs.readFile(ownerFile, 'utf8')) as { ownerGeneration: string; pid: number; startedAt: string };
+    assert.equal(recorded.ownerGeneration, record.ownerGeneration);
+    assert.equal(recorded.pid, process.pid);
+    assert.equal(recorded.startedAt, processStartToken(process.pid));
+    assert.equal((await fs.stat(ownerFile)).mode & 0o077, 0);
+    // The private socket stops answering while the App is away.
+    service.close();
+    await fs.rm(path.join(record.privateDirectory, 'attach.sock'), { force: true });
+    // A live process with the recorded start time is not death, even unreachable.
+    const standToken = processStartToken(stand.pid!);
+    assert.ok(standToken);
+    await fs.writeFile(ownerFile, JSON.stringify({ ownerGeneration: record.ownerGeneration, pid: stand.pid, startedAt: standToken }), { mode: 0o600 });
+    assert.equal((await service.ensure('dead-owner', {})).status, 'unknown');
+    assert.equal(herdrManagedDb.get('dead-owner', record.ownerGeneration)?.lifecycle, 'idle');
+    // A different generation's record proves nothing about this one.
+    await fs.writeFile(ownerFile, JSON.stringify({ ownerGeneration: 'other-generation', pid: stand.pid, startedAt: standToken }), { mode: 0o600 });
+    stand.kill('SIGKILL'); await exited;
+    assert.equal((await service.ensure('dead-owner', {})).status, 'unknown');
+    assert.equal(herdrManagedDb.get('dead-owner', record.ownerGeneration)?.lifecycle, 'idle');
+    // The exact recorded process is gone: this generation is fenced, nothing replaced.
+    await fs.writeFile(ownerFile, JSON.stringify({ ownerGeneration: record.ownerGeneration, pid: stand.pid, startedAt: standToken }), { mode: 0o600 });
+    const fenced = await service.ensure('dead-owner', {});
+    assert.equal(fenced.status, 'unknown');
+    assert.equal(fenced.ownerGeneration, record.ownerGeneration);
+    assert.equal(herdrManagedDb.get('dead-owner', record.ownerGeneration)?.lifecycle, 'interrupted');
+    assert.equal(db.get('dead-owner')!.phase, 'ready');
+    assert.deepEqual(db.get('dead-owner')!.placement, record.placement);
+    assert.equal(db.get('dead-owner')!.ownerGeneration, record.ownerGeneration, 'no replacement owner is provisioned');
+    assert.ok(await fs.stat(path.join(record.privateDirectory, 'bootstrap.json')), 'private files are retained');
+  } finally {
+    if (stand.exitCode === null && stand.signalCode === null) stand.kill('SIGKILL');
+    service.close();
+    if (host) await host.close().catch(() => {});
     for (const socket of sockets) socket.destroy();
     await new Promise<void>(resolve => herdr.close(() => resolve()));
     await fs.rm(root, { recursive: true, force: true });

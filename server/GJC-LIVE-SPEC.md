@@ -59,6 +59,23 @@ rejected before live delivery; the UI offers refusal, not password entry.
 Redaction of tagged permission inputs is not a promise that arbitrary
 credentials entered into an ordinary question will stay out of native history.
 
+A fenced owner (`unknown`, `interrupted`, `closed`) is still recoverable
+read-only: a reopened App attaches to an already-published owner without
+re-promoting readiness, `status`/`ack` queries and rejected commands are
+answered from durable state without being journaled, and no prompt is admitted
+or replayed. A private attach failure alone never fences a generation. The host
+records its exact process identity (`owner.json`: pid plus kernel start time)
+next to its attach socket; a reopened App confirms owner death only when that
+recorded process no longer exists or its start time differs, marks the
+generation `interrupted`, and keeps the claimed target, journal and private
+files. A live but unreachable owner stays unknown. The host's private SDK child
+reports between-turn runtime state as bounded `managed.idle` records journaled
+as `sdk.idle` under the last settled turn, never silently dropped and never
+presented as a live turn event; the child escalation path fences a failed
+claim only after the child's exit is observed. Appending owned placement into
+an already-focused owned workspace is valid; focus is verified by comparing the
+focused identities before and after the append.
+
 App-dependent automation waits on the original SDK callback while disconnected.
 Renewal binds the actual browser/application target and requires explicit
 resume approval. Only authoritative completed receipts or fenced

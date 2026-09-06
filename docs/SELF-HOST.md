@@ -152,6 +152,19 @@ admission/execution/settlement, not necessarily successful task completion.
 After a missing reply, use `:ack ACTION` and `:status` before any retry.
 Unknown needs status and authoritative proof, **not restart-and-retry** or a
 fresh action ID. Do not mutate foreign tasks to recover a managed one.
+A fenced owner (`unknown`, `interrupted`) still answers `:status` and
+`:ack ACTION` from what it durably knows, and rejects new commands with
+`ACK ACTION rejected SEQ`; those replies are not journaled and nothing is
+admitted. A reopened App attaches to such an owner read-only and shows the same
+unknown receipts. When the exact owner process is confirmed gone (its recorded
+pid no longer exists or belongs to a newer process), the App marks that
+generation `interrupted`; an unreachable but live owner stays unknown, and no
+replacement owner is started either way.
+
+Console display output is lossy under backpressure: when the terminal falls
+behind, display blocks are dropped behind one visible `OMITTED N display
+blocks` marker while `ACK`/`REQUEST`/`REJECT`/`STATUS` records are kept in
+order. Only critical-record overflow disconnects the console.
 
 The App server projects mappings through a generation/sequence CAS. Project
 policy writers share revision-checked storage; the live host alone resolves its

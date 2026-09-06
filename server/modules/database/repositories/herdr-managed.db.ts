@@ -294,7 +294,10 @@ export const herdrManagedDb = {
     getConnection().transaction(() => {
     herdrManagedLifecycleSchema.parse(lifecycle);
     const binding = this.get(appSessionId, ownerGeneration);
-    if (!binding || (['unknown', 'interrupted', 'closed'].includes(binding.lifecycle) && lifecycle !== binding.lifecycle && lifecycle !== 'closed')) {
+    // Fenced owners only move toward stronger facts: an unknown owner may be
+    // confirmed interrupted, and either may be confirmed closed. Nothing revives.
+    if (!binding || (['unknown', 'interrupted', 'closed'].includes(binding.lifecycle) && lifecycle !== binding.lifecycle && lifecycle !== 'closed'
+      && !(binding.lifecycle === 'unknown' && lifecycle === 'interrupted'))) {
       throw new Error('Managed owner cannot be resurrected.');
     }
     this.appendEvent({ appSessionId, ownerGeneration, kind: 'managed.session', payload: { lifecycle } });
@@ -415,7 +418,8 @@ export const herdrManagedDb = {
       const old = this.getCommand(command.appSessionId, command.ownerGeneration, command.actionId);
       if (old) {
         if (old.payloadHash !== command.payloadHash || old.kind !== command.kind) throw new Error('Managed command conflict.');
-        return old;
+        const { kind: _kind, payloadHash: _payloadHash, ...receipt } = old;
+        return receipt;
       }
       const receipt = this.recordCommand({ ...command, state: 'admitted', message: 'Queued.' });
       this.appendEvent({ ...command, kind: 'managed.queue', payload: { action: 'enqueue', entry: {

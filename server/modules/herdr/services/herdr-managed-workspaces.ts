@@ -10,6 +10,7 @@ import { herdrManagedProvisionDb, getConnection, herdrManagedDb, type ProvisionR
 import { enrichGjcSdkRunOptions } from '../../../gjc-worker-client.js';
 
 import { HerdrManagedAttachClient } from './herdr-managed-client.js';
+import { confirmOwnerDeath, type OwnerLiveness } from './herdr-owner-liveness.js';
 import { getProductionHerdrSessionsService, type HerdrSessionsService, type HerdrProvisioningHandle } from './herdr-sessions.js';
 
 export type HerdrManagedTrustedOptions = { modelId?: string; model?: string; modelProfile?: string; effort?: string };
@@ -103,6 +104,22 @@ export class HerdrManagedWorkspacesService {
   #uncertain(record: ProvisionRecord): EnsureManagedConversationResult {
     return { status: 'unknown', appSessionId: record.appSessionId, providerSessionId: record.providerSessionId, ownerGeneration: record.ownerGeneration, selectedSessionName: record.selectedSessionName };
   }
+  /**
+   * A failed private attach is reconciled only against exact evidence. When the
+   * recorded owner process is confirmed gone, its generation is fenced as
+   * interrupted so nothing waits on it; the claimed target, journal and private
+   * files are retained and no replacement owner is started here.
+   */
+  async #reconcileOwner(record: ProvisionRecord): Promise<OwnerLiveness> {
+    const liveness = await confirmOwnerDeath(record.privateDirectory, record.ownerGeneration);
+    if (liveness === 'confirmed_dead') {
+      const binding = herdrManagedDb.get(record.appSessionId, record.ownerGeneration);
+      if (binding && !['interrupted', 'closed'].includes(binding.lifecycle)) {
+        try { herdrManagedDb.setLifecycle(record.appSessionId, record.ownerGeneration, 'interrupted'); } catch { /* concurrent terminal write wins */ }
+      }
+    }
+    return liveness;
+  }
   async #ensure(id: string, options: HerdrManagedTrustedOptions): Promise<EnsureManagedConversationResult> {
     const projectPath = this.#db.projectPath(id);
     if (!projectPath) throw new Error('Session is not registered as managed.');
@@ -114,10 +131,12 @@ export class HerdrManagedWorkspacesService {
           await this.attach(id);
           return this.#result(this.#db.get(id)!);
         } catch {
-          // A private attach failure does not prove owner death. Preserve the
-          // claimed target so the reporter can still clean it up and a later
-          // attach can recover the same owner.
-          return this.#uncertain(this.#db.get(id)!);
+          // A private attach failure alone does not prove owner death. Preserve
+          // the claimed target so the reporter can still clean it up and a later
+          // attach can recover the same owner; only exact process evidence fences it.
+          const current = this.#db.get(id)!;
+          await this.#reconcileOwner(current);
+          return this.#uncertain(current);
         }
       }
       // Another process may still be executing the recorded intent, or its
@@ -197,7 +216,11 @@ export class HerdrManagedWorkspacesService {
       if (state.identity.appSessionId !== id || state.identity.ownerGeneration !== record.ownerGeneration || !state.providerSessionId) throw new Error('Managed host identity mismatch.');
       const current = this.#db.get(id);
       if (!current?.placement || (current.providerSessionId !== null && current.providerSessionId !== state.providerSessionId)) throw new Error('Managed host placement is not published.');
-      this.#db.projectReady(id, record.ownerGeneration, state.providerSessionId);
+      // An owner that already published readiness is recovered exactly as it
+      // is: an unknown or interrupted lifecycle is inspected read-only through
+      // the same authenticated client, never re-promoted or replayed.
+      const published = current.phase === 'ready' && current.providerSessionId === state.providerSessionId;
+      if (!published) this.#db.projectReady(id, record.ownerGeneration, state.providerSessionId);
       this.#clients.set(id, client); return client;
     } catch (error) { client.close(); this.#clients.delete(id); throw error; }
     finally { if (timer) clearTimeout(timer); }

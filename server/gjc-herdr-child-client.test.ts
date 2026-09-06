@@ -143,6 +143,23 @@ test('a delayed native title may settle once on the first prompt identity, but a
   await assert.rejects(arbitrary.transport.request({ ...prompt, requestId: 'after', runId: 'after', actionId: 'after' }), /Managed child protocol failed/);
 });
 
+test('bounded idle records after a settled prompt are persisted and acknowledged, unlike bare late turn events', async () => {
+  const journal: string[] = [];
+  const f = fixture((frame) => { journal.push(String(frame.event.kind)); });
+  const settled = f.transport.request(prompt);
+  f.emit({ type: 'response', requestId: 'p', runId: 'p', ok: true });
+  assert.equal((await settled).ok, true);
+  f.emit({ type: 'event', requestId: 'p', runId: 'p', eventSeq: 1, event: { kind: 'managed.idle', afterActionId: 'p', event: { kind: 'text', text: 'late background result' } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(journal, ['managed.idle']);
+  assert.equal(f.writes.at(-1)?.eventSeq, 1, 'the idle record is acknowledged so the child can drain');
+  const next = f.transport.request({ ...prompt, requestId: 'next', runId: 'next', actionId: 'next' });
+  f.emit({ type: 'event', requestId: 'next', runId: 'next', eventSeq: 2, event: { kind: 'text', text: 'live' } });
+  f.emit({ type: 'response', requestId: 'next', runId: 'next', ok: true });
+  assert.equal((await next).ok, true);
+  assert.deepEqual(journal, ['managed.idle', 'text']);
+});
+
 test('oversized complete multibyte frame rejects every waiter', async () => {
   const f = fixture(() => {});
   const p = f.transport.request(prompt);

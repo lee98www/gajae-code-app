@@ -267,9 +267,15 @@ export function renderEvent(event: ConsoleEventView, secrets: readonly string[] 
   return event.secret ? '[redacted]' : sanitizeConsoleText(event.text ?? '', 8192, secrets);
 }
 
-/** Bounded outstanding bytes. Critical overflow disconnects visibly via callback instead of losing receipts. */
+/**
+ * Bounded outstanding bytes. Display output is lossy: blocks that do not fit
+ * are dropped behind exactly one visible omission marker. Critical records
+ * (ACK/REQUEST/REJECT/STATUS) are never dropped; critical overflow disconnects
+ * visibly via callback instead of losing receipts.
+ */
 export class ConsoleOutputWriter {
   #queue: string[] = []; #bytes = 0; #blocked = false; #closed = false;
+  #omitted = 0;
   constructor(private readonly output: Writable, private readonly onDisconnect: (reason: string) => void) {
     output.on('drain', this.#drain); output.on('error', this.#error); output.on('close', this.#close);
   }
@@ -279,16 +285,26 @@ export class ConsoleOutputWriter {
       this.close('critical_block_overflow'); return false;
     }
     const line = `${sanitizeConsoleText(block, 8191)}\n`; const bytes = Buffer.byteLength(line);
-    if (this.#bytes + this.output.writableLength + bytes > MAX) {
-      // Disconnect is also safe for display; no silent loss or unbounded omission markers.
-      this.close(priority === 'critical' ? 'critical_output_overflow' : 'display_output_overflow'); return false;
+    if (priority === 'display' && (this.#omitted > 0 || !this.#fits(bytes))) {
+      // Once display output falls behind, later display blocks stay behind the
+      // pending marker so a stalled console never reorders what it shows.
+      this.#omitted++; return false;
     }
+    if (!this.#fits(bytes)) { this.close('critical_output_overflow'); return false; }
     this.#queue.push(line); this.#bytes += bytes; this.#flush(); return !this.#closed;
   }
+  #fits(bytes: number): boolean { return this.#bytes + this.output.writableLength + bytes <= MAX; }
   #flush(): void {
     while (!this.#closed && !this.#blocked && this.#queue.length) {
       const line = this.#queue.shift()!; this.#bytes -= Buffer.byteLength(line);
       try { this.#blocked = !this.output.write(line); } catch { this.close('output_error'); }
+    }
+    if (!this.#closed && !this.#blocked && this.#omitted > 0) {
+      const marker = `OMITTED ${this.#omitted} display blocks\n`;
+      if (this.#fits(Buffer.byteLength(marker))) {
+        this.#omitted = 0;
+        try { this.#blocked = !this.output.write(marker); } catch { this.close('output_error'); }
+      }
     }
   }
   #drain = () => { this.#blocked = false; this.#flush(); };

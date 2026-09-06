@@ -452,6 +452,51 @@ test('console status exposes safe session, active-turn, queue and request identi
   });
 });
 
+test('a terminal user controls an App-started turn from rendered console identity alone', async () => {
+  await withManagedDatabase(async tmp => {
+    herdrManagedDb.reserve({ appSessionId: 'managed-session', projectPath: '/tmp/project', herdrInstanceId: 'herdr-main', ownerGeneration: 'owner-gen-1' });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    output.setEncoding('utf8');
+    let stdout = '';
+    output.on('data', chunk => { stdout += String(chunk); });
+    const controls: string[] = [];
+    let release!: () => void;
+    const host = await runHerdrTaskHostStdio({
+      bootstrap: { appSessionId: 'managed-session', ownerGeneration: 'owner-gen-1', herdrInstanceId: 'herdr-main', projectPath: '/tmp/project', sessionRoot: tmp },
+      input,
+      output,
+      createSession: () => ({
+        providerSessionId: 'provider-session-1',
+        prompt: () => new Promise<void>(resolve => { release = resolve; }),
+        async steer(text, _actionId, runId) { controls.push(`steer:${runId}:${text}`); return true; },
+        async abort(_actionId, runId) { controls.push(`abort:${runId}`); release(); return true; },
+      }),
+    });
+    const until = async (predicate: () => boolean) => { for (let i = 0; i < 200 && !predicate(); i++) await new Promise(resolve => setTimeout(resolve, 5)); assert.ok(predicate()); };
+    // The App starts the turn; the terminal learns about it only from what the console prints.
+    const started = host.dispatch(promptCommand(crypto.randomUUID(), 'from the App'));
+    void started.catch(() => {});
+    await until(() => host.snapshot().activeTurnId !== null);
+    const statusStart = stdout.length;
+    input.write(':status\n');
+    await until(() => stdout.slice(statusStart).includes('activeTurnId='));
+    const rendered = /STATUS \S+ \d+ appSessionId=(\S+) ownerGeneration=(\S+) providerSessionId=\S+ activeTurnId=(\S+) queue=/.exec(stdout.slice(statusStart));
+    assert.ok(rendered);
+    const [, appSessionId, ownerGeneration, turn] = rendered;
+    assert.equal(appSessionId, 'managed-session'); assert.equal(ownerGeneration, 'owner-gen-1');
+    assert.notEqual(turn, '-');
+    input.write(`:steer console-steer ${turn} "keep going"\n`);
+    await until(() => stdout.includes('ACK console-steer settled'));
+    input.write(`:abort console-abort ${turn}\n`);
+    await until(() => stdout.includes('ACK console-abort settled'));
+    assert.equal((await started).state, 'settled');
+    assert.deepEqual(controls, [`steer:${turn}:keep going`, `abort:${turn}`]);
+    assert.equal(host.snapshot().activeTurnId, null);
+    await host.close();
+  });
+});
+
 test('private attach clients authenticate, share one host, and EOF leaves owner alive', async () => {
   await withManagedDatabase(async (tmp) => {
     herdrManagedDb.reserve({ appSessionId: 'managed-session', projectPath: '/tmp/project', herdrInstanceId: 'herdr-main', ownerGeneration: 'owner-gen-1' });

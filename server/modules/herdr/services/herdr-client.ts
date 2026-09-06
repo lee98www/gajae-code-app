@@ -433,6 +433,15 @@ export class HerdrClient {
     if (!argv.length || argv.some((arg) => typeof arg !== 'string' || arg.includes('\0')) || !argv[0]) {
       throw new HerdrError('HERDR_INVALID_REQUEST', 400, 'Invalid managed host argv.');
     }
+    // Focus is verified by before/after comparison: an append with focus:false
+    // must leave every focused identity exactly as it was. A parent workspace
+    // the user already focused therefore stays focused and remains valid.
+    const focusOf = (s: HerdrWireSnapshot) => ({
+      workspaces: s.workspaces.filter((w) => w.focused).map((w) => w.workspace_id).sort(),
+      tabs: s.tabs.filter((t) => t.focused).map((t) => t.tab_id).sort(),
+      panes: s.panes.filter((p) => p.focused).map((p) => p.pane_id).sort(),
+    });
+    const before = focusOf(await this.snapshot(signal, guard));
     const receipt = await this.request('layout.apply', {
       workspace_id: workspaceId, focus: false, root: { type: 'pane', command: [...argv], cwd, env: {} },
     }, (value) => {
@@ -449,15 +458,18 @@ export class HerdrClient {
       if (!tabId.startsWith(`${workspaceId}:t`) || !paneId.startsWith(`${workspaceId}:p`) || layout.focused_pane_id !== paneId) throw new Error('Invalid layout pane mapping.');
       return { tabId, paneId };
     }, signal, guard);
-    // LayoutDescription has no terminal id. Resolve only its exact IDs, never focus.
+    // LayoutDescription has no terminal id. Resolve only its exact IDs.
     const snapshot = await this.snapshot(signal, guard);
     const workspaces = snapshot.workspaces.filter((w) => w.workspace_id === workspaceId);
     const tabs = snapshot.tabs.filter((t) => t.tab_id === receipt.tabId);
     const panes = snapshot.panes.filter((p) => p.pane_id === receipt.paneId);
     if (workspaces.length !== 1 || tabs.length !== 1 || tabs[0]!.workspace_id !== workspaceId || panes.length !== 1 ||
-      panes[0]!.workspace_id !== workspaceId || panes[0]!.tab_id !== receipt.tabId || workspaces[0]!.focused || tabs[0]!.focused ||
+      panes[0]!.workspace_id !== workspaceId || panes[0]!.tab_id !== receipt.tabId || tabs[0]!.focused ||
       panes[0]!.focused || (panes[0]!.cwd !== '' && panes[0]!.cwd !== cwd)) {
       throw new HerdrError('HERDR_INVALID_RESPONSE', 502, 'Herdr layout mapping is unknown.');
+    }
+    if (JSON.stringify(focusOf(snapshot)) !== JSON.stringify(before)) {
+      throw new HerdrError('HERDR_INVALID_RESPONSE', 502, 'Herdr layout changed focus.');
     }
     return Object.freeze({ workspaceId, ...receipt, terminalId: panes[0]!.terminal_id });
   }

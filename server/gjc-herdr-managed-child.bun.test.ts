@@ -91,9 +91,9 @@ const createSessionFactory = async (input) => {
       emit({ type: 'tool_execution_end', toolCallId: 'tool:' + turns, toolName: 'read', result: { content: [{ type: 'text', text: String(answer) }], details: { turn: turns } }, isError: false });
       emit({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'answer:' + turns }], stopReason: text === 'fail' ? 'error' : 'stop', ...(text === 'fail' ? { errorMessage: 'first failure' } : {}), usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 } } });
       this.isStreaming = false;
-      // Real runtimes keep reporting background state after a turn (a late
-      // title attempt, bookkeeping). No turn owns it once the prompt settles.
-      if (text === 'idle-after') setTimeout(() => emit({ type: 'notice', level: 'info', message: 'idle:late-bookkeeping' }), 150);
+      // Real runtimes keep reporting background state after a turn (late tool
+      // updates, notices, bookkeeping). No turn owns it once the prompt settles.
+      if (text === 'idle-after') setTimeout(() => { for (let index = 0; index < 20; index += 1) emit({ type: 'notice', level: 'info', message: 'idle:late-bookkeeping:' + index }); }, 150);
     },
     async abort() { resolveAbort?.('aborted'); },
     async dispose() { resolveAbort?.('disposed'); await writeFile(${JSON.stringify(disposalFile)}, JSON.stringify({ creations, turns, steers })); },
@@ -304,7 +304,7 @@ test('managed Always remains host-owned and a later changed policy is consulted 
   } finally { await h.cleanup(); }
 });
 
-test('idle runtime events after a settled turn are dropped so close stays confirmable', { timeout: 20_000 }, async () => {
+test('idle runtime events after a settled turn are journaled as bounded idle records and close stays confirmable', { timeout: 20_000 }, async () => {
   const h = await harness();
   try {
     await h.init();
@@ -317,8 +317,15 @@ test('idle runtime events after a settled turn are dropped so close stays confir
     const settledFrames = h.frames.length;
     await new Promise((resolve) => setTimeout(resolve, 500));
     const late = h.frames.slice(settledFrames).filter((f): f is ManagedChildEvent => f.type === 'event');
-    assert.deepEqual(late, [], 'no event may follow the settled prompt response');
-    assert.equal(JSON.stringify(h.frames).includes('idle:late-bookkeeping'), false);
+    // Nothing is presented under the settled identity as a live turn event, and
+    // nothing vanishes: each idle report is wrapped, bounded, and the bound is recorded once.
+    assert.equal(late.length, 17);
+    assert.ok(late.every((f) => f.requestId === 'settled' && f.runId === 'settled' && f.event.kind === 'managed.idle' && f.event.afterActionId === 'settled'));
+    const wrapped = late.slice(0, 16).map((f) => (f.event.event as { text?: string; content?: string; message?: string }));
+    assert.equal(JSON.stringify(wrapped).includes('idle:late-bookkeeping:0'), true);
+    assert.equal(JSON.stringify(wrapped).includes('idle:late-bookkeeping:15'), true);
+    assert.equal(JSON.stringify(late).includes('idle:late-bookkeeping:16'), false);
+    assert.deepEqual(late[16]!.event, { kind: 'managed.idle', afterActionId: 'settled', omittedAfter: 16 });
     h.send({ type: 'close', requestId: 'close', actionId: 'close' });
     assert.equal((await h.response('close')).ok, true);
     assert.equal(await h.exited, 0);
