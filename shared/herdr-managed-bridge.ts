@@ -88,3 +88,6 @@ export function parseManagedBridgeRequest(line: string): HerdrManagedBridgeReque
   if (new TextEncoder().encode(line).byteLength > HERDR_MANAGED_MAX_FRAME_BYTES) throw new Error('Managed bridge frame too large.');
   return herdrManagedBridgeRequestSchema.parse(JSON.parse(line));
 }
+
+/** Error code the App attaches to a managed target resolution it definitively refused. */
+export const HERDR_MANAGED_TARGET_REJECTED = 'target_rejected' as const;

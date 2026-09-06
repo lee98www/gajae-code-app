@@ -1254,10 +1254,12 @@ test('between-turn events cross the publication boundary and a lost idle journal
     herdrManagedDb.reserve({ appSessionId: 'managed-session', projectPath: '/tmp/project', herdrInstanceId: 'herdr-main', ownerGeneration: 'owner-gen-1' });
     const secret = 't'.repeat(32);
     let emit!: (event: Record<string, unknown>, seq: number) => void | Promise<void>;
+    let onEventRun!: (runId: string, event: Record<string, unknown>, seq: number) => void | Promise<void>;
     const host = new HerdrTaskHost({
       bootstrap: { appSessionId: 'managed-session', ownerGeneration: 'owner-gen-1', herdrInstanceId: 'herdr-main', projectPath: '/tmp/project', sessionRoot: '/tmp/gjc', attachSocketPath: '/tmp/unused.sock', attachSecret: secret },
       createSession: ({ onEvent }) => {
         emit = (event, seq) => onEvent({ version: 1, generation: 'owner-gen-1', requestId: 'action:turn-1', runId: 'turn-1', type: 'event', eventSeq: seq, event });
+        onEventRun = (runId, event, seq) => onEvent({ version: 1, generation: 'owner-gen-1', requestId: `action:${runId}`, runId, type: 'event', eventSeq: seq, event });
         return {
           providerSessionId: 'provider-session-1',
           async prompt() {
@@ -1275,22 +1277,32 @@ test('between-turn events cross the publication boundary and a lost idle journal
     await emit({ kind: 'managed.idle', afterActionId: 'turn-1', event: { kind: 'text', text: `notice ${secret}` } }, 5);
     const idle = herdrManagedDb.eventsSince('managed-session', 'owner-gen-1', 0).filter(event => event.kind === 'sdk.idle');
     assert.equal(idle.length, 2);
-    const [lateResult, lateNotice] = idle.map(event => event.payload as { event: Record<string, unknown>; turnId: string });
+    const [lateResult, lateNotice] = idle.map(event => event.payload as { event: Record<string, unknown>; turnId?: string; transportRunId: string });
     assert.deepEqual(lateResult.event, { kind: 'tool_result', toolId: 'browser-1', content: '[Protected automation result]', isError: false, isFinal: true });
     assert.equal(lateResult.turnId, 'turn-1');
     assert.deepEqual(lateNotice.event, { kind: 'text', text: 'notice [redacted]' });
+    // A late record travelling under a later prompt's run keeps its causal turn;
+    // the transport run is recorded apart and never becomes the turn identity.
+    await onEventRun('turn-2', { kind: 'managed.idle', afterActionId: 'turn-1', event: { kind: 'tool_result', toolId: 'browser-1', content: 'late under turn-2', isFinal: true } }, 6);
+    const crossed = herdrManagedDb.eventsSince('managed-session', 'owner-gen-1', 0).filter(event => event.kind === 'sdk.idle').at(-1)!.payload as { turnId?: string; transportRunId: string; afterActionId: string };
+    assert.deepEqual([crossed.turnId, crossed.transportRunId, crossed.afterActionId], ['turn-1', 'turn-2', 'turn-1']);
+    // Without a causal origin there is no turn identity to claim, only the transport run.
+    await onEventRun('turn-2', { kind: 'managed.idle', afterActionId: null, event: { kind: 'text', text: 'orphan' } }, 7);
+    const orphan = herdrManagedDb.eventsSince('managed-session', 'owner-gen-1', 0).filter(event => event.kind === 'sdk.idle').at(-1)!.payload as { turnId?: string; transportRunId: string };
+    assert.equal(Object.hasOwn(orphan, 'turnId'), false);
+    assert.equal(orphan.transportRunId, 'turn-2');
     assert.doesNotMatch(JSON.stringify(idle), new RegExp(secret));
     // A writable owner whose journal write fails has lost an event: the failure
     // reaches the transport instead of being acknowledged as fenced.
     const appendEvent = herdrManagedDb.appendEvent;
     herdrManagedDb.appendEvent = () => { throw new Error('SQLITE_FULL: database or disk is full'); };
     try {
-      await assert.rejects(Promise.resolve().then(() => emit({ kind: 'managed.idle', afterActionId: 'turn-1', event: { kind: 'text', text: 'lost' } }, 6)), /SQLITE_FULL/);
+      await assert.rejects(Promise.resolve().then(() => emit({ kind: 'managed.idle', afterActionId: 'turn-1', event: { kind: 'text', text: 'lost' } }, 8)), /SQLITE_FULL/);
     } finally { herdrManagedDb.appendEvent = appendEvent; }
     // A fenced owner's journal is not writable by design; that is not a lost event.
     herdrManagedDb.setLifecycle('managed-session', 'owner-gen-1', 'unknown');
-    await emit({ kind: 'managed.idle', afterActionId: 'turn-1', event: { kind: 'text', text: 'after fence' } }, 7);
-    assert.equal(herdrManagedDb.eventsSince('managed-session', 'owner-gen-1', 0).filter(event => event.kind === 'sdk.idle').length, 2);
+    await emit({ kind: 'managed.idle', afterActionId: 'turn-1', event: { kind: 'text', text: 'after fence' } }, 9);
+    assert.equal(herdrManagedDb.eventsSince('managed-session', 'owner-gen-1', 0).filter(event => event.kind === 'sdk.idle').length, 4);
     await host.close().catch(() => {});
   });
 });

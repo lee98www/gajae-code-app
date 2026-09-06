@@ -297,3 +297,55 @@ test('managed ledger rejects unsafe permissions and symlink storage', async () =
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('a target the App can never bind is answered with the target_rejected code; other failures stay untyped', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'managed-bridge-reject-')));
+  const oldSocket = process.env.GAJAE_AUTOMATION_SOCKET;
+  process.env.GAJAE_AUTOMATION_SOCKET = join(root, 'bridge.sock');
+  const service = new AutomationService(root);
+  Object.defineProperty(service, 'supported', { value: true });
+  Object.defineProperty(service, 'grants', { value: new AutomationGrantStore({ get: () => null, set: () => {} }) });
+  let sidecarDown = false;
+  service.browser.state = async () => { if (sidecarDown) throw new Error('sidecar_unavailable: transport down'); return { sessionId: 's', activeTabId: null, tabs: [] }; };
+  service.browser.shutdown = async () => {};
+  service.cua.shutdown = async () => {};
+  await service.startBridge();
+  const raw = (body: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const transport = service.managedBridgeCapability()!;
+    return new Promise((resolve, reject) => {
+      const socket = net.createConnection(transport.socketPath);
+      let buffer = '';
+      socket.setTimeout(5000, () => { socket.destroy(); reject(new Error('RPC timeout')); });
+      socket.on('error', reject);
+      socket.on('connect', () => socket.write(`${JSON.stringify({ ...body, id: body.requestId, token: transport.token })}\n`));
+      socket.on('data', chunk => { buffer += chunk.toString(); if (!buffer.includes('\n')) return; socket.destroy(); resolve(JSON.parse(buffer.slice(0, buffer.indexOf('\n')))); });
+    });
+  };
+  const resolveFor = async (requestId: string, invocation: Record<string, unknown>) => {
+    const identity = { generation: 'g', provider: 'p', turn: 't', toolCallId: 'tool', index: 0, operationId: 'op', argumentsHash: await hashManagedInvocation(invocation), policyRevision: 0, targetContext: 'pending' };
+    return raw({ type: 'managed-resolve-target', requestId, identity, sourceOperationId: 'op', bridgeInstanceId: service.managedBridgeCapability()!.bridgeInstanceId, invocation });
+  };
+  try {
+    const blank = await resolveFor('r1', { surface: 'browser', sessionId: 's', operation: 'open', payload: { url: 'about:blank', allowDownload: false } });
+    assert.equal(blank.ok, false);
+    assert.equal(blank.code, 'target_rejected', JSON.stringify(blank));
+    assert.match(String(blank.error), /concrete http\(s\) origin; "about:blank" has none/);
+    const tabs = await resolveFor('r2', { surface: 'browser', sessionId: 's', operation: 'command', payload: { command: { action: 'newTab' } } });
+    assert.deepEqual([tabs.ok, tabs.code], [false, 'target_rejected']);
+    const ok = await resolveFor('r3', { surface: 'browser', sessionId: 's', operation: 'open', payload: { url: 'https://example.test/page', allowDownload: false } });
+    assert.equal(ok.ok, true);
+    // A transport failure while resolving is not a rejection of the target.
+    sidecarDown = true;
+    const down = await resolveFor('r4', { surface: 'browser', sessionId: 's', operation: 'command', payload: { command: { action: 'reload' } } });
+    assert.equal(down.ok, false);
+    assert.equal('code' in down, false, 'an uncertain failure carries no rejection code');
+    // A dispatch failure never carries the code either.
+    const dispatch = await raw({ type: 'managed-dispatch', requestId: 'r5', attempt: { identity: { generation: 'g', provider: 'p', turn: 't', toolCallId: 'tool', index: 0, operationId: 'op', argumentsHash: 'a'.repeat(64), policyRevision: 0, targetContext: 'x' }, originalCapabilityGeneration: 'cap', requestId: 'r5', bridgeInstanceId: 'other', sourceOperationId: 'op', targetBinding: { kind: 'discovery', operation: 'list_apps' } }, invocation: { surface: 'computer', sessionId: 's', operation: 'call', tool: 'list_apps', arguments: {} } });
+    assert.equal(dispatch.ok, false);
+    assert.equal('code' in dispatch, false);
+  } finally {
+    await service.shutdown();
+    if (oldSocket === undefined) delete process.env.GAJAE_AUTOMATION_SOCKET; else process.env.GAJAE_AUTOMATION_SOCKET = oldSocket;
+    await rm(root, { recursive: true, force: true });
+  }
+});

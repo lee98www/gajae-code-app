@@ -14,6 +14,8 @@ import {
   type ManagedChildResponse,
 } from '../shared/herdr-managed-child-protocol.js';
 
+import { MANAGED_CHILD_TOOL_ORIGIN_LIMIT } from './gjc-herdr-managed-child.js';
+
 /** This script is test-owned and imported, never a production bootstrap option. */
 function launcherSource(disposalFile: string, titleDelayMs = 0) {
   return `
@@ -84,6 +86,14 @@ const createSessionFactory = async (input) => {
       }
       if (text === 'overflow') {
         for (let index = 0; index < 129; index += 1) emit({ type: 'thinking_end', content: 'burst:' + index });
+      }
+      // A runtime that starts more tools than the origin bound without finishing any.
+      if (text.startsWith('tool-flood:')) {
+        const count = Number(text.slice('tool-flood:'.length));
+        for (let index = 0; index < count; index += 1) {
+          emit({ type: 'tool_execution_start', toolCallId: 'flood:' + index, toolName: 'bash', args: { command: 'sleep' } });
+          if (index % 64 === 63) await new Promise((resolve) => setTimeout(resolve, 5));
+        }
       }
       emit({ type: 'thinking_end', content: 'thinking:' + turns });
       // A background tool started by this turn whose completion arrives later.
@@ -400,6 +410,20 @@ test('a tool finishing after its turn settled is never attributed to the next pr
     h.send({ type: 'close', requestId: 'close', actionId: 'close' });
     assert.equal((await h.response('close')).ok, true);
     assert.equal(await h.exited, 0);
+  } finally { await h.cleanup(); }
+});
+
+test('more unresolved tool origins than the bound fail the child closed instead of forgetting an origin', { timeout: 30_000 }, async () => {
+  const h = await harness();
+  try {
+    await h.init();
+    h.send({ type: 'prompt', runId: 'flood', requestId: 'flood', actionId: 'flood', text: 'tool-flood:' + (MANAGED_CHILD_TOOL_ORIGIN_LIMIT + 1) });
+    assert.equal(await h.exited, 0);
+    const starts = h.frames.filter((f) => f.type === 'event' && f.runId === 'flood' && f.event.kind === 'tool_use');
+    assert.equal(starts.length, MANAGED_CHILD_TOOL_ORIGIN_LIMIT, 'every start up to the bound is journaled; the bound-plus-one start is never emitted');
+    assert.ok(!h.frames.some((f) => f.type === 'event' && f.event.kind === 'tool_use' && f.event.toolId === 'flood:' + MANAGED_CHILD_TOOL_ORIGIN_LIMIT));
+    assert.ok(!h.frames.some((f) => f.type === 'response' && f.runId === 'flood' && f.ok === true), 'the flooded turn never settles as ok');
+    assert.equal(JSON.parse(await readFile(h.disposalFile, 'utf8')).turns, 1);
   } finally { await h.cleanup(); }
 });
 

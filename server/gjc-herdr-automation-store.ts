@@ -80,7 +80,15 @@ export class ManagedAutomationStore {
       if (ref === operation.resultRef && !Object.hasOwn(record, 'result')) throw new Error('Automation result missing.');
       if (ref === operation.evidenceRef) {
         const evidence = record.evidence;
-        if (!attempt || !evidence || evidence.verifier !== 'managed-bridge-ledger-v1' || !Number.isFinite(Date.parse(evidence.observedAt))) throw new Error('Unverifiable automation evidence.');
+        if (!evidence || !Number.isFinite(Date.parse(evidence.observedAt))) throw new Error('Unverifiable automation evidence.');
+        if (evidence.verifier === 'managed-bridge-target-rejection-v1') {
+          // The App refused to bind this invocation before anything was
+          // dispatched: no attempt, no dispatch, no result, only the reason.
+          const content = evidence.content as { error?: unknown } | null;
+          if (attempt || operation.phase !== 'cancelled' || operation.dispatchCount !== 0 || operation.resultRef || Object.hasOwn(record, 'result') || typeof content?.error !== 'string' || !content.error) throw new Error('Unverifiable target rejection evidence.');
+          continue;
+        }
+        if (!attempt || evidence.verifier !== 'managed-bridge-ledger-v1') throw new Error('Unverifiable automation evidence.');
         const receipt = verifyManagedBridgeReceipt(evidence.content, attempt);
         if (receipt.status === 'completed') {
           completed = true;

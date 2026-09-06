@@ -4,7 +4,7 @@ import net, { type Server as NetServer, type Socket } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { canonicalManagedInvocation, herdrManagedBridgeRequestSchema, verifyManagedBridgeInvocation, type HerdrManagedBridgeRequest, type HerdrManagedBridgeResponse } from '../../../shared/herdr-managed-bridge.js';
+import { canonicalManagedInvocation, HERDR_MANAGED_TARGET_REJECTED, herdrManagedBridgeRequestSchema, verifyManagedBridgeInvocation, type HerdrManagedBridgeRequest, type HerdrManagedBridgeResponse } from '../../../shared/herdr-managed-bridge.js';
 import { herdrManagedTargetBindingSchema, managedInstalledBundleIdSchema, type HerdrManagedAutomationIdentity, type HerdrManagedTargetBinding } from '../../../shared/herdr-managed-protocol.js';
 
 import { ManagedBridgeLedger } from './managed-bridge-ledger.js';
@@ -125,6 +125,11 @@ const COMPUTER_DISCOVERY_TOOLS = new Set<CuaSafeTool>([
  */
 const WORKSPACE_BROWSER_APPLICATION_ID = 'app.gajae.workspace-browser';
 const WORKSPACE_BROWSER_LABEL = 'Workspace Browser';
+
+/** An invocation the App can never bind to a managed target; nothing was dispatched. */
+export class ManagedTargetRejectedError extends Error {
+  constructor(message: string) { super(message); this.name = 'ManagedTargetRejectedError'; }
+}
 
 export class AutomationService {
   readonly browser = new BrowserSidecarClient();
@@ -431,11 +436,11 @@ export class AutomationService {
 
   private async resolveManagedTarget(request: BridgeRequest, signal: AbortSignal): Promise<HerdrManagedTargetBinding> {
     if (request.surface === 'browser') {
-      if (!['open', 'close', 'authorize', 'command'].includes(String(request.operation))) throw new Error('Unsupported managed browser operation.');
+      if (!['open', 'close', 'authorize', 'command'].includes(String(request.operation))) throw new ManagedTargetRejectedError('Unsupported managed browser operation.');
       if (request.operation === 'close') return { kind: 'session-management', operation: 'close', sessionId: request.sessionId };
       const payload = object(request.payload);
       const command = object(payload.command);
-      if (['selectTab', 'newTab', 'closeTab'].includes(String(command.action))) throw new Error('Managed tab management requires a new target binding.');
+      if (['selectTab', 'newTab', 'closeTab'].includes(String(command.action))) throw new ManagedTargetRejectedError('Managed tab management requires a new target binding.');
       const rawUrl = request.operation === 'command' ? command.url : payload.url;
       let state: BrowserSessionState;
       try { state = await this.browser.state(request.sessionId, signal) as BrowserSessionState; }
@@ -449,15 +454,15 @@ export class AutomationService {
       const tab = state.tabs.find(candidate => candidate.id === state.activeTabId);
       if (rawUrl !== undefined) {
         const origin = typeof rawUrl === 'string' ? automationOrigin(rawUrl) : null;
-        if (!origin) throw new Error('Managed browser target requires a concrete origin.');
+        if (!origin) throw new ManagedTargetRejectedError(`Managed browser target requires a concrete http(s) origin; ${typeof rawUrl === 'string' ? JSON.stringify(rawUrl.slice(0, 200)) : 'the url'} has none.`);
         return { kind: 'browser-origin', origin, tabId: tab?.id ?? 'no-active-tab' };
       }
       if (!tab && request.operation === 'open') return { kind: 'session-management', operation: 'open', sessionId: request.sessionId };
       const origin = tab && automationOrigin(tab.url);
-      if (!tab || !origin) throw new Error('Managed browser target is unresolved.');
+      if (!tab || !origin) throw new ManagedTargetRejectedError('Managed browser target is unresolved: open a page with a concrete http(s) origin first.');
       return { kind: 'browser-origin', origin, tabId: tab.id };
     }
-    if (!isCuaSafeTool(request.tool)) throw new Error('Unsupported managed computer operation.');
+    if (!isCuaSafeTool(request.tool)) throw new ManagedTargetRejectedError('Unsupported managed computer operation.');
     const args = object(request.arguments);
     if (request.tool === 'launch_app') {
       const payload = object(request.payload);
@@ -468,7 +473,7 @@ export class AutomationService {
         || (payload.application !== undefined && payload.application !== args.bundle_id)
         || (payload.scope !== undefined && !['session', 'always'].includes(String(payload.scope)))
         || (request.operation !== 'authorize' && Object.keys(payload).length > 0)) {
-        throw new Error('Managed launch requires only an exact bundle_id selector.');
+        throw new ManagedTargetRejectedError('Managed launch requires only an exact bundle_id selector.');
       }
       return this.installedApps.resolve(args.bundle_id as string, signal);
     }
@@ -664,12 +669,14 @@ export class AutomationService {
     const controller = new AbortController();
     const abort = () => controller.abort();
     socket.once('close', abort);
+    let managedResolve = false;
     try {
       request = JSON.parse(line) as BridgeRequest;
       if (typeof object(request).type === 'string' && String(object(request).type).startsWith('managed-')) {
         const { id, token, ...body } = object(request);
         if (token !== this.bridgeToken || !safeBridgeId(id)) throw new Error('Unauthorized automation bridge request.');
         const managed = herdrManagedBridgeRequestSchema.parse(body);
+        managedResolve = managed.type === 'managed-resolve-target';
         if (id !== (managed.type === 'managed-resolve-target' ? managed.requestId : managed.attempt.requestId)) throw new Error('Managed request ID mismatch.');
         const result = await this.handleManaged(managed, controller.signal);
         socket.write(`${JSON.stringify({ id, ok: true, result })}\n`);
@@ -705,6 +712,10 @@ export class AutomationService {
         id: request && typeof request.id === 'string' ? request.id : 'invalid',
         ok: false,
         error: error instanceof Error ? error.message.slice(0, 1_000) : 'Automation bridge request failed.',
+        // Only a target resolution the App definitively refused carries a code;
+        // every other failure stays an untyped answer the caller treats as
+        // uncertain.
+        ...(error instanceof ManagedTargetRejectedError && managedResolve ? { code: HERDR_MANAGED_TARGET_REJECTED } : {}),
       })}\n`);
     } finally {
       socket.off('close', abort);

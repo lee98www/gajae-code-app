@@ -14,7 +14,7 @@ import { herdrManagedProvisionDb } from '@/modules/database/repositories/herdr-m
 import { herdrManagedSnapshotsDb } from '@/modules/database/repositories/herdr-managed-snapshots.db.js';
 import { HerdrAgentReporter, HerdrClient, recordOwnerProcess, type HerdrAgentReporterStatus, type HerdrWireSnapshot } from '@/modules/herdr/index.js';
 
-import { verifyManagedBridgeReceipt, verifyManagedBridgeTarget, type HerdrManagedBridgeResolveRequest } from '../shared/herdr-managed-bridge.js';
+import { HERDR_MANAGED_TARGET_REJECTED, verifyManagedBridgeReceipt, verifyManagedBridgeTarget, type HerdrManagedBridgeResolveRequest } from '../shared/herdr-managed-bridge.js';
 import type { HerdrManagedChildAutomationControl, ManagedChildEvent, ManagedChildRequest, ManagedChildTurnOptions } from '../shared/herdr-managed-child-protocol.js';
 import {
   HERDR_MANAGED_PROTOCOL_VERSION,
@@ -32,7 +32,7 @@ import {
   type HerdrManagedHostHello,
 } from '../shared/herdr-managed-protocol.js';
 
-import { gjcAutoApprovalReason, managedBridgeRequest, type SdkRunConfig } from './gjc-engine.js';
+import { GjcAutomationResponseError, gjcAutoApprovalReason, managedBridgeRequest, type SdkRunConfig } from './gjc-engine.js';
 import { ManagedAutomationStore, automationCanonical } from './gjc-herdr-automation-store.js';
 import { ManagedChildTransport } from './gjc-herdr-child-client.js';
 import { acquireConsoleTerminal, ConsoleInputDecoder, ConsoleOutputWriter, parseConsoleLine, renderConsoleReceipt, renderConsoleReject, renderRequest, renderEvent } from './gjc-herdr-task-console.js';
@@ -545,7 +545,12 @@ export class HerdrTaskHost {
       // the same publication boundary as an in-turn event: automation payloads
       // stay protected and known tokens are redacted before anything is journaled.
       const inner = isObject(event.event) ? this.#protect(event.event) : undefined;
-      const payload = { ...event, ...(inner ? { event: inner } : {}), turnId: frame.runId };
+      // The causal origin (the turn that started the tool, or the last settled
+      // turn) is the record's turn identity. The transport run the frame
+      // travelled under is kept apart so a consumer keyed on turnId can never
+      // label a late result with whichever prompt happened to be active.
+      const causal = typeof event.afterActionId === 'string' && event.afterActionId ? event.afterActionId : null;
+      const payload = { ...event, ...(inner ? { event: inner } : {}), ...(causal ? { turnId: causal } : {}), transportRunId: frame.runId };
       try {
         herdrManagedDb.appendEvent({ appSessionId: this.#bootstrap.appSessionId, ownerGeneration: this.#bootstrap.ownerGeneration, kind: 'sdk.idle', payload });
       } catch (error) {
@@ -844,7 +849,16 @@ export class HerdrTaskHost {
       const policyRevision = herdrManagedDb.currentPolicy(this.#bootstrap.appSessionId, this.#bootstrap.ownerGeneration).revision;
       const sourceOperationId = record.sourceOperationId ?? operation.identity.operationId;
       const request: HerdrManagedBridgeResolveRequest = { type: 'managed-resolve-target', requestId: crypto.randomUUID(), identity: { ...operation.identity, policyRevision }, sourceOperationId, bridgeInstanceId: transport.bridgeInstanceId, invocation: record.arguments };
-      const target = await verifyManagedBridgeTarget(await managedBridgeRequest(bridgeTransport, request), request);
+      let resolved: unknown;
+      try { resolved = await managedBridgeRequest(bridgeTransport, request); } catch (error) {
+        // The App answered that this invocation can never be bound (no concrete
+        // origin, unsupported operation). Nothing was dispatched: the SDK
+        // callback fails with that reason instead of waiting for an attachment
+        // that can never come. Any other failure leaves the operation waiting.
+        if (!(error instanceof GjcAutomationResponseError) || error.code !== HERDR_MANAGED_TARGET_REJECTED || !connected()) throw error;
+        return this.#session.automationControl({ type: 'target-rejected', actionId: control.actionId, identity: operation.identity, error: this.#redact(error.message).slice(0, 1000) || 'Managed target rejected.' });
+      }
+      const target = await verifyManagedBridgeTarget(resolved, request);
       if (!connected() || herdrManagedDb.currentPolicy(this.#bootstrap.appSessionId, this.#bootstrap.ownerGeneration).revision !== policyRevision
         || automationCanonical(this.snapshot().automation[operation.identity.operationId]) !== automationCanonical(operation)) return false;
       const targetContext = automationCanonical(target.targetBinding);

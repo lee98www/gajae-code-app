@@ -300,3 +300,71 @@ await runManagedChild({ createAdapter: async () => ({ initializeManagedGjcSessio
     }
   });
 });
+
+test('a target the App can never bind fails the SDK callback with the App reason instead of waiting forever', { timeout: 30_000 }, async () => {
+  await fixture(async (root, create, client) => {
+    const script = path.join(root, 'child.ts');
+    await fs.writeFile(script, `
+import { runManagedChild } from ${JSON.stringify(fileURLToPath(new URL('./gjc-herdr-managed-child.ts', import.meta.url)))};
+import { GjcHerdrAutomationBroker } from ${JSON.stringify(fileURLToPath(new URL('./gjc-herdr-automation-broker.ts', import.meta.url)))};
+await runManagedChild({ createAdapter: async () => ({ initializeManagedGjcSession: async (_id, _config, writer, managed) => {
+  const broker = new GjcHerdrAutomationBroker({ generation: managed.generation, provider: 'provider', policyRevision: 0, emit: event => writer.send(event), flush: managed.flush });
+  return { providerSessionId: 'provider', setAutomationTurn: turn => broker.setTurn(turn), automationControl: control => broker.control(control), operationStatus: id => broker.status(id),
+    prompt: () => broker.dispatch({ toolCallId: 'tool', index: 0, request: { surface: 'browser', sessionId: 's', operation: 'open', payload: { url: 'about:blank', allowDownload: false } } })
+      .then(() => { writer.send({ kind: 'stream_end', content: 'opened' }); }, error => { writer.send({ kind: 'stream_end', content: 'tool-error:' + error.code + ':' + error.message }); }),
+    steer: async () => false, abort: async () => { await broker.abort(); return true; }, dispose: () => broker.abort(), validateApproval: () => false, resolveApproval: () => false };
+} }) });
+`);
+    const child = spawn(fileURLToPath(new URL('../dist-native/bun', import.meta.url)), [script], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const priorSocket = process.env.GAJAE_AUTOMATION_SOCKET;
+    process.env.GAJAE_AUTOMATION_SOCKET = path.join(root, 'bridge.sock');
+    let opens = 0;
+    const bridge = new AutomationService(root);
+    Object.defineProperty(bridge, 'supported', { value: true });
+    Object.defineProperty(bridge, 'grants', { value: new AutomationGrantStore({ get: () => null, set: () => {} }) });
+    bridge.browser.state = async () => ({ sessionId: 's', activeTabId: null, tabs: [] });
+    bridge.browser.open = async () => { opens++; return { opened: true }; };
+    bridge.browser.shutdown = async () => {};
+    bridge.cua.shutdown = async () => {};
+    try {
+      await bridge.startBridge();
+      const host = await create(({ onEvent, appSessionId, ownerGeneration }) => initializeManagedChildSession(child, { appSessionId, ownerGeneration, onEvent, agentDir: root, runConfig: { cwd: root, sessionRoot: root, credential: { kind: 'runtime-env', envVar: 'GJC_RUNTIME_API_KEY' }, modelId: 'fixture', toolNames: [], spawns: 'deny', bashPolicy: { allowedPrefixes: [] } } }));
+      const running = host.dispatch(command('turn', 'prompt', { text: 'open blank' }));
+      await wait(() => Object.keys(host.snapshot().automation).length === 1);
+      const owner = client(); await owner.connect();
+      const pending = Object.values(host.snapshot().automation)[0];
+      assert.equal(pending.phase, 'waiting_attachment');
+      const transport = bridge.managedBridgeCapability()!;
+      const bound = await owner.automationControl({ type: 'bind-capability', actionId: randomUUID(), identity: pending.identity, currentTransport: { ownerConnectionId: 'caller-cannot-choose', bridgeInstanceId: transport.bridgeInstanceId, transportLocator: transport.socketPath, transportToken: transport.token } });
+      assert.ok(bound.type === 'automation-control' && bound.accepted, 'the rejection is an accepted, terminal answer');
+      const settled = await running;
+      assert.equal(settled.state, 'settled', 'the turn continues: the model receives the tool error');
+      const operation = host.snapshot().automation[pending.identity.operationId];
+      assert.equal(operation.phase, 'cancelled');
+      assert.equal(operation.dispatchCount, 0);
+      assert.ok(operation.evidenceRef, 'the rejection is evidenced');
+      assert.equal(operation.resultRef, null, 'nothing was executed, so there is no result');
+      const store = new ManagedAutomationStore(root, identity.ownerGeneration);
+      try {
+        store.verify(operation);
+          const record = store.read(operation.evidenceRef, operation.identity.operationId);
+        assert.equal(record.evidence?.verifier, 'managed-bridge-target-rejection-v1');
+        assert.match(String((record.evidence?.content as { error?: string })?.error), /concrete http\(s\) origin; "about:blank" has none/);
+        assert.equal(Object.hasOwn(record, 'result'), false);
+      } finally { store.close(); }
+      const answer = host.snapshot().messages.at(-1)?.content ?? '';
+      assert.match(answer, /^tool-error:target_rejected:Managed browser target requires a concrete http\(s\) origin/);
+      assert.equal(opens, 0, 'nothing was dispatched');
+      // A late capability offer for the ended operation is refused, never dispatched.
+      const late = await owner.automationControl({ type: 'bind-capability', actionId: randomUUID(), identity: pending.identity, currentTransport: { ownerConnectionId: 'caller-cannot-choose', bridgeInstanceId: transport.bridgeInstanceId, transportLocator: transport.socketPath, transportToken: transport.token } });
+      assert.ok(late.type === 'automation-control' && !late.accepted);
+      owner.close();
+      await host.close();
+    } finally {
+      if (child.exitCode === null) child.kill('SIGKILL');
+      await bridge.shutdown();
+      if (priorSocket === undefined) delete process.env.GAJAE_AUTOMATION_SOCKET;
+      else process.env.GAJAE_AUTOMATION_SOCKET = priorSocket;
+    }
+  });
+});

@@ -9,6 +9,10 @@ export const herdrManagedChildAutomationControlSchema = z.union([
   z.object({ type: z.literal('attach-capability'), actionId: herdrManagedActionIdSchema, capability: herdrManagedCapabilitySchema }).strict(),
   z.object({ type: z.literal('reconcile-verified'), actionId: herdrManagedActionIdSchema, identity: herdrManagedAutomationIdentitySchema, receipt: herdrManagedBridgeReceiptSchema }).strict()
     .refine(v => Object.keys(v.identity).every(key => v.identity[key as keyof typeof v.identity] === v.receipt.attempt.identity[key as keyof typeof v.identity])),
+  // The App answered that this exact invocation can never be bound to a
+  // target (no concrete origin, unsupported operation). Nothing was sent; the
+  // SDK callback fails with that reason instead of waiting for an attachment.
+  z.object({ type: z.literal('target-rejected'), actionId: herdrManagedActionIdSchema, identity: herdrManagedAutomationIdentitySchema, error: z.string().min(1).max(1000) }).strict(),
 ]);
 export type HerdrManagedChildAutomationControl = z.infer<typeof herdrManagedChildAutomationControlSchema>;
 

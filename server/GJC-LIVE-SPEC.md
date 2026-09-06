@@ -93,7 +93,11 @@ host's private SDK child reports between-turn runtime state as bounded
 never presented as a live turn event. The SDK carries no turn identity on its
 callbacks; a tool started by one turn whose update arrives under a later
 prompt is recorded the same way under the turn that started it, never
-attributed to the active prompt. The wrapped event crosses the ordinary
+attributed to the active prompt; the journaled record's `turnId` is that
+causal origin (absent when there is none) and the transport run it travelled
+under is kept apart as `transportRunId`. The child never forgets an unresolved
+tool origin: past the origin bound it fails closed so the owner fences the
+turn unknown rather than misattributing a late result. The wrapped event crosses the ordinary
 publication boundary first (protected automation payloads, redacted known
 tokens), a fenced owner's journal silently declines it, and any other
 persistence failure fails the private transport instead of acknowledging a
@@ -113,7 +117,12 @@ turn that ends unknown is never additionally reported as a rejected command.
 
 App-dependent automation waits on the original SDK callback while disconnected.
 Renewal binds the actual browser/application target and requires explicit
-resume approval. Only authoritative completed receipts or fenced
+resume approval. An invocation the App definitively refuses to bind (no
+concrete http(s) origin, unsupported operation, tab management, an inexact
+launch selector) is answered with the `target_rejected` code; the host then
+ends that operation as an evidenced, never-dispatched cancellation and the SDK
+callback fails with the App's reason instead of waiting for an attachment that
+can never come. Every other resolution failure keeps the operation waiting. Only authoritative completed receipts or fenced
 not-dispatched outcomes permit recovery; an existing reservation with unknown
 outcome is not replayable. Missing command replies require status/ACK lookup,
 not restart, a new action ID, or a replacement task. A denial consumes its

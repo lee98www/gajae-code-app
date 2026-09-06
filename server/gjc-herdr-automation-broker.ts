@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 import { herdrManagedChildAutomationControlSchema, type HerdrManagedChildAutomationControl } from '../shared/herdr-managed-child-protocol.js';
-import { canonicalManagedInvocation as canonical, verifyManagedBridgeReceipt, type HerdrManagedBridgeAttempt, type HerdrManagedBridgeReceipt } from '../shared/herdr-managed-bridge.js';
+import { canonicalManagedInvocation as canonical, HERDR_MANAGED_TARGET_REJECTED, verifyManagedBridgeReceipt, type HerdrManagedBridgeAttempt, type HerdrManagedBridgeReceipt } from '../shared/herdr-managed-bridge.js';
 import type { HerdrManagedAutomationIdentity, HerdrManagedAutomationOperation, HerdrManagedAutomationProtectedRecord, HerdrManagedCapability } from '../shared/herdr-managed-protocol.js';
 
 import { managedBridgeRequest, GjcAutomationResponseError, type ManagedAutomationDispatcher } from './gjc-automation-tools.js';
@@ -136,6 +136,18 @@ export class GjcHerdrAutomationBroker {
     }
     const p = this.pending.get(c.identity.operationId);
     if (!p || canonical(p.operation.identity) !== canonical(c.identity)) return false;
+    if (c.type === 'target-rejected') {
+      // Nothing was ever dispatched for this invocation and the App has
+      // answered that nothing can be: the callback fails with that reason and
+      // the operation ends as a known, evidenced non-dispatch.
+      if (p.actualDispatch || p.operation.phase !== 'waiting_attachment' || this.cancelled.has(p)) return false;
+      const operation = p.operation;
+      p.record.evidence = { verifier: 'managed-bridge-target-rejection-v1', observedAt: new Date().toISOString(), content: { error: c.error } };
+      operation.evidenceRef = randomUUID(); operation.phase = 'cancelled';
+      this.cancelled.add(p); p.cleanup();
+      try { await this.publish(p); } finally { p.reject(new GjcAutomationResponseError(c.error, HERDR_MANAGED_TARGET_REJECTED)); }
+      return true;
+    }
     if (c.type === 'reconcile-verified') {
       if (p.operation.phase !== 'outcome_unknown' || !p.record.attempt) return false;
       let receipt: HerdrManagedBridgeReceipt;

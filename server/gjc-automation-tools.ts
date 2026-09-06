@@ -7,7 +7,7 @@ import type { ExtensionUIContext } from '@gajae-code/coding-agent/extensibility/
 import * as z from 'zod/v4';
 
 import { HERDR_MANAGED_MAX_FRAME_BYTES } from '../shared/herdr-managed-protocol.js';
-import { herdrManagedBridgeRequestSchema, type HerdrManagedBridgeRequest } from '../shared/herdr-managed-bridge.js';
+import { HERDR_MANAGED_TARGET_REJECTED, herdrManagedBridgeRequestSchema, type HerdrManagedBridgeRequest } from '../shared/herdr-managed-bridge.js';
 
 const browserActionSchema = z.object({
   verb: z.enum(['navigate', 'back', 'forward', 'reload', 'click', 'type', 'fill', 'select', 'press', 'scroll', 'wait', 'observe', 'extract', 'screenshot']),
@@ -45,9 +45,12 @@ const computerSchema = z.object({
   arguments: z.record(z.string(), z.unknown()).default({}),
 });
 
-type BridgeResponse = { id: string; ok: boolean; result?: unknown; error?: string };
+type BridgeResponse = { id: string; ok: boolean; result?: unknown; error?: string; code?: string };
 /** A matching bridge receipt, as distinct from transport uncertainty. */
-export class GjcAutomationResponseError extends Error {}
+export class GjcAutomationResponseError extends Error {
+  constructor(message: string, readonly code?: string) { super(message); }
+}
+
 type BrowserAuthorization = { granted: boolean; origin: string | null };
 type ComputerAuthorization = { granted: boolean; application: string | null; label: string | null };
 
@@ -119,10 +122,11 @@ export function bridgeRequest(
         const response = JSON.parse(buffer.slice(0, newline)) as BridgeResponse;
         if (response.id !== id) throw new Error('Automation bridge returned a mismatched response.');
         if (typeof response.ok !== 'boolean') throw new Error('Automation bridge returned an invalid response.');
-        if (fixedId && (Object.keys(response).some(key => !['id', 'ok', response.ok ? 'result' : 'error'].includes(key))
-          || (response.ok ? !Object.hasOwn(response, 'result') : typeof response.error !== 'string' || !response.error))) throw new Error('Automation bridge returned an invalid response.');
+        if (fixedId && (Object.keys(response).some(key => !['id', 'ok', ...(response.ok ? ['result'] : ['error', 'code'])].includes(key))
+          || (response.ok ? !Object.hasOwn(response, 'result') : typeof response.error !== 'string' || !response.error)
+          || (!response.ok && response.code !== undefined && response.code !== HERDR_MANAGED_TARGET_REJECTED))) throw new Error('Automation bridge returned an invalid response.');
         receipt?.(buffer.slice(0, newline));
-        if (!response.ok) throw new GjcAutomationResponseError(response.error || 'Automation request failed.');
+        if (!response.ok) throw new GjcAutomationResponseError(response.error || 'Automation request failed.', response.code === HERDR_MANAGED_TARGET_REJECTED ? HERDR_MANAGED_TARGET_REJECTED : undefined);
         finish(undefined, response.result);
       } catch (error) {
         finish(error instanceof Error ? error : new Error('Automation response was invalid.'));

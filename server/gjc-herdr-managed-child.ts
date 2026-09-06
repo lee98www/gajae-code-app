@@ -44,6 +44,7 @@ const IDLE_EVENT_LIMIT = 16;
  * turn that started it, never to the prompt that happens to be active.
  */
 const TOOL_ORIGIN_LIMIT = 4096;
+export const MANAGED_CHILD_TOOL_ORIGIN_LIMIT = TOOL_ORIGIN_LIMIT;
 const sameIdentity = (left: ManagedChildIdentity | undefined, right: ManagedChildIdentity | undefined): boolean =>
   left?.version === right?.version
   && left?.generation === right?.generation
@@ -160,7 +161,14 @@ export async function runManagedChild(options: RunManagedChildOptions = {}): Pro
             const toolId = typeof record.toolId === 'string' ? record.toolId : undefined;
             const origin = toolId ? toolOrigins.get(toolId) : undefined;
             if (toolId && record.kind === 'tool_use' && activePrompt && !origin) {
-              if (toolOrigins.size >= TOOL_ORIGIN_LIMIT) toolOrigins.delete(toolOrigins.keys().next().value!);
+              if (toolOrigins.size >= TOOL_ORIGIN_LIMIT) {
+                // Forgetting an unresolved origin would let its late result be
+                // presented under whichever prompt is active then. A runtime
+                // holding this many unfinished tools is broken: fail closed so
+                // the owner fences the turn unknown instead of misattributing.
+                onDeath();
+                throw new Error('Managed child tool origin capacity exceeded.');
+              }
               toolOrigins.set(toolId, { identity: activePrompt, actionId: lastActionId! });
             }
             if (toolId && record.kind === 'tool_result' && record.isFinal !== false) toolOrigins.delete(toolId);
