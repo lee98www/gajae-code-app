@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createHerdrManagedState, applyHerdrManagedEvent } from './herdr-managed-state.js';
-import { managedJsonBytes, type HerdrManagedEvent } from './herdr-managed-protocol.js';
+import { HERDR_MANAGED_WAIT_REASONS, managedJsonBytes, type HerdrManagedEvent } from './herdr-managed-protocol.js';
 import { projectManagedState, projectManagedEvent, pageTransfer, assembleManagedTransfer, acceptManagedSequence, MANAGED_AUTOMATION_UNKNOWN_STATUS, MANAGED_AUTOMATION_WAITING_PREFIX, MANAGED_CHAT_MAX_FRAME_BYTES } from './herdr-managed-chat.js';
 
 const initial = () => ({ ...createHerdrManagedState({ appSessionId: 'app', ownerGeneration: 'gen' }), providerSessionId: 'native' });
@@ -93,15 +93,17 @@ test('a waiting step shows the app-local reason it cannot bind yet, and only whi
   const identity = { generation: 'gen', provider: 'native', turn: 'turn', toolCallId: 'call', operationId: 'op', index: 0, argumentsHash: 'a'.repeat(64), policyRevision: 0, targetContext: 'unresolved' };
   state.automation.op = { identity, phase: 'waiting_attachment', capabilityGeneration: null, approvalRequestId: null, dispatchCount: 0, argumentsRef: 'args', resultRef: null, evidenceRef: null };
   assert.equal((projectManagedState(state).metadata.status as { text: string }).text, 'Using Browser…', 'no overlay, no invented reason');
-  const told = projectManagedState(state, { waiting: { op: 'session_not_found: Open the browser session first.' } });
-  assert.equal((told.metadata.status as { text: string }).text, `${MANAGED_AUTOMATION_WAITING_PREFIX}session_not_found: Open the browser session first.`);
+  const told = projectManagedState(state, { waiting: { op: 'browser_session_missing' } });
+  assert.equal((told.metadata.status as { text: string }).text, `${MANAGED_AUTOMATION_WAITING_PREFIX}${HERDR_MANAGED_WAIT_REASONS.browser_session_missing}`);
   assert.equal((told.metadata.status as { automationWaiting?: boolean }).automationWaiting, true);
   assert.equal(told.pendingPermissions.length, 0, 'waiting is not an approval');
-  assert.equal((projectManagedState(state, { waiting: { other: 'stale reason' } }).metadata.status as { text: string }).text, 'Using Browser…', 'reasons bind to the exact operation');
+  // Only the closed classes have text: an unknown class shows nothing rather than arbitrary text.
+  assert.equal((projectManagedState(state, { waiting: { op: 'session_not_found: /Users/private/path' as never } }).metadata.status as { text: string }).text, 'Using Browser…');
+  assert.equal((projectManagedState(state, { waiting: { other: 'bind_failed' } }).metadata.status as { text: string }).text, 'Using Browser…', 'reasons bind to the exact operation');
   state.automation.op = { ...state.automation.op, phase: 'awaiting_reattach_approval', capabilityGeneration: 'cap', approvalRequestId: 'approval' };
-  assert.equal((projectManagedState(state, { waiting: { op: 'stale' } }).metadata.status as { text: string }).text, 'Using Browser…', 'a bound step no longer waits');
+  assert.equal((projectManagedState(state, { waiting: { op: 'bind_failed' } }).metadata.status as { text: string }).text, 'Using Browser…', 'a bound step no longer waits');
   state.automation.op = { ...state.automation.op, phase: 'outcome_unknown', approvalRequestId: null, dispatchCount: 1 };
-  assert.equal((projectManagedState(state, { waiting: { op: 'stale' } }).metadata.status as { text: string }).text, MANAGED_AUTOMATION_UNKNOWN_STATUS, 'unknown outranks any wait reason');
+  assert.equal((projectManagedState(state, { waiting: { op: 'bind_failed' } }).metadata.status as { text: string }).text, MANAGED_AUTOMATION_UNKNOWN_STATUS, 'unknown outranks any wait reason');
 });
 test('sequence guard rejects stale generations and gaps, ignores duplicates', () => {
   const cursor = { sessionId: 'app', ownerGeneration: 'gen', watermark: 5 };

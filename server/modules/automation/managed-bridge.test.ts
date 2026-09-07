@@ -339,11 +339,11 @@ test('a target the App can never bind is answered with the target_rejected code;
     // url itself (which is the agent's payload and may carry secrets).
     const secret = 'SECRET-7f3a9c';
     let index = 10;
-    for (const url of [`file:///Users/someone/${secret}.html`, `data:text/html,<p>${secret}</p>`, `javascript:alert('${secret}')`, `mailto:${secret}@example.test`, `http://[${secret}`, `://${secret}`, '   ']) {
+    for (const url of [`file:///Users/someone/${secret}.html`, `data:text/html,<p>${secret}</p>`, `javascript:alert('${secret}')`, `mailto:${secret}@example.test`, `${secret.toLowerCase()}:payload`, `x-${secret.toLowerCase()}:payload`, `http://[${secret}`, `://${secret}`, '   ']) {
       const rejected = await resolveFor(`r${index++}`, { surface: 'browser', sessionId: 's', operation: 'open', payload: { url, allowDownload: false } });
       assert.deepEqual([rejected.ok, rejected.code], [false, 'target_rejected'], url);
-      assert.match(String(rejected.error), /^Managed browser target requires a concrete http\(s\) origin; (a [a-z0-9+.-]+: url has none|the url is not a valid http\(s\) address)\.$/, url);
-      assert.doesNotMatch(JSON.stringify(rejected), new RegExp(secret), url);
+      assert.match(String(rejected.error), /^Managed browser target requires a concrete http\(s\) origin; (a (about|blob|chrome|data|file|ftp|javascript|mailto|tel|view-source|ws|wss): url has none|a non-http\(s\) url has none|the url is not a valid http\(s\) address)\.$/, url);
+      assert.doesNotMatch(JSON.stringify(rejected), new RegExp(secret, 'i'), url);
     }
     // A command against a session this instance does not hold is missing
     // context, not an invalid invocation: it stays untyped so the step keeps

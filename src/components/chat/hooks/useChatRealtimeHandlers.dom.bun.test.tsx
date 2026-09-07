@@ -125,6 +125,24 @@ function projection(sessionId = 'visible', generation = 'g1', watermark = 1): Ma
   };
 }
 
+test('a same-watermark managed_ui_status frame replaces the status text of an active viewer without a new snapshot', () => {
+  const { calls, send } = mount();
+  pageTransfer(projection()).forEach(frame => send(frame));
+  const before = calls.filter(call => call[0] === 'processing').length;
+  const waiting = { ...projection().metadata, status: { text: 'Automation step waiting for its target: the browser session for this conversation is not open in the app yet; open it in the Browser panel or with an open step.', automationWaiting: true } };
+  send(waiting as unknown as ServerEvent);
+  const shown = calls.filter(call => call[0] === 'processing').slice(before).at(-1)?.[2] as { statusText?: string } | undefined;
+  assert.equal(shown?.statusText, waiting.status.text, 'the exact reason is shown at the unchanged watermark');
+  assert.equal(calls.filter(c => c[0] === 'replaceManagedProjection').length, 1, 'no second projection replacement');
+  // Cleared the same way once the step is bound.
+  send({ ...projection().metadata, status: { text: 'Using Browser…' } } as unknown as ServerEvent);
+  assert.equal((calls.filter(call => call[0] === 'processing').at(-1)?.[2] as { statusText?: string }).statusText, 'Using Browser…');
+  // A frame for another generation or watermark is ignored.
+  send({ ...projection('visible', 'g1', 2).metadata, status: { text: 'stale', automationWaiting: true } } as unknown as ServerEvent);
+  send({ ...projection('visible', 'g2', 1).metadata, status: { text: 'stale', automationWaiting: true } } as unknown as ServerEvent);
+  assert.equal((calls.filter(call => call[0] === 'processing').at(-1)?.[2] as { statusText?: string }).statusText, 'Using Browser…');
+});
+
 test('execution mode is explicitly hydrated and bound to the visible conversation', () => {
   const { calls, send } = mount();
   send({ kind: 'chat_subscribed', sessionId: 'other', isProcessing: false } as ServerEvent);

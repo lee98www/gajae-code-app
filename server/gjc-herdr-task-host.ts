@@ -16,7 +16,7 @@ import { HerdrAgentReporter, HerdrClient, recordOwnerProcess, type HerdrAgentRep
 
 import { HERDR_MANAGED_TARGET_REJECTED, verifyManagedBridgeReceipt, verifyManagedBridgeTarget, type HerdrManagedBridgeResolveRequest } from '../shared/herdr-managed-bridge.js';
 import type { HerdrManagedChildAutomationControl, ManagedChildEvent, ManagedChildRequest, ManagedChildTurnOptions } from '../shared/herdr-managed-child-protocol.js';
-import {
+import { type HerdrManagedWaitReason,
   HERDR_MANAGED_PROTOCOL_VERSION,
   publicManagedTargetContext,
   herdrManagedAttachFrameSchema,
@@ -38,6 +38,17 @@ import { ManagedChildTransport } from './gjc-herdr-child-client.js';
 import { acquireConsoleTerminal, ConsoleInputDecoder, ConsoleOutputWriter, parseConsoleLine, renderConsoleReceipt, renderConsoleReject, renderRequest, renderEvent } from './gjc-herdr-task-console.js';
 
 const MANAGED_UNCONFIRMED_CLOSURE = 'Managed owner closure unconfirmed.';
+/**
+ * The only thing an attached App learns about a bind that could not complete
+ * is one of the closed wait classes: the private failure text (paths, App
+ * error bodies, locators) never crosses the attach socket.
+ */
+function classifyWaitReason(error: unknown): HerdrManagedWaitReason {
+  if (!(error instanceof GjcAutomationResponseError)) return 'bridge_unavailable';
+  if (error.message.startsWith('session_not_found:')) return 'browser_session_missing';
+  if (error.message.startsWith('Managed browser target is unresolved')) return 'browser_page_unresolved';
+  return 'bind_failed';
+}
 const MANAGED_AUTOMATION_UNKNOWN_TEXT = 'Automation step outcome unknown: the app disconnected while it ran and it is never retried automatically; stop the task to continue.';
 
 export type ManagedSdkSession = {
@@ -948,9 +959,9 @@ export class HerdrTaskHost {
               // A bind that could not complete leaves the durable operation
               // waiting; the attached App learns the bounded reason so its
               // viewers see what the step waits for instead of a bare spinner.
-              let accepted = false; let reason: string | undefined;
+              let accepted = false; let reason: HerdrManagedWaitReason | undefined;
               try { accepted = await this.#automationControl(frame.control, client.connectionId); }
-              catch (error) { reason = this.#redact(error instanceof Error ? error.message : 'Automation control failed.').slice(0, 300) || 'Automation control failed.'; }
+              catch (error) { reason = classifyWaitReason(error); }
               this.#send(socket, { type: 'automation-control', id: frame.id, accepted, ...(reason ? { reason } : {}) });
             }
           } catch { socket.write(`${JSON.stringify({ type: 'error', id: frame.id, message: 'command rejected' })}\n`); }

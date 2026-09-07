@@ -125,7 +125,7 @@ export const herdrManagedAttachResponseSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('snapshot-page'), id: idSchema, snapshotId: idSchema, page: z.number().int().nonnegative(), chunk: z.string(), leaseExpiresAt: z.number().int().nonnegative() }).strict().refine(v => managedJsonBytes(v) <= HERDR_MANAGED_MAX_FRAME_BYTES),
   z.object({ type: z.literal('replay'), id: idSchema, afterSeq: z.number().int().nonnegative(), watermark: z.number().int().nonnegative(), nextSeq: z.number().int().nonnegative(), events: z.array(herdrManagedEventSchema).max(HERDR_MANAGED_MAX_REPLAY_EVENTS), complete: z.boolean() }).strict().refine(v => managedJsonBytes(v) <= HERDR_MANAGED_MAX_FRAME_BYTES && v.nextSeq <= v.watermark && v.events.every((e, i) => e.seq === v.afterSeq + i + 1) && v.nextSeq === v.afterSeq + v.events.length && v.complete === (v.nextSeq === v.watermark)),
   z.object({ type: z.literal('subscribed'), id: idSchema, watermark: z.number().int().nonnegative() }).strict(),
-  z.object({ type: z.literal('automation-control'), id: idSchema, accepted: z.boolean(), reason: z.string().min(1).max(300).optional() }).strict(),
+  z.object({ type: z.literal('automation-control'), id: idSchema, accepted: z.boolean(), reason: z.lazy(() => herdrManagedWaitReasonSchema).optional() }).strict(),
   z.object({ type: z.literal('snapshot-required'), id: idSchema, reason: z.enum(['gap', 'lease_expired']) }).strict(),
   z.object({ type: z.literal('receipt'), id: idSchema, receipt: z.lazy(() => herdrManagedCommandReceiptSchema) }).strict(),
   z.object({ type: z.literal('event'), event: herdrManagedEventSchema }).strict(),
@@ -241,6 +241,20 @@ export const herdrManagedCapabilitySchema = z.object({
   && v.policyRevision === v.operationIdentity.policyRevision && v.targetContext === v.operationIdentity.targetContext);
 export type HerdrManagedCapability = z.infer<typeof herdrManagedCapabilitySchema>;
 /** Private authenticated App-server/child control only; never browser attach events/status. */
+/**
+ * Why a never-dispatched operation could not be bound on the last attempt. A
+ * closed set: the host classifies its private failure into one of these and
+ * nothing else crosses to the App or its viewers.
+ */
+export const HERDR_MANAGED_WAIT_REASONS = {
+  browser_session_missing: 'the browser session for this conversation is not open in the app yet; open it in the Browser panel or with an open step.',
+  browser_page_unresolved: 'no page with a concrete http(s) origin is open yet; navigate to one or use an open step.',
+  bridge_unavailable: 'the app did not answer the target request; it retries while the app is attached.',
+  bind_failed: 'the app could not bind this step to its target yet; it retries while the app is attached.',
+} as const;
+export const herdrManagedWaitReasonSchema = z.enum(Object.keys(HERDR_MANAGED_WAIT_REASONS) as [keyof typeof HERDR_MANAGED_WAIT_REASONS, ...(keyof typeof HERDR_MANAGED_WAIT_REASONS)[]]);
+export type HerdrManagedWaitReason = z.infer<typeof herdrManagedWaitReasonSchema>;
+
 export const herdrManagedAutomationControlSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('bind-capability'), actionId: idSchema, identity: herdrManagedAutomationIdentitySchema, currentTransport: herdrManagedBridgeTransportSchema }).strict(),
   z.object({ type: z.literal('detach-capability'), actionId: idSchema, generation: idSchema, capabilityGeneration: idSchema, ownerConnectionId: idSchema }).strict(),

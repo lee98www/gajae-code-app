@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { setImmediate as yieldToSocket, setTimeout as waitForSocket } from 'node:timers/promises';
 
 import { MANAGED_CHAT_MAX_FRAME_BYTES, pageTransfer, projectManagedEvent, projectManagedState, type ManagedProjectionOverlay } from '../../../../shared/herdr-managed-chat.js';
-import type { HerdrManagedBridgeTransport, HerdrManagedCommand, HerdrManagedCommandReceipt } from '../../../../shared/herdr-managed-protocol.js';
+import type { HerdrManagedWaitReason, HerdrManagedBridgeTransport, HerdrManagedCommand, HerdrManagedCommandReceipt } from '../../../../shared/herdr-managed-protocol.js';
 import { herdrManagedActionIdSchema } from '../../../../shared/herdr-managed-protocol.js';
 import type { HerdrManagedState } from '../../../../shared/herdr-managed-state.js';
 import { herdrManagedProvisionDb, herdrManagedDb, getConnection } from '../../database/index.js';
@@ -20,7 +20,7 @@ export type ManagedChatControl = { sessionId: string; actionId: string; content?
 export type ManagedChatPermissionResponse = { sessionId: string; actionId: string; requestId: string; allow: boolean; always?: boolean; message?: string; updatedInput?: unknown };
 type Client = Pick<HerdrManagedAttachClient, 'state' | 'recover' | 'subscribe' | 'subscribeState' | 'command' | 'automationControl' | 'close' | 'connected'>;
 /** Viewer-facing, App-local: why a waiting operation could not be bound on the last renewal. */
-type Binding = { client: Client; viewers: Set<ManagedChatConnection>; off: (() => void)[]; renewing?: boolean; waiting: Map<string, string> };
+type Binding = { client: Client; viewers: Set<ManagedChatConnection>; off: (() => void)[]; renewing?: boolean; waiting: Map<string, HerdrManagedWaitReason> };
 type SnapshotTransfer = { latest: HerdrManagedState | null; events: unknown[]; bytes: number };
 export type HerdrManagedChatOptions = {
   workspaces?: Pick<HerdrManagedWorkspacesService, 'isManaged' | 'ensure'> & { attach(id: string): Promise<Client> };
@@ -69,7 +69,13 @@ export class HerdrManagedChatService {
           const reason = response.type === 'automation-control' && !response.accepted ? response.reason : undefined;
           const known = binding.waiting.get(operation.identity.operationId);
           if (reason) binding.waiting.set(operation.identity.operationId, reason); else binding.waiting.delete(operation.identity.operationId);
-          if ((reason ?? null) !== (known ?? null) && binding.client.state) for (const viewer of binding.viewers) void this.#snapshot(viewer, binding.client.state, binding);
+          // The durable sequence did not move: viewers get the projection's
+          // status at the current watermark, never a new event or a snapshot
+          // they would rightly discard as stale.
+          if ((reason ?? null) !== (known ?? null) && binding.client.state) {
+            const metadata = projectManagedState(binding.client.state, this.#overlay(binding, binding.client.state)).metadata;
+            for (const viewer of binding.viewers) this.#emit(viewer, metadata);
+          }
         }
       }
     } catch { /* Absence leaves the durable operation waiting, not failed. */ }
@@ -77,7 +83,7 @@ export class HerdrManagedChatService {
   }
   #overlay(binding: Binding | undefined, state: HerdrManagedState): ManagedProjectionOverlay | undefined {
     if (!binding?.waiting.size) return undefined;
-    const waiting: Record<string, string> = {};
+    const waiting: Record<string, HerdrManagedWaitReason> = {};
     for (const [operationId, reason] of binding.waiting) if (state.automation[operationId]?.phase === 'waiting_attachment') waiting[operationId] = reason;
     return Object.keys(waiting).length ? { waiting } : undefined;
   }

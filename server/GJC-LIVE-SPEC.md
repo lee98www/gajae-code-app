@@ -125,9 +125,15 @@ ends that operation as an evidenced, never-dispatched cancellation and the SDK
 callback fails with the App's reason instead of waiting for an attachment that
 can never come. Missing context (a browser session this App instance does not
 hold yet, no active page with a concrete origin) is recoverable: the operation
-keeps waiting, the host answers the bind with a bounded reason, and the App
-shows it to its viewers as the step's status until a later renewal binds the
-restored actual target and asks for approval on the same callback.
+keeps waiting, the host answers the bind with one of a closed set of wait
+classes (`browser_session_missing`, `browser_page_unresolved`,
+`bridge_unavailable`, `bind_failed`; the private failure text never crosses
+the attach socket), and the App shows the class's fixed text to its viewers as
+the step's status — delivered to already-subscribed viewers as a
+`managed_ui_status` frame at the unchanged watermark, never as a new event or
+snapshot — until a later renewal binds the restored actual target and asks for
+approval on the same callback. Rejection reasons name only a well-known
+scheme; any other scheme is described, never quoted.
 A step that was actually dispatched when the App vanished stays
 `outcome_unknown`: the App's ledger keeps the reservation, reconciliation
 never invents a completion, and nothing retries it. Both clients say so

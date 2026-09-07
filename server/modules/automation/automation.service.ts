@@ -131,6 +131,8 @@ export class ManagedTargetRejectedError extends Error {
   constructor(message: string) { super(message); this.name = 'ManagedTargetRejectedError'; }
 }
 
+const PUBLIC_URL_SCHEMES = new Set(['about', 'blob', 'chrome', 'data', 'file', 'ftp', 'javascript', 'mailto', 'tel', 'view-source', 'ws', 'wss']);
+
 function safeAutomationOrigin(raw: string): string | null {
   try { return automationOrigin(raw); } catch { return null; }
 }
@@ -145,9 +147,12 @@ function managedBrowserOrigin(raw: unknown): string {
   const origin = safeAutomationOrigin(raw);
   if (origin) return origin;
   const scheme = /^\s*([a-z][a-z0-9+.-]{0,15}):/iu.exec(raw)?.[1]?.toLowerCase();
-  throw new ManagedTargetRejectedError(scheme
+  // Only a well-known scheme is named; anything else is described, not quoted:
+  // a custom scheme is still the agent's payload.
+  throw new ManagedTargetRejectedError(scheme && PUBLIC_URL_SCHEMES.has(scheme)
     ? `Managed browser target requires a concrete http(s) origin; a ${scheme}: url has none.`
-    : 'Managed browser target requires a concrete http(s) origin; the url is not a valid http(s) address.');
+    : scheme ? 'Managed browser target requires a concrete http(s) origin; a non-http(s) url has none.'
+      : 'Managed browser target requires a concrete http(s) origin; the url is not a valid http(s) address.');
 }
 
 export class AutomationService {

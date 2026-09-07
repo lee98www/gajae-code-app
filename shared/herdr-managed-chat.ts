@@ -1,5 +1,5 @@
-import type { HerdrManagedEvent, HerdrManagedIdentity, HerdrManagedLifecycle } from './herdr-managed-protocol.js';
-import { managedJsonBytes, publicManagedTargetContext } from './herdr-managed-protocol.js';
+import type { HerdrManagedEvent, HerdrManagedIdentity, HerdrManagedLifecycle, HerdrManagedWaitReason } from './herdr-managed-protocol.js';
+import { HERDR_MANAGED_WAIT_REASONS, managedJsonBytes, publicManagedTargetContext } from './herdr-managed-protocol.js';
 import type { HerdrManagedState } from './herdr-managed-state.js';
 
 export const MANAGED_CHAT_MAX_FRAME_BYTES = 1024 * 1024;
@@ -51,9 +51,10 @@ export const MANAGED_AUTOMATION_UNKNOWN_STATUS = 'Automation step outcome unknow
 export const MANAGED_AUTOMATION_WAITING_PREFIX = 'Automation step waiting for its target: ';
 /**
  * App-local, viewer-facing facts that are not part of the owner's durable
- * state: why a waiting operation could not be bound on the last attempt.
+ * state: why a waiting operation could not be bound on the last attempt, as a
+ * closed reason class whose public text lives here.
  */
-export interface ManagedProjectionOverlay { waiting?: Record<string, string> }
+export interface ManagedProjectionOverlay { waiting?: Record<string, HerdrManagedWaitReason> }
 
 export function projectManagedState(state: HerdrManagedState, overlay?: ManagedProjectionOverlay): ManagedChatProjection {
   const { appSessionId: sessionId, ownerGeneration } = state.identity;
@@ -112,7 +113,8 @@ export function projectManagedState(state: HerdrManagedState, overlay?: ManagedP
   // retried on its own: the runtime's last activity text ("Using Browser…")
   // would otherwise spin forever without telling the person why.
   const unknownAutomation = !terminal && automation.some(operation => operation.phase === 'outcome_unknown');
-  const waitingReason = terminal ? undefined : automation.map(operation => operation.phase === 'waiting_attachment' ? overlay?.waiting?.[operation.identity.operationId] : undefined).find(Boolean);
+  const waitingClass = terminal ? undefined : automation.map(operation => operation.phase === 'waiting_attachment' ? overlay?.waiting?.[operation.identity.operationId] : undefined).find(Boolean);
+  const waitingReason = waitingClass && waitingClass in HERDR_MANAGED_WAIT_REASONS ? HERDR_MANAGED_WAIT_REASONS[waitingClass] : undefined;
   const status = unknownAutomation
     ? { ...(publicValue(state.status) as Record<string, unknown> ?? {}), text: MANAGED_AUTOMATION_UNKNOWN_STATUS, automationUnknown: true }
     : waitingReason

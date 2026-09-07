@@ -276,7 +276,9 @@ test('real attach projects mapping before send, reuses owner, orders two viewers
         automationControl: async (control: Parameters<HerdrManagedAttachClient['automationControl']>[0]) => {
           if (control.type !== 'bind-capability') throw new Error('Only binds expected');
           binds.push(Date.now());
-          if (binds.length === 1) return { type: 'automation-control' as const, id: 'reply', accepted: false, reason: 'session_not_found: Open the browser session first.' };
+          // Bound at subscribe time; the context vanishes on the next renewal
+          // (the viewer is already watching); restored on the one after.
+          if (binds.length === 2) return { type: 'automation-control' as const, id: 'reply', accepted: false, reason: 'browser_session_missing' as const };
           return { type: 'automation-control' as const, id: 'reply', accepted: true };
         },
         command: async () => { throw new Error('No command expected'); }, close() {},
@@ -290,17 +292,27 @@ test('real attach projects mapping before send, reuses owner, orders two viewers
         const pages = frame.kind === 'managed_snapshot_page' && typeof frame.chunk === 'string' ? frame.chunk : null;
         if (pages) return { automationWaiting: /"automationWaiting":true/.test(pages), text: (/"text":"([^"]*)"/.exec(pages) ?? [])[1] };
         const projection = frame.projection as { metadata?: { status?: Status } } | undefined;
+        if (frame.kind === 'managed_ui_status' && 'status' in frame) return (frame.status && typeof frame.status === 'object' ? frame.status : { automationWaiting: false }) as Status;
         return (frame.metadata as { status?: Status } | undefined)?.status ?? projection?.metadata?.status;
       };
       const statuses = () => watcher.frames.map(statusOf).filter(Boolean) as Status[];
-      for (let i = 0; i < 200 && !statuses().some(status => status.automationWaiting); i++) await new Promise(resolve => setTimeout(resolve, 5));
+      assert.equal(statuses().some(status => status.automationWaiting), false, 'bound at subscribe time: nothing to wait for');
+      for (let i = 0; i < 1200 && !statuses().some(status => status.automationWaiting); i++) await new Promise(resolve => setTimeout(resolve, 5));
       const waitingStatus = statuses().find(status => status.automationWaiting);
       assert.ok(waitingStatus, 'the viewer is told what the step waits for');
-      assert.equal(waitingStatus.text, 'Automation step waiting for its target: session_not_found: Open the browser session first.');
-      // The next renewal binds: the reason is gone from the projection again.
-      for (let i = 0; i < 600 && binds.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 5));
+      assert.equal(waitingStatus.text, 'Automation step waiting for its target: the browser session for this conversation is not open in the app yet; open it in the Browser panel or with an open step.');
+      // An already-subscribed viewer learns it through a same-watermark status frame, not a snapshot it would discard as stale.
+      const statusFrames = watcher.frames.filter(frame => frame.kind === 'managed_ui_status' && (frame.status as Status | null)?.automationWaiting);
+      assert.equal(statusFrames.length >= 1, true, 'the reason travels as a managed_ui_status frame');
+      assert.equal(statusFrames[0].watermark, waitingState.watermark, 'at the unchanged watermark');
+      assert.equal(statusFrames[0].ownerGeneration, waitingState.identity.ownerGeneration);
+      assert.equal(watcher.frames.filter(frame => frame.kind === 'managed_snapshot_begin').length, 1, 'no second snapshot for a status-only change');
+      // The next renewal binds: the reason is cleared the same way.
+      for (let i = 0; i < 1200 && binds.length < 3; i++) await new Promise(resolve => setTimeout(resolve, 5));
       for (let i = 0; i < 200 && (statuses().at(-1)?.automationWaiting); i++) await new Promise(resolve => setTimeout(resolve, 5));
       assert.equal(Boolean(statuses().at(-1)?.automationWaiting), false, 'a successful bind clears the wait reason');
+      assert.equal(watcher.frames.filter(frame => frame.kind === 'managed_ui_status').length >= 2, true, 'set and cleared through status frames');
+      assert.equal(watcher.frames.filter(frame => frame.kind === 'managed_snapshot_begin').length, 1);
     } finally { told.close(); automationService.managedBridgeCapability = originalBridgeCapability; }
     let finishAttach!: (value: HerdrManagedAttachClient) => void;
     let renewals = 0;

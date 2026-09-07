@@ -393,8 +393,9 @@ await runManagedChild({ createAdapter: async () => ({ initializeManagedGjcSessio
     const bridge = new AutomationService(root);
     Object.defineProperty(bridge, 'supported', { value: true });
     Object.defineProperty(bridge, 'grants', { value: new AutomationGrantStore({ get: () => null, set: () => {} }) });
+    let failure = 'session_not_found: Open the browser session first.';
     bridge.browser.state = async () => {
-      if (!sessionOpen) throw new Error('session_not_found: Open the browser session first.');
+      if (!sessionOpen) throw new Error(failure);
       return { sessionId: 's', activeTabId: 'tab-1', tabs: [{ id: 'tab-1', url: 'https://example.test/restored', title: '', loading: false, canGoBack: false, canGoForward: false }] };
     };
     bridge.browser.command = async () => { dispatches++; return { observed: 'restored' }; };
@@ -413,9 +414,19 @@ await runManagedChild({ createAdapter: async () => ({ initializeManagedGjcSessio
       // attached App is told why.
       const first = await bind();
       assert.ok(first.type === 'automation-control' && !first.accepted);
-      assert.match(String(first.type === 'automation-control' && first.reason), /session_not_found/);
+      assert.equal(first.type === 'automation-control' && first.reason, 'browser_session_missing', 'a closed reason class, never the private failure text');
       assert.equal(host.snapshot().automation[pending.identity.operationId].phase, 'waiting_attachment');
       assert.equal(dispatches, 0);
+      // Whatever the App's private failure says (paths, locators, tokens), the
+      // attached App only ever learns a closed class.
+      failure = 'Browser sidecar failed at /Users/private/Library/sidecar.sock with token ' + 'T'.repeat(48);
+      const adversarial = await bind();
+      assert.ok(adversarial.type === 'automation-control' && !adversarial.accepted);
+      assert.equal(adversarial.type === 'automation-control' && adversarial.reason, 'bind_failed');
+      assert.doesNotMatch(JSON.stringify(adversarial), /private|sidecar\.sock|T{48}/);
+      assert.doesNotMatch(JSON.stringify(host.snapshot()), /private|sidecar\.sock|T{48}/, 'the failure never enters host state');
+      assert.doesNotMatch(JSON.stringify(herdrManagedDb.eventsSince(identity.appSessionId, identity.ownerGeneration, 0)), /private|sidecar\.sock|T{48}/, 'nor the journal');
+      failure = 'session_not_found: Open the browser session first.';
       // The context comes back (the person opened the Browser panel, or an
       // earlier step opened a page): the same operation binds its actual target
       // and still needs explicit approval before anything is dispatched.
