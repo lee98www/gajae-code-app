@@ -62,16 +62,21 @@ node scripts/release/smoke-packaged-server.mjs --tauri-app "/Applications/Gajae 
       each installed replacement (`artifacts/herdr-managed-gen11-staged-smoke.log`,
       exit 0): independent host/child closure outside repository dependency
       resolution.
-- [x] Default production SDK/pinned Bun initialization and clean shutdown on
-      the installed bundle: every installed drill below created one SDK session
-      through the private Bun SDK child and closed it the supported way.
+- [x] Installed owner lifecycle: each installed drill below provisioned one
+      owner host in the user's Herdr, mapped a provider session id, settled
+      its turns and was closed the supported way (`close-installed-owner.ts`
+      receipts). The one-SDK-session/private-child proof is the lifetime
+      harness in `npm run verify`; the installed receipts do not record the
+      child or session count.
 - [x] Production Herdr CLI provisioning against the selected existing instance:
       the drills appended an owned workspace/pane (`focus:false`) into the
       user's running Herdr, verified by fresh snapshots, and removed only it.
-- [x] Owned pane tokens and status after App detach and console follow-up:
-      `agent: gjc` with `blocked`/`done` status while the App was absent
+- [x] Owned pane status after App detach and console follow-up: `agent: gjc`
+      with status `done` after the console abort while the App was absent
       (`artifacts/herdr-installed/console-drill-20260907T040550Z.json`
-      `absentPanes`); foreign workspaces untouched.
+      `absentPanes`) and `blocked` while a browser step waited with the App
+      absent (`artifacts/herdr-installed/cua-drill-run11.log`, `absent panes`);
+      foreign workspaces untouched.
 - [x] Installed App/DOM: the installed SPA drove normal chat, ask cards,
       `AutomationResume` approvals, the unknown-outcome notice and the waiting
       reason (`artifacts/herdr-installed/unknown-notice.png`,
