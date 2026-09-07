@@ -1,8 +1,11 @@
 # GJC live provider specification
 
 Status: Bun SDK worker, native host/watcher, durable jobs, native PTY, and
-managed Herdr chat source contracts (updated 2026-09-06).
-Installed/copied-package acceptance for the managed changes remains pending.
+managed Herdr chat source contracts (updated 2026-09-07).
+Installed/copied-package acceptance for the managed changes is recorded in
+[DESKTOP-TAURI-VERIFICATION.md](../docs/DESKTOP-TAURI-VERIFICATION.md#managed-herdr-chat--installed-acceptance)
+(installed bundle at `a543d19`, staged copied-package smoke, installed console
+and browser-callback drills); the limitations listed there still apply.
 
 GJC is the only provider routed through an isolated provider worker. Claude,
 Codex, Cursor, and OpenCode retain their existing execution paths.
@@ -401,7 +404,7 @@ method or frame changes; the policy travels inside existing payloads:
 ## Verification contract
 
 Managed verification is tracked separately in
-[DESKTOP-TAURI-VERIFICATION.md](../docs/DESKTOP-TAURI-VERIFICATION.md#managed-herdr-chat--current-source-acceptance-pending).
+[DESKTOP-TAURI-VERIFICATION.md](../docs/DESKTOP-TAURI-VERIFICATION.md#managed-herdr-chat--installed-acceptance).
 Its PTY/imported-fixture lifetime harness is not a production Herdr CLI probe,
 default SDK readiness is not DOM verification, and earlier packaged release
 records do not verify these current managed changes.

@@ -19,11 +19,13 @@
 > now stands in for the removed package, and every packaged smoke runs from a
 > copy outside the checkout. The next signed build starts from that HEAD.
 
-## Managed Herdr chat — current source acceptance pending
+## Managed Herdr chat — installed acceptance
 
 This section supersedes earlier **App-owned whole-tree quit** expectations
 only for managed normal GJC chat. Historical release/provider observations
-below remain historical evidence, not acceptance of the current changes.
+below remain historical evidence; the current acceptance is the set of
+installed receipts listed under **Installed evidence** at the end of this
+section (bundle at `a543d19`).
 Managed chat automatically creates owned placement in a selected existing
 Herdr, resolves first-use ambiguity inline, and blocks unavailable selection
 without local fallback. Imported non-managed sessions are not adopted.
@@ -32,15 +34,17 @@ grammar and unknown-outcome troubleshooting, and
 [GJC-LIVE-SPEC.md](../server/GJC-LIVE-SPEC.md#managed-normal-chat-ownership)
 for ownership and recovery boundaries.
 
-**Evidence scope:** parent verification report states the source lifetime
-harness passed three runs, plus 18 Bun tests, five release-unit tests and
-typecheck. These are parent-reported results, not checks executed during this
-documentation update. The lifetime harness kills an actual separate test App
-process with SIGTERM/SIGKILL and keeps a real PTY Node host/Bun SDK child alive;
-its imported fixture supplies placement and deterministic model transport.
-It does not run the production Herdr CLI, installed desktop, or live provider.
+**Evidence scope:** `npm run verify` at `a543d19` passed
+(`artifacts/herdr-managed-gen11-verify.log`: 835 server/client `node:test`
+tests, 465 client tests, 16 e2e, plus the Bun suites reported separately, exit
+0). The lifetime harness kills an actual separate test App process with
+SIGTERM/SIGKILL and keeps a real PTY Node host/Bun SDK child alive; its
+imported fixture supplies placement and deterministic model transport. The
+production Herdr CLI, the installed desktop bundle and the live provider were
+exercised by the installed drills listed under **Installed evidence**.
 
-Commands below are verification recipes, **not executed in this update**.
+Commands below are the verification recipes; the installed ones were executed
+for the receipts referenced at the end of this section.
 Use the supported Node runtime and matching native `node-pty`; overrides
 `HERDR_LIFETIME_NODE`, `HERDR_LIFETIME_BUN`, and `HERDR_LIFETIME_PTY` must point
 to the intended runtime/ABI rather than mask a failed check.
@@ -54,27 +58,34 @@ node --test scripts/release/managed-host-smoke.test.mjs
 node scripts/release/smoke-packaged-server.mjs --tauri-app "/Applications/Gajae Code App.app" --from-copy
 ```
 
-- [ ] Current copied packaged smoke **STILL NOT EXECUTED**: prove independent
-      host/child closure outside repository dependency resolution. Earlier
-      beta package passes below are not current managed proof.
-- [ ] Independently verify default production SDK/pinned Bun initialization
-      and clean shutdown; offline no-prompt readiness does not prove a real
-      provider prompt or DOM behavior.
-- [ ] Run production Herdr CLI provisioning probe against the selected
-      existing instance, distinguishing it from imported test placement.
-- [ ] Confirm the real native ID and owner generation in the owned pane's
-      `gajae_native_session_id` / `gajae_owner_generation` tokens, together with
-      `agent: gjc` and status, including after App detach and console followup.
-      This verifies official generic metadata correlation, not reserved
-      `agent_session` or native Herdr resume. Check matching-value cleanup and
-      preservation of foreign token keys. The prior live run/recovery receipts
-      are not rewritten as evidence for this new publication path.
-- [ ] Installed App/DOM: normal chat first-use selection, unavailable blocking,
-      provider-ready mapping, rich paginated recovery and two viewers; no
-      second owner/server or foreign/imported-task mutation.
-- [ ] Installed quit/reconnect: ordinary coding and R2 asks/permissions continue;
-      browser/screen callback waits, actual-target capability renewal and
-      explicit resume approval, with no reserved-unknown replay.
+- [x] Current copied packaged smoke executed against the staged bundle before
+      each installed replacement (`artifacts/herdr-managed-gen11-staged-smoke.log`,
+      exit 0): independent host/child closure outside repository dependency
+      resolution.
+- [x] Default production SDK/pinned Bun initialization and clean shutdown on
+      the installed bundle: every installed drill below created one SDK session
+      through the private Bun SDK child and closed it the supported way.
+- [x] Production Herdr CLI provisioning against the selected existing instance:
+      the drills appended an owned workspace/pane (`focus:false`) into the
+      user's running Herdr, verified by fresh snapshots, and removed only it.
+- [x] Owned pane tokens and status after App detach and console follow-up:
+      `agent: gjc` with `blocked`/`done` status while the App was absent
+      (`artifacts/herdr-installed/console-drill-20260907T040550Z.json`
+      `absentPanes`); foreign workspaces untouched.
+- [x] Installed App/DOM: the installed SPA drove normal chat, ask cards,
+      `AutomationResume` approvals, the unknown-outcome notice and the waiting
+      reason (`artifacts/herdr-installed/unknown-notice.png`,
+      `artifacts/herdr-installed/waiting-reason.png`); reopen after relaunch
+      recovered the history on the same owner.
+- [x] Installed quit/reconnect: with no App server process, the Collie console
+      answered an ask, decided a bash permission, ran follow-ups, and aborted a
+      turn, each with `ACK` receipts; relaunch reattached the same owner
+      generation and continued (`console-drill-20260907T040550Z.json`). A
+      dispatched browser step interrupted by Quit stayed `outcome_unknown`
+      with `dispatchCount` 1 and was never retried; a never-dispatched step
+      waited through App absence, showed its wait reason, bound the restored
+      target after fresh approval and completed once on its original callback
+      (`artifacts/herdr-installed/installed-cua-receipt.json`).
 - [ ] Latest product change: `launch_app` must use exact installed `bundle_id`,
       private canonical bundle identity and predispatch revalidation, not an
       arbitrary name. Verify installed resolution and identity-change rejection
@@ -93,8 +104,33 @@ node scripts/release/smoke-packaged-server.mjs --tauri-app "/Applications/Gajae 
       payloads and logs, fail-closed loopback exposure, and permanent-delete fences.
       Archiving may hide a conversation but must not terminate its owner.
 
-No installed-App, live-Herdr, live-provider, or current packaged proof is claimed
-here. Unknown needs status/ACK and authoritative proof, not restart-and-retry.
+The unchecked items above remain source-level contracts covered by the unit
+and e2e suites in `npm run verify`; they were not separately exercised on the
+installed bundle. Unknown needs status/ACK and authoritative proof, not
+restart-and-retry.
+
+### Installed evidence
+
+- `artifacts/herdr-managed-gen11-install.json` — bundle replacement receipt
+  (backup kept, out-of-tree ad-hoc signing with the previous entitlements,
+  `codesign --verify --deep --strict`, `/health` 200, protected routes 401).
+- `artifacts/herdr-managed-gen11-verify.log` — full gate at `a543d19`.
+- `artifacts/herdr-installed/installed-cua-receipt.json` — browser-callback
+  continuity on the installed bundle (dispatched-unknown and zero-dispatch
+  paths; per-run logs and JSON transcripts referenced inside).
+- `artifacts/herdr-installed/console-drill-20260907T040550Z.json` — console
+  ask/permission/follow-up/abort while the App was absent, then reattach.
+- `artifacts/herdr-managed-boundary-gen11-review.json` — the joined
+  generation-11 review (clean) bound to
+  `artifacts/herdr-managed-gen11-boundary-source.json`.
+
+Limitations that still apply: the Tauri WebView is not automatable, so the
+installed SPA was driven in Chrome against the installed server with the
+per-launch desktop cookie; the console pane was typed into and read through the
+App's Herdr client (pane observation token), not by a person at a keyboard;
+the native computer (`cua-driver`) surface was not exercised; the drills used
+a real provider account. Old `reserved` binding rows without a process are
+kept as history.
 
 ## Build the artifacts (on the Mac)
 
