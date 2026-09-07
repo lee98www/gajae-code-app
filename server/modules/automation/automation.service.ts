@@ -131,6 +131,25 @@ export class ManagedTargetRejectedError extends Error {
   constructor(message: string) { super(message); this.name = 'ManagedTargetRejectedError'; }
 }
 
+function safeAutomationOrigin(raw: string): string | null {
+  try { return automationOrigin(raw); } catch { return null; }
+}
+
+/**
+ * The origin of an invocation's own url, or a rejection whose reason names
+ * only the scheme: the url itself is the agent's payload and never travels
+ * into a public reason.
+ */
+function managedBrowserOrigin(raw: unknown): string {
+  if (typeof raw !== 'string') throw new ManagedTargetRejectedError('Managed browser target requires a url string.');
+  const origin = safeAutomationOrigin(raw);
+  if (origin) return origin;
+  const scheme = /^\s*([a-z][a-z0-9+.-]{0,15}):/iu.exec(raw)?.[1]?.toLowerCase();
+  throw new ManagedTargetRejectedError(scheme
+    ? `Managed browser target requires a concrete http(s) origin; a ${scheme}: url has none.`
+    : 'Managed browser target requires a concrete http(s) origin; the url is not a valid http(s) address.');
+}
+
 export class AutomationService {
   readonly browser = new BrowserSidecarClient();
   readonly cua = new CuaDriverClient();
@@ -442,27 +461,28 @@ export class AutomationService {
       const command = object(payload.command);
       if (['selectTab', 'newTab', 'closeTab'].includes(String(command.action))) throw new ManagedTargetRejectedError('Managed tab management requires a new target binding.');
       const rawUrl = request.operation === 'command' ? command.url : payload.url;
+      // The url is an immutable property of this invocation: judge it before
+      // any session context, which can still change while the step waits.
+      const explicitOrigin = rawUrl === undefined ? undefined : managedBrowserOrigin(rawUrl);
       let state: BrowserSessionState;
       try { state = await this.browser.state(request.sessionId, signal) as BrowserSessionState; }
       catch (error) {
         // A new session has no tab yet. Only the exact sidecar absence result
         // authorizes that narrow binding; transport failures are not absence.
-        if (!(error instanceof Error) || !error.message.startsWith('session_not_found:')) throw error;
-        // A command against a session this App instance does not have (it was
-        // opened by an instance that has since quit) can never bind: the agent
-        // must open the session again, which is a different invocation.
-        if (request.operation !== 'open' && !(request.operation === 'authorize' && typeof rawUrl === 'string')) throw new ManagedTargetRejectedError('Managed browser session is not open in this app instance: open the browser session first.');
+        // A command against a session this instance does not hold is missing
+        // context, not an invalid invocation: it keeps waiting and binds once
+        // the session exists again (the Browser panel or an open step).
+        if (!(error instanceof Error) || !error.message.startsWith('session_not_found:')
+          || (request.operation !== 'open' && !(request.operation === 'authorize' && typeof rawUrl === 'string'))) throw error;
         state = { sessionId: request.sessionId, activeTabId: null, tabs: [] };
       }
       const tab = state.tabs.find(candidate => candidate.id === state.activeTabId);
-      if (rawUrl !== undefined) {
-        const origin = typeof rawUrl === 'string' ? automationOrigin(rawUrl) : null;
-        if (!origin) throw new ManagedTargetRejectedError(`Managed browser target requires a concrete http(s) origin; ${typeof rawUrl === 'string' ? JSON.stringify(rawUrl.slice(0, 200)) : 'the url'} has none.`);
-        return { kind: 'browser-origin', origin, tabId: tab?.id ?? 'no-active-tab' };
-      }
+      if (explicitOrigin !== undefined) return { kind: 'browser-origin', origin: explicitOrigin, tabId: tab?.id ?? 'no-active-tab' };
       if (!tab && request.operation === 'open') return { kind: 'session-management', operation: 'open', sessionId: request.sessionId };
-      const origin = tab && automationOrigin(tab.url);
-      if (!tab || !origin) throw new ManagedTargetRejectedError('Managed browser target is unresolved: open a page with a concrete http(s) origin first.');
+      const origin = tab && safeAutomationOrigin(tab.url);
+      // No active page with a concrete origin yet: recoverable context, so the
+      // step waits for the person or a later open step to provide one.
+      if (!tab || !origin) throw new Error('Managed browser target is unresolved: no active page with a concrete http(s) origin yet.');
       return { kind: 'browser-origin', origin, tabId: tab.id };
     }
     if (!isCuaSafeTool(request.tool)) throw new ManagedTargetRejectedError('Unsupported managed computer operation.');

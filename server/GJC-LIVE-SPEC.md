@@ -117,12 +117,17 @@ turn that ends unknown is never additionally reported as a rejected command.
 
 App-dependent automation waits on the original SDK callback while disconnected.
 Renewal binds the actual browser/application target and requires explicit
-resume approval. An invocation the App definitively refuses to bind (no
-concrete http(s) origin, unsupported operation, tab management, an inexact
-launch selector) is answered with the `target_rejected` code; the host then
+resume approval. Only an immutable property of the invocation itself is a
+rejection: a url without an http(s) origin (the reason names the scheme, never
+the url), an unsupported operation, tab management, an inexact launch
+selector. The App answers those with the `target_rejected` code; the host then
 ends that operation as an evidenced, never-dispatched cancellation and the SDK
 callback fails with the App's reason instead of waiting for an attachment that
-can never come. Every other resolution failure keeps the operation waiting.
+can never come. Missing context (a browser session this App instance does not
+hold yet, no active page with a concrete origin) is recoverable: the operation
+keeps waiting, the host answers the bind with a bounded reason, and the App
+shows it to its viewers as the step's status until a later renewal binds the
+restored actual target and asks for approval on the same callback.
 A step that was actually dispatched when the App vanished stays
 `outcome_unknown`: the App's ledger keeps the reservation, reconciliation
 never invents a completion, and nothing retries it. Both clients say so

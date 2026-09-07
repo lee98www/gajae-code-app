@@ -310,7 +310,7 @@ import { GjcHerdrAutomationBroker } from ${JSON.stringify(fileURLToPath(new URL(
 await runManagedChild({ createAdapter: async () => ({ initializeManagedGjcSession: async (_id, _config, writer, managed) => {
   const broker = new GjcHerdrAutomationBroker({ generation: managed.generation, provider: 'provider', policyRevision: 0, emit: event => writer.send(event), flush: managed.flush });
   return { providerSessionId: 'provider', setAutomationTurn: turn => broker.setTurn(turn), automationControl: control => broker.control(control), operationStatus: id => broker.status(id),
-    prompt: () => broker.dispatch({ toolCallId: 'tool', index: 0, request: { surface: 'browser', sessionId: 's', operation: 'open', payload: { url: 'about:blank', allowDownload: false } } })
+    prompt: () => broker.dispatch({ toolCallId: 'tool', index: 0, request: { surface: 'browser', sessionId: 's', operation: 'open', payload: { url: "javascript:alert('SECRET-4b1d')", allowDownload: false } } })
       .then(() => { writer.send({ kind: 'stream_end', content: 'opened' }); }, error => { writer.send({ kind: 'stream_end', content: 'tool-error:' + error.code + ':' + error.message }); }),
     steer: async () => false, abort: async () => { await broker.abort(); return true; }, dispose: () => broker.abort(), validateApproval: () => false, resolveApproval: () => false };
 } }) });
@@ -349,15 +349,90 @@ await runManagedChild({ createAdapter: async () => ({ initializeManagedGjcSessio
         store.verify(operation);
           const record = store.read(operation.evidenceRef, operation.identity.operationId);
         assert.equal(record.evidence?.verifier, 'managed-bridge-target-rejection-v1');
-        assert.match(String((record.evidence?.content as { error?: string })?.error), /concrete http\(s\) origin; "about:blank" has none/);
+        assert.equal((record.evidence?.content as { error?: string })?.error, 'Managed browser target requires a concrete http(s) origin; a javascript: url has none.');
         assert.equal(Object.hasOwn(record, 'result'), false);
       } finally { store.close(); }
       const answer = host.snapshot().messages.at(-1)?.content ?? '';
-      assert.match(answer, /^tool-error:target_rejected:Managed browser target requires a concrete http\(s\) origin/);
+      assert.equal(answer, 'tool-error:target_rejected:Managed browser target requires a concrete http(s) origin; a javascript: url has none.');
+      assert.doesNotMatch(JSON.stringify(host.snapshot()), /SECRET-4b1d/, 'the rejected url never travels into public state');
+      assert.doesNotMatch(JSON.stringify(herdrManagedDb.eventsSince(identity.appSessionId, identity.ownerGeneration, 0).filter(event => event.kind !== 'managed.automation-record-chunk')), /SECRET-4b1d/);
       assert.equal(opens, 0, 'nothing was dispatched');
       // A late capability offer for the ended operation is refused, never dispatched.
       const late = await owner.automationControl({ type: 'bind-capability', actionId: randomUUID(), identity: pending.identity, currentTransport: { ownerConnectionId: 'caller-cannot-choose', bridgeInstanceId: transport.bridgeInstanceId, transportLocator: transport.socketPath, transportToken: transport.token } });
       assert.ok(late.type === 'automation-control' && !late.accepted);
+      owner.close();
+      await host.close();
+    } finally {
+      if (child.exitCode === null) child.kill('SIGKILL');
+      await bridge.shutdown();
+      if (priorSocket === undefined) delete process.env.GAJAE_AUTOMATION_SOCKET;
+      else process.env.GAJAE_AUTOMATION_SOCKET = priorSocket;
+    }
+  });
+});
+
+test('a step whose browser context is missing keeps waiting with a reason and completes on its original callback once the context is restored', { timeout: 30_000 }, async () => {
+  await fixture(async (root, create, client) => {
+    const script = path.join(root, 'child.ts');
+    await fs.writeFile(script, `
+import { runManagedChild } from ${JSON.stringify(fileURLToPath(new URL('./gjc-herdr-managed-child.ts', import.meta.url)))};
+import { GjcHerdrAutomationBroker } from ${JSON.stringify(fileURLToPath(new URL('./gjc-herdr-automation-broker.ts', import.meta.url)))};
+await runManagedChild({ createAdapter: async () => ({ initializeManagedGjcSession: async (_id, _config, writer, managed) => {
+  const broker = new GjcHerdrAutomationBroker({ generation: managed.generation, provider: 'provider', policyRevision: 0, emit: event => writer.send(event), flush: managed.flush });
+  return { providerSessionId: 'provider', setAutomationTurn: turn => broker.setTurn(turn), automationControl: control => broker.control(control), operationStatus: id => broker.status(id),
+    prompt: () => broker.dispatch({ toolCallId: 'tool', index: 0, request: { surface: 'browser', sessionId: 's', operation: 'command', payload: { command: { action: 'observe' } } } })
+      .then(value => { writer.send({ kind: 'stream_end', content: 'observed:' + JSON.stringify(value) }); }, error => { writer.send({ kind: 'stream_end', content: 'tool-error:' + error.message }); }),
+    steer: async () => false, abort: async () => { await broker.abort(); return true; }, dispose: () => broker.abort(), validateApproval: () => false, resolveApproval: () => false };
+} }) });
+`);
+    const child = spawn(fileURLToPath(new URL('../dist-native/bun', import.meta.url)), [script], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const priorSocket = process.env.GAJAE_AUTOMATION_SOCKET;
+    process.env.GAJAE_AUTOMATION_SOCKET = path.join(root, 'bridge.sock');
+    let sessionOpen = false;
+    let dispatches = 0;
+    const bridge = new AutomationService(root);
+    Object.defineProperty(bridge, 'supported', { value: true });
+    Object.defineProperty(bridge, 'grants', { value: new AutomationGrantStore({ get: () => null, set: () => {} }) });
+    bridge.browser.state = async () => {
+      if (!sessionOpen) throw new Error('session_not_found: Open the browser session first.');
+      return { sessionId: 's', activeTabId: 'tab-1', tabs: [{ id: 'tab-1', url: 'https://example.test/restored', title: '', loading: false, canGoBack: false, canGoForward: false }] };
+    };
+    bridge.browser.command = async () => { dispatches++; return { observed: 'restored' }; };
+    bridge.browser.shutdown = async () => {};
+    bridge.cua.shutdown = async () => {};
+    try {
+      await bridge.startBridge();
+      const host = await create(({ onEvent, appSessionId, ownerGeneration }) => initializeManagedChildSession(child, { appSessionId, ownerGeneration, onEvent, agentDir: root, runConfig: { cwd: root, sessionRoot: root, credential: { kind: 'runtime-env', envVar: 'GJC_RUNTIME_API_KEY' }, modelId: 'fixture', toolNames: [], spawns: 'deny', bashPolicy: { allowedPrefixes: [] } } }));
+      const running = host.dispatch(command('turn', 'prompt', { text: 'observe' }));
+      await wait(() => Object.keys(host.snapshot().automation).length === 1);
+      const owner = client(); await owner.connect();
+      const pending = Object.values(host.snapshot().automation)[0];
+      const transport = bridge.managedBridgeCapability()!;
+      const bind = () => owner.automationControl({ type: 'bind-capability', actionId: randomUUID(), identity: Object.values(host.snapshot().automation).find(op => op.phase === 'waiting_attachment')!.identity, currentTransport: { ownerConnectionId: 'caller-cannot-choose', bridgeInstanceId: transport.bridgeInstanceId, transportLocator: transport.socketPath, transportToken: transport.token } });
+      // Missing context is not a rejection: the operation keeps waiting and the
+      // attached App is told why.
+      const first = await bind();
+      assert.ok(first.type === 'automation-control' && !first.accepted);
+      assert.match(String(first.type === 'automation-control' && first.reason), /session_not_found/);
+      assert.equal(host.snapshot().automation[pending.identity.operationId].phase, 'waiting_attachment');
+      assert.equal(dispatches, 0);
+      // The context comes back (the person opened the Browser panel, or an
+      // earlier step opened a page): the same operation binds its actual target
+      // and still needs explicit approval before anything is dispatched.
+      sessionOpen = true;
+      const second = await bind();
+      assert.ok(second.type === 'automation-control' && second.accepted);
+      await wait(() => Object.values(host.snapshot().automation).some(op => op.phase === 'awaiting_reattach_approval'));
+      const offered = Object.values(host.snapshot().automation).find(op => op.phase === 'awaiting_reattach_approval')!;
+      assert.equal(offered.identity.targetContext, canonicalManagedInvocation({ kind: 'browser-origin', origin: 'https://example.test', tabId: 'tab-1' }));
+      assert.equal(dispatches, 0);
+      const approval = { identity: offered.identity, capabilityGeneration: offered.capabilityGeneration, approvalRequestId: offered.approvalRequestId, decision: 'approve' };
+      assert.equal((await host.dispatch(command('approve', 'resume', approval))).state, 'settled');
+      const settled = await running;
+      assert.equal(settled.state, 'settled');
+      assert.equal(dispatches, 1, 'dispatched exactly once');
+      assert.equal(host.snapshot().messages.at(-1)?.content, 'observed:{"observed":"restored"}', 'the original callback completed');
+      assert.equal(host.snapshot().automation[offered.identity.operationId].phase, 'completed');
       owner.close();
       await host.close();
     } finally {

@@ -166,7 +166,7 @@ test('managed Unix bridge resolves actual targets and durably arbitrates exact a
     await rpc(service, { type: 'managed-dispatch', attempt: attempt(firstOpen), invocation: open });
     const firstAuthorize = await resolve({ surface: 'browser', sessionId: 's', operation: 'authorize', payload: { url: 'https://first.test' } });
     assert.deepEqual(firstAuthorize.targetBinding, { kind: 'browser-origin', origin: 'https://first.test', tabId: 'no-active-tab' });
-    await assert.rejects(resolve(), /not open in this app instance: open the browser session first/);
+    await assert.rejects(resolve(), /session_not_found/);
     service.browser.state = async () => { throw new Error('Browser sidecar disconnected.'); };
     await assert.rejects(resolve(open), /disconnected/);
     const click = { surface: 'computer', sessionId: 's', tool: 'click', arguments: { target: { window_id: 7 }, name: 'ignored label' } };
@@ -329,16 +329,29 @@ test('a target the App can never bind is answered with the target_rejected code;
     const blank = await resolveFor('r1', { surface: 'browser', sessionId: 's', operation: 'open', payload: { url: 'about:blank', allowDownload: false } });
     assert.equal(blank.ok, false);
     assert.equal(blank.code, 'target_rejected', JSON.stringify(blank));
-    assert.match(String(blank.error), /concrete http\(s\) origin; "about:blank" has none/);
+    assert.equal(blank.error, 'Managed browser target requires a concrete http(s) origin; a about: url has none.');
     const tabs = await resolveFor('r2', { surface: 'browser', sessionId: 's', operation: 'command', payload: { command: { action: 'newTab' } } });
     assert.deepEqual([tabs.ok, tabs.code], [false, 'target_rejected']);
     const ok = await resolveFor('r3', { surface: 'browser', sessionId: 's', operation: 'open', payload: { url: 'https://example.test/page', allowDownload: false } });
     assert.equal(ok.ok, true);
-    // A command against a session this instance never opened is a rejection: the
-    // agent has to open again. A transport failure while resolving is not.
+    // Every url without an http(s) origin is an immutable property of the
+    // invocation: rejected with a reason that names only the scheme, never the
+    // url itself (which is the agent's payload and may carry secrets).
+    const secret = 'SECRET-7f3a9c';
+    let index = 10;
+    for (const url of [`file:///Users/someone/${secret}.html`, `data:text/html,<p>${secret}</p>`, `javascript:alert('${secret}')`, `mailto:${secret}@example.test`, `http://[${secret}`, `://${secret}`, '   ']) {
+      const rejected = await resolveFor(`r${index++}`, { surface: 'browser', sessionId: 's', operation: 'open', payload: { url, allowDownload: false } });
+      assert.deepEqual([rejected.ok, rejected.code], [false, 'target_rejected'], url);
+      assert.match(String(rejected.error), /^Managed browser target requires a concrete http\(s\) origin; (a [a-z0-9+.-]+: url has none|the url is not a valid http\(s\) address)\.$/, url);
+      assert.doesNotMatch(JSON.stringify(rejected), new RegExp(secret), url);
+    }
+    // A command against a session this instance does not hold is missing
+    // context, not an invalid invocation: it stays untyped so the step keeps
+    // waiting and binds once the session exists again.
     const gone = await resolveFor('r6', { surface: 'browser', sessionId: 's', operation: 'command', payload: { command: { action: 'reload' } } });
-    assert.deepEqual([gone.ok, gone.code], [false, 'target_rejected']);
-    assert.match(String(gone.error), /open the browser session first/);
+    assert.equal(gone.ok, false);
+    assert.equal('code' in gone, false, 'a recoverable context failure carries no rejection code');
+    assert.match(String(gone.error), /session_not_found/);
     sidecarDown = true;
     const down = await resolveFor('r4', { surface: 'browser', sessionId: 's', operation: 'command', payload: { command: { action: 'reload' } } });
     assert.equal(down.ok, false);

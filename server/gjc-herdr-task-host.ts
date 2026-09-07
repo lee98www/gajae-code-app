@@ -944,7 +944,15 @@ export class HerdrTaskHost {
               client.cursor = frame.watermark;
               this.#send(socket, { type: 'subscribed', id: frame.id, watermark: frame.watermark });
               this.#broadcast();
-            } else if (frame.type === 'automation-control') this.#send(socket, { type: 'automation-control', id: frame.id, accepted: await this.#automationControl(frame.control, client.connectionId) });
+            } else if (frame.type === 'automation-control') {
+              // A bind that could not complete leaves the durable operation
+              // waiting; the attached App learns the bounded reason so its
+              // viewers see what the step waits for instead of a bare spinner.
+              let accepted = false; let reason: string | undefined;
+              try { accepted = await this.#automationControl(frame.control, client.connectionId); }
+              catch (error) { reason = this.#redact(error instanceof Error ? error.message : 'Automation control failed.').slice(0, 300) || 'Automation control failed.'; }
+              this.#send(socket, { type: 'automation-control', id: frame.id, accepted, ...(reason ? { reason } : {}) });
+            }
           } catch { socket.write(`${JSON.stringify({ type: 'error', id: frame.id, message: 'command rejected' })}\n`); }
         })().catch(() => socket.destroy()).finally(() => { inflight--; });
       }

@@ -125,7 +125,7 @@ export const herdrManagedAttachResponseSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('snapshot-page'), id: idSchema, snapshotId: idSchema, page: z.number().int().nonnegative(), chunk: z.string(), leaseExpiresAt: z.number().int().nonnegative() }).strict().refine(v => managedJsonBytes(v) <= HERDR_MANAGED_MAX_FRAME_BYTES),
   z.object({ type: z.literal('replay'), id: idSchema, afterSeq: z.number().int().nonnegative(), watermark: z.number().int().nonnegative(), nextSeq: z.number().int().nonnegative(), events: z.array(herdrManagedEventSchema).max(HERDR_MANAGED_MAX_REPLAY_EVENTS), complete: z.boolean() }).strict().refine(v => managedJsonBytes(v) <= HERDR_MANAGED_MAX_FRAME_BYTES && v.nextSeq <= v.watermark && v.events.every((e, i) => e.seq === v.afterSeq + i + 1) && v.nextSeq === v.afterSeq + v.events.length && v.complete === (v.nextSeq === v.watermark)),
   z.object({ type: z.literal('subscribed'), id: idSchema, watermark: z.number().int().nonnegative() }).strict(),
-  z.object({ type: z.literal('automation-control'), id: idSchema, accepted: z.boolean() }).strict(),
+  z.object({ type: z.literal('automation-control'), id: idSchema, accepted: z.boolean(), reason: z.string().min(1).max(300).optional() }).strict(),
   z.object({ type: z.literal('snapshot-required'), id: idSchema, reason: z.enum(['gap', 'lease_expired']) }).strict(),
   z.object({ type: z.literal('receipt'), id: idSchema, receipt: z.lazy(() => herdrManagedCommandReceiptSchema) }).strict(),
   z.object({ type: z.literal('event'), event: herdrManagedEventSchema }).strict(),

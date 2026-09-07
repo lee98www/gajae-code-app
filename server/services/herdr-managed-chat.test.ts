@@ -264,7 +264,44 @@ test('real attach projects mapping before send, reuses owner, orders two viewers
       assert.equal(controls[1].originalCapabilityGeneration, 'original-capability');
       assert.equal(Object.hasOwn(controls[0], 'capability'), false);
       assert.equal(Object.hasOwn(controls[0], 'argumentsRef'), false);
-    } finally { normal.close(); automationService.managedBridgeCapability = originalBridgeCapability; }
+    } finally { normal.close(); }
+    // A bind the host cannot complete yet: the host answers why, the viewer is
+    // told what the step waits for, and a later successful bind clears it.
+    const binds: number[] = [];
+    const waitingState = { ...state(), automation: { [unresolved.operationId]: waiting } };
+    const told = new HerdrManagedChatService({
+      db: { get: db.get, projectState: () => true },
+      workspaces: { isManaged: () => true, ensure: async () => { throw new Error('Subscribe does not provision'); }, attach: async () => ({
+        state: waitingState, connected: true, recover: async () => waitingState, subscribe: () => () => {}, subscribeState: () => () => {},
+        automationControl: async (control: Parameters<HerdrManagedAttachClient['automationControl']>[0]) => {
+          if (control.type !== 'bind-capability') throw new Error('Only binds expected');
+          binds.push(Date.now());
+          if (binds.length === 1) return { type: 'automation-control' as const, id: 'reply', accepted: false, reason: 'session_not_found: Open the browser session first.' };
+          return { type: 'automation-control' as const, id: 'reply', accepted: true };
+        },
+        command: async () => { throw new Error('No command expected'); }, close() {},
+      } as unknown as HerdrManagedAttachClient) },
+    });
+    try {
+      const watcher = viewer();
+      assert.equal((await told.subscribe('app', watcher.connection)).ok, true);
+      type Status = { text?: string; automationWaiting?: boolean };
+      const statusOf = (frame: Record<string, unknown>): Status | undefined => {
+        const pages = frame.kind === 'managed_snapshot_page' && typeof frame.chunk === 'string' ? frame.chunk : null;
+        if (pages) return { automationWaiting: /"automationWaiting":true/.test(pages), text: (/"text":"([^"]*)"/.exec(pages) ?? [])[1] };
+        const projection = frame.projection as { metadata?: { status?: Status } } | undefined;
+        return (frame.metadata as { status?: Status } | undefined)?.status ?? projection?.metadata?.status;
+      };
+      const statuses = () => watcher.frames.map(statusOf).filter(Boolean) as Status[];
+      for (let i = 0; i < 200 && !statuses().some(status => status.automationWaiting); i++) await new Promise(resolve => setTimeout(resolve, 5));
+      const waitingStatus = statuses().find(status => status.automationWaiting);
+      assert.ok(waitingStatus, 'the viewer is told what the step waits for');
+      assert.equal(waitingStatus.text, 'Automation step waiting for its target: session_not_found: Open the browser session first.');
+      // The next renewal binds: the reason is gone from the projection again.
+      for (let i = 0; i < 600 && binds.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 5));
+      for (let i = 0; i < 200 && (statuses().at(-1)?.automationWaiting); i++) await new Promise(resolve => setTimeout(resolve, 5));
+      assert.equal(Boolean(statuses().at(-1)?.automationWaiting), false, 'a successful bind clears the wait reason');
+    } finally { told.close(); automationService.managedBridgeCapability = originalBridgeCapability; }
     let finishAttach!: (value: HerdrManagedAttachClient) => void;
     let renewals = 0;
     const closing = new HerdrManagedChatService({

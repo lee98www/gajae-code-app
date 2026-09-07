@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { setImmediate as yieldToSocket, setTimeout as waitForSocket } from 'node:timers/promises';
 
-import { MANAGED_CHAT_MAX_FRAME_BYTES, pageTransfer, projectManagedEvent, projectManagedState } from '../../../../shared/herdr-managed-chat.js';
+import { MANAGED_CHAT_MAX_FRAME_BYTES, pageTransfer, projectManagedEvent, projectManagedState, type ManagedProjectionOverlay } from '../../../../shared/herdr-managed-chat.js';
 import type { HerdrManagedBridgeTransport, HerdrManagedCommand, HerdrManagedCommandReceipt } from '../../../../shared/herdr-managed-protocol.js';
 import { herdrManagedActionIdSchema } from '../../../../shared/herdr-managed-protocol.js';
 import type { HerdrManagedState } from '../../../../shared/herdr-managed-state.js';
@@ -19,7 +19,8 @@ export type ManagedChatSend = { sessionId: string; content: string; actionId: st
 export type ManagedChatControl = { sessionId: string; actionId: string; content?: string; turnId?: string };
 export type ManagedChatPermissionResponse = { sessionId: string; actionId: string; requestId: string; allow: boolean; always?: boolean; message?: string; updatedInput?: unknown };
 type Client = Pick<HerdrManagedAttachClient, 'state' | 'recover' | 'subscribe' | 'subscribeState' | 'command' | 'automationControl' | 'close' | 'connected'>;
-type Binding = { client: Client; viewers: Set<ManagedChatConnection>; off: (() => void)[]; renewing?: boolean };
+/** Viewer-facing, App-local: why a waiting operation could not be bound on the last renewal. */
+type Binding = { client: Client; viewers: Set<ManagedChatConnection>; off: (() => void)[]; renewing?: boolean; waiting: Map<string, string> };
 type SnapshotTransfer = { latest: HerdrManagedState | null; events: unknown[]; bytes: number };
 export type HerdrManagedChatOptions = {
   workspaces?: Pick<HerdrManagedWorkspacesService, 'isManaged' | 'ensure'> & { attach(id: string): Promise<Client> };
@@ -64,11 +65,21 @@ export class HerdrManagedChatService {
         if (operation.phase === 'outcome_unknown' && operation.capabilityGeneration) {
           await binding.client.automationControl({ type: 'reconcile', actionId: randomUUID(), identity: operation.identity, originalCapabilityGeneration: operation.capabilityGeneration, currentTransport });
         } else if (['waiting_attachment', 'awaiting_reattach_approval'].includes(operation.phase)) {
-          await binding.client.automationControl({ type: 'bind-capability', actionId: randomUUID(), identity: operation.identity, currentTransport });
+          const response = await binding.client.automationControl({ type: 'bind-capability', actionId: randomUUID(), identity: operation.identity, currentTransport });
+          const reason = response.type === 'automation-control' && !response.accepted ? response.reason : undefined;
+          const known = binding.waiting.get(operation.identity.operationId);
+          if (reason) binding.waiting.set(operation.identity.operationId, reason); else binding.waiting.delete(operation.identity.operationId);
+          if ((reason ?? null) !== (known ?? null) && binding.client.state) for (const viewer of binding.viewers) void this.#snapshot(viewer, binding.client.state, binding);
         }
       }
     } catch { /* Absence leaves the durable operation waiting, not failed. */ }
     finally { binding.renewing = false; }
+  }
+  #overlay(binding: Binding | undefined, state: HerdrManagedState): ManagedProjectionOverlay | undefined {
+    if (!binding?.waiting.size) return undefined;
+    const waiting: Record<string, string> = {};
+    for (const [operationId, reason] of binding.waiting) if (state.automation[operationId]?.phase === 'waiting_attachment') waiting[operationId] = reason;
+    return Object.keys(waiting).length ? { waiting } : undefined;
   }
   #emit(connection: ManagedChatConnection, value: unknown): boolean {
     if (this.#closed || this.#detached.has(connection) || connection.readyState !== 1) { this.detach(connection); return false; }
@@ -101,7 +112,7 @@ export class HerdrManagedChatService {
     await yieldToSocket();
     return !this.#closed && !this.#detached.has(connection) && connection.readyState === 1;
   }
-  async #snapshot(connection: ManagedChatConnection, state: HerdrManagedState): Promise<boolean> {
+  async #snapshot(connection: ManagedChatConnection, state: HerdrManagedState, binding?: Binding): Promise<boolean> {
     let transfers = this.#transfers.get(connection);
     if (!transfers) { transfers = new Map(); this.#transfers.set(connection, transfers); }
     const id = state.identity.appSessionId;
@@ -119,7 +130,7 @@ export class HerdrManagedChatService {
         if (transfer.latest) {
           const snapshot = transfer.latest;
           transfer.latest = null;
-          for (const frame of pageTransfer(projectManagedState(snapshot), randomUUID())) {
+          for (const frame of pageTransfer(projectManagedState(snapshot, this.#overlay(binding ?? this.#bindings.get(id), snapshot)), randomUUID())) {
             if (!await this.#writeSnapshotFrame(connection, frame)) return false;
           }
         }
@@ -176,7 +187,7 @@ export class HerdrManagedChatService {
       if (binding?.client !== client) {
         const viewers = binding?.viewers ?? new Set<ManagedChatConnection>();
         binding?.off.forEach(off => off());
-        binding = { client, viewers, off: [] };
+        binding = { client, viewers, off: [], waiting: binding?.waiting ?? new Map() };
         this.#bindings.set(id, binding);
         const current = binding;
         const renewal = setInterval(() => { if (client.state) void this.#renew(current, client.state); }, 2000);
@@ -195,7 +206,7 @@ export class HerdrManagedChatService {
         current.off.push(client.subscribe(event => {
           const state = client.state; if (!state || state.watermark !== event.seq) return;
           liveWatermark = event.seq;
-          const frame = projectManagedEvent(event, state);
+          const frame = projectManagedEvent(event, state, this.#overlay(current, state));
           for (const viewer of current.viewers) this.#event(viewer, state, frame);
         }));
         if (client.state) this.#project(client.state);

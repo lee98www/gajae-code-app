@@ -47,8 +47,15 @@ const visibleKinds = new Set<ManagedChatKind>(['text', 'thinking', 'tool_use', '
 
 /** Shown while a dispatched automation step's outcome cannot be recovered. */
 export const MANAGED_AUTOMATION_UNKNOWN_STATUS = 'Automation step outcome unknown: the app disconnected while it ran and it is never retried automatically. Stop the task to continue.';
+/** Shown while a never-dispatched step waits for context the app cannot bind yet. */
+export const MANAGED_AUTOMATION_WAITING_PREFIX = 'Automation step waiting for its target: ';
+/**
+ * App-local, viewer-facing facts that are not part of the owner's durable
+ * state: why a waiting operation could not be bound on the last attempt.
+ */
+export interface ManagedProjectionOverlay { waiting?: Record<string, string> }
 
-export function projectManagedState(state: HerdrManagedState): ManagedChatProjection {
+export function projectManagedState(state: HerdrManagedState, overlay?: ManagedProjectionOverlay): ManagedChatProjection {
   const { appSessionId: sessionId, ownerGeneration } = state.identity;
   const records: ManagedChatRecord[] = [];
   const row = (key: string, kind: ManagedChatKind, payload: unknown, turnId: string | null, seq?: number): ManagedChatRecord => {
@@ -105,9 +112,12 @@ export function projectManagedState(state: HerdrManagedState): ManagedChatProjec
   // retried on its own: the runtime's last activity text ("Using Browser…")
   // would otherwise spin forever without telling the person why.
   const unknownAutomation = !terminal && automation.some(operation => operation.phase === 'outcome_unknown');
+  const waitingReason = terminal ? undefined : automation.map(operation => operation.phase === 'waiting_attachment' ? overlay?.waiting?.[operation.identity.operationId] : undefined).find(Boolean);
   const status = unknownAutomation
     ? { ...(publicValue(state.status) as Record<string, unknown> ?? {}), text: MANAGED_AUTOMATION_UNKNOWN_STATUS, automationUnknown: true }
-    : publicValue(state.status);
+    : waitingReason
+      ? { ...(publicValue(state.status) as Record<string, unknown> ?? {}), text: `${MANAGED_AUTOMATION_WAITING_PREFIX}${waitingReason}`, automationWaiting: true }
+      : publicValue(state.status);
   return { records, pendingPermissions, metadata: {
     kind: 'managed_ui_status', sessionId, ownerGeneration, providerSessionId: state.providerSessionId,
     watermark: state.watermark, lifecycle: state.lifecycle, activeTurnId: state.activeTurnId, title: state.title,
@@ -118,10 +128,10 @@ export function projectManagedState(state: HerdrManagedState): ManagedChatProjec
 }
 
 /** state is the authoritative state AFTER reducing event. Original unmanaged SDK events are never mutated. */
-export function projectManagedEvent(event: HerdrManagedEvent, state: HerdrManagedState): ManagedLiveEvent {
+export function projectManagedEvent(event: HerdrManagedEvent, state: HerdrManagedState, overlay?: ManagedProjectionOverlay): ManagedLiveEvent {
   if (event.appSessionId !== state.identity.appSessionId || event.ownerGeneration !== state.identity.ownerGeneration || event.seq !== state.watermark) throw new Error('Managed projection identity/watermark mismatch.');
   return { kind: 'managed_live_event', id: `${event.ownerGeneration}:${event.seq}`, sessionId: event.appSessionId,
-    ownerGeneration: event.ownerGeneration, seq: event.seq, projection: projectManagedState(state) };
+    ownerGeneration: event.ownerGeneration, seq: event.seq, projection: projectManagedState(state, overlay) };
 }
 
 export interface ManagedChatCursor { sessionId: string; ownerGeneration: string; watermark: number }
