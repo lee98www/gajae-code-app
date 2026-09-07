@@ -38,6 +38,7 @@ import { ManagedChildTransport } from './gjc-herdr-child-client.js';
 import { acquireConsoleTerminal, ConsoleInputDecoder, ConsoleOutputWriter, parseConsoleLine, renderConsoleReceipt, renderConsoleReject, renderRequest, renderEvent } from './gjc-herdr-task-console.js';
 
 const MANAGED_UNCONFIRMED_CLOSURE = 'Managed owner closure unconfirmed.';
+const MANAGED_AUTOMATION_UNKNOWN_TEXT = 'Automation step outcome unknown: the app disconnected while it ran and it is never retried automatically; stop the task to continue.';
 
 export type ManagedSdkSession = {
   providerSessionId: string;
@@ -1269,6 +1270,9 @@ export async function runHerdrTaskHostStdio(options: { bootstrap: HerdrTaskHostB
         kind: 'resume', policyRevision: operation.identity.policyRevision,
         question: `Resume ${publicManagedTargetContext(operation.identity.targetContext)}; capability ${operation.capabilityGeneration}`,
       }, secrets), 'critical');
+      // A dispatched step whose App vanished mid-flight is never retried on
+      // its own; whoever holds the terminal must know the turn is parked on it.
+      else if (operation.phase === 'outcome_unknown') writer.write(renderEvent({ kind: 'error', text: `${MANAGED_AUTOMATION_UNKNOWN_TEXT} (${publicManagedTargetContext(operation.identity.targetContext)})` }, secrets) ?? '', 'critical');
     } else if (event.kind === 'sdk.event' && isObject(event.payload) && event.payload.kind === 'stream_end' && typeof event.payload.content === 'string') {
       const display = renderEvent({ kind: 'conversation', text: event.payload.content }, secrets);
       if (display) writer.write(display);

@@ -45,6 +45,9 @@ function publicValue(value: unknown): unknown {
 const publicData = (v: unknown): Data => object(publicValue(v));
 const visibleKinds = new Set<ManagedChatKind>(['text', 'thinking', 'tool_use', 'tool_result', 'error', 'complete', 'status', 'interactive_prompt', 'task_notification', 'system_notice']);
 
+/** Shown while a dispatched automation step's outcome cannot be recovered. */
+export const MANAGED_AUTOMATION_UNKNOWN_STATUS = 'Automation step outcome unknown: the app disconnected while it ran and it is never retried automatically. Stop the task to continue.';
+
 export function projectManagedState(state: HerdrManagedState): ManagedChatProjection {
   const { appSessionId: sessionId, ownerGeneration } = state.identity;
   const records: ManagedChatRecord[] = [];
@@ -98,11 +101,18 @@ export function projectManagedState(state: HerdrManagedState): ManagedChatProjec
       providerSessionId: operation.identity.provider, turnId: operation.identity.turn, policyRevision: operation.identity.policyRevision, createdAt: '' });
   }
   const terminal = ['idle', 'interrupted', 'closed'].includes(state.lifecycle);
+  // A dispatched step whose App vanished mid-flight stays unknown and is never
+  // retried on its own: the runtime's last activity text ("Using Browser…")
+  // would otherwise spin forever without telling the person why.
+  const unknownAutomation = !terminal && automation.some(operation => operation.phase === 'outcome_unknown');
+  const status = unknownAutomation
+    ? { ...(publicValue(state.status) as Record<string, unknown> ?? {}), text: MANAGED_AUTOMATION_UNKNOWN_STATUS, automationUnknown: true }
+    : publicValue(state.status);
   return { records, pendingPermissions, metadata: {
     kind: 'managed_ui_status', sessionId, ownerGeneration, providerSessionId: state.providerSessionId,
     watermark: state.watermark, lifecycle: state.lifecycle, activeTurnId: state.activeTurnId, title: state.title,
     terminal, isProcessing: !terminal, usage: publicValue(state.usage), configuration: publicValue(state.configuration),
-    status: publicValue(state.status), turns: publicData(state.turns),
+    status, turns: publicData(state.turns),
     queue: { paused: state.queue.paused, count: state.queue.entries.length, actionIds: state.queue.entries.map(e => e.command.actionId) }, automation,
   } };
 }

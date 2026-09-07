@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import { createHerdrManagedState, applyHerdrManagedEvent } from './herdr-managed-state.js';
 import { managedJsonBytes, type HerdrManagedEvent } from './herdr-managed-protocol.js';
-import { projectManagedState, projectManagedEvent, pageTransfer, assembleManagedTransfer, acceptManagedSequence, MANAGED_CHAT_MAX_FRAME_BYTES } from './herdr-managed-chat.js';
+import { projectManagedState, projectManagedEvent, pageTransfer, assembleManagedTransfer, acceptManagedSequence, MANAGED_AUTOMATION_UNKNOWN_STATUS, MANAGED_CHAT_MAX_FRAME_BYTES } from './herdr-managed-chat.js';
 
 const initial = () => ({ ...createHerdrManagedState({ appSessionId: 'app', ownerGeneration: 'gen' }), providerSessionId: 'native' });
 test('tool pairing keeps partial and rich final details without duplicate tool cards', () => {
@@ -67,6 +67,24 @@ test('automation resume exposes approval binding without protected records or ca
   assert.equal(p.pendingPermissions[0].requestId, 'approval');
   assert.equal((p.pendingPermissions[0].input as { capabilityGeneration: string }).capabilityGeneration, 'cap');
   assert.deepEqual((p.pendingPermissions[0].input as { identity: unknown }).identity, state.automation.op.identity);
+});
+test('an automation step whose outcome is unknown replaces the runtime activity text and stays interruptible', () => {
+  const state = initial();
+  state.lifecycle = 'running'; state.activeTurnId = 'turn';
+  state.status = { text: 'Using Browser…', tokenBudget: null };
+  const identity = { generation: 'gen', provider: 'native', turn: 'turn', toolCallId: 'call', operationId: 'op', index: 0, argumentsHash: 'a'.repeat(64), policyRevision: 0, targetContext: 'browser' };
+  state.automation.op = { identity, phase: 'dispatching', capabilityGeneration: 'cap', approvalRequestId: 'approval', dispatchCount: 1, argumentsRef: 'args', resultRef: null, evidenceRef: null };
+  assert.equal((projectManagedState(state).metadata.status as { text: string }).text, 'Using Browser…');
+  state.automation.op = { ...state.automation.op, phase: 'outcome_unknown', approvalRequestId: null };
+  const p = projectManagedState(state);
+  assert.equal((p.metadata.status as { text: string }).text, MANAGED_AUTOMATION_UNKNOWN_STATUS);
+  assert.equal((p.metadata.status as { automationUnknown?: boolean }).automationUnknown, true);
+  assert.equal(p.metadata.terminal, false);
+  assert.equal(p.metadata.activeTurnId, 'turn', 'the turn stays interruptible');
+  assert.equal(p.pendingPermissions.length, 0, 'nothing is offered for approval: the step is never retried on its own');
+  // Once the owner has settled the turn the notice is gone with it.
+  state.lifecycle = 'idle'; state.activeTurnId = null;
+  assert.equal((projectManagedState(state).metadata.status as { text: string }).text, 'Using Browser…');
 });
 test('sequence guard rejects stale generations and gaps, ignores duplicates', () => {
   const cursor = { sessionId: 'app', ownerGeneration: 'gen', watermark: 5 };

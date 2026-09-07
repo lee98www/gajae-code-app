@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -18,6 +19,7 @@ import { projectManagedState } from '../shared/herdr-managed-chat.js';
 
 import { commandHash, confirmChildExit, HerdrTaskHost, initializeManagedChildSession, runHerdrTaskHostStdio, type ManagedSdkSessionFactory } from './gjc-herdr-task-host.js';
 import { GjcHerdrAutomationBroker } from './gjc-herdr-automation-broker.js';
+import { automationCanonical } from './gjc-herdr-automation-store.js';
 import { parseConsoleLine, sanitizeConsoleText } from './gjc-herdr-task-console.js';
 import { ManagedBridgeLedger } from './modules/automation/managed-bridge-ledger.js';
 import { HerdrManagedAttachClient } from './modules/herdr/index.js';
@@ -544,6 +546,55 @@ test('a console-entered turn that ends unknown is announced once and never as a 
     assert.doesNotMatch(stdout, /REJECT/, 'an unknown outcome is never presented as a rejected command');
     assert.doesNotMatch(stdout, /ACK console-turn (admitted|settled|rejected)/);
     assert.equal(host.snapshot().lifecycle, 'unknown');
+    await host.close().catch(() => {});
+  });
+});
+
+test('a dispatched automation step whose outcome became unknown is announced on the console with its target', async () => {
+  await withManagedDatabase(async tmp => {
+    herdrManagedDb.reserve({ appSessionId: 'managed-session', projectPath: '/tmp/project', herdrInstanceId: 'herdr-main', ownerGeneration: 'owner-gen-1' });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    output.setEncoding('utf8');
+    let stdout = '';
+    output.on('data', chunk => { stdout += String(chunk); });
+    let emit!: (event: Record<string, unknown>, seq: number) => void | Promise<void>;
+    let finish: () => void = () => {};
+    const args = { surface: 'browser', sessionId: 'managed-session', operation: 'command', payload: { command: { action: 'observe' } } };
+    const identity = { generation: 'owner-gen-1', provider: 'provider-session-1', turn: 'turn-1', toolCallId: 'browser-1', operationId: 'op-1', index: 0, argumentsHash: createHash('sha256').update(automationCanonical(args)).digest('hex'), policyRevision: 0, targetContext: 'unresolved' };
+    const chunk = (recordId: string, record: Record<string, unknown>) => {
+      const bytes = Buffer.from(JSON.stringify(record));
+      return { kind: 'managed.automation-record-chunk', recordId, operationId: (record.identity as { operationId: string }).operationId, index: 0, total: 1, encoding: 'base64', data: bytes.toString('base64'), sha256: createHash('sha256').update(bytes).digest('hex') };
+    };
+    const host = await runHerdrTaskHostStdio({
+      bootstrap: { appSessionId: 'managed-session', ownerGeneration: 'owner-gen-1', herdrInstanceId: 'herdr-main', projectPath: '/tmp/project', sessionRoot: tmp },
+      input,
+      output,
+      createSession: ({ onEvent }) => {
+        emit = (event, seq) => onEvent({ version: 1, generation: 'owner-gen-1', requestId: 'action:turn-1', runId: 'turn-1', type: 'event', eventSeq: seq, event });
+        return { providerSessionId: 'provider-session-1', prompt: () => new Promise<void>(resolve => { finish = resolve; }), abort: async () => { finish(); return true; } };
+      },
+    });
+    input.write(`:prompt turn-1 ${host.snapshot().watermark} "open the page"\n`);
+    for (let i = 0; i < 200 && host.snapshot().lifecycle !== 'running'; i++) await new Promise(resolve => setTimeout(resolve, 5));
+    const bound = { ...identity, operationId: 'op-2', targetContext: JSON.stringify({ kind: 'browser-origin', origin: 'https://example.test', tabId: 'tab-1' }) };
+    await emit(chunk('args-1', { identity, arguments: args }), 1);
+    await emit({ kind: 'managed.automation', payload: { identity, phase: 'waiting_attachment', argumentsRef: 'args-1', resultRef: null, evidenceRef: null, capabilityGeneration: null, approvalRequestId: null, dispatchCount: 0 } }, 2);
+    await emit({ kind: 'managed.automation', payload: { identity, phase: 'cancelled', argumentsRef: 'args-1', resultRef: null, evidenceRef: null, capabilityGeneration: null, approvalRequestId: null, dispatchCount: 0 } }, 3);
+    await emit(chunk('args-2', { identity: bound, arguments: args, sourceOperationId: 'op-1' }), 4);
+    await emit({ kind: 'managed.automation', payload: { identity: bound, phase: 'waiting_attachment', argumentsRef: 'args-2', resultRef: null, evidenceRef: null, capabilityGeneration: null, approvalRequestId: null, dispatchCount: 0 } }, 5);
+    await emit({ kind: 'managed.automation', payload: { identity: bound, phase: 'awaiting_reattach_approval', argumentsRef: 'args-2', resultRef: null, evidenceRef: null, capabilityGeneration: 'cap-1', approvalRequestId: 'approval-1', dispatchCount: 0 } }, 6);
+    await emit({ kind: 'managed.automation', payload: { identity: bound, phase: 'dispatching', argumentsRef: 'args-2', resultRef: null, evidenceRef: null, capabilityGeneration: 'cap-1', approvalRequestId: 'approval-1', dispatchCount: 1 } }, 7);
+    assert.doesNotMatch(stdout, /outcome unknown/);
+    await emit({ kind: 'managed.automation', payload: { identity: bound, phase: 'outcome_unknown', argumentsRef: 'args-2', resultRef: null, evidenceRef: null, capabilityGeneration: 'cap-1', approvalRequestId: null, dispatchCount: 1 } }, 8);
+    for (let i = 0; i < 200 && !stdout.includes('outcome unknown'); i++) await new Promise(resolve => setTimeout(resolve, 5));
+    const announcements = stdout.split('\n').filter(line => line.startsWith('ERROR Automation step outcome unknown: the app disconnected while it ran and it is never retried automatically; stop the task to continue. ('));
+    assert.equal(announcements.length, 1, 'announced exactly once');
+    assert.match(announcements[0], /"origin":"https:\/\/example\.test"/, 'with the public target binding');
+    assert.doesNotMatch(stdout, /REJECT/, 'an unknown step is never presented as a rejected command');
+    assert.equal(host.snapshot().automation['op-2'].phase, 'outcome_unknown');
+    finish();
+    await new Promise(resolve => setTimeout(resolve, 20));
     await host.close().catch(() => {});
   });
 });

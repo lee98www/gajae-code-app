@@ -122,7 +122,15 @@ concrete http(s) origin, unsupported operation, tab management, an inexact
 launch selector) is answered with the `target_rejected` code; the host then
 ends that operation as an evidenced, never-dispatched cancellation and the SDK
 callback fails with the App's reason instead of waiting for an attachment that
-can never come. Every other resolution failure keeps the operation waiting. Only authoritative completed receipts or fenced
+can never come. Every other resolution failure keeps the operation waiting.
+A step that was actually dispatched when the App vanished stays
+`outcome_unknown`: the App's ledger keeps the reservation, reconciliation
+never invents a completion, and nothing retries it. Both clients say so
+instead of spinning on the runtime's last activity text: the console prints
+one `ERROR Automation step outcome unknown …` line with the public target and
+the chat projection replaces the status text with the same notice while the
+turn stays interruptible. Continuing is the person's decision (stop the task,
+ask again). Only authoritative completed receipts or fenced
 not-dispatched outcomes permit recovery; an existing reservation with unknown
 outcome is not replayable. Missing command replies require status/ACK lookup,
 not restart, a new action ID, or a replacement task. A denial consumes its
