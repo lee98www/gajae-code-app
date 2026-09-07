@@ -34,10 +34,11 @@ grammar and unknown-outcome troubleshooting, and
 [GJC-LIVE-SPEC.md](../server/GJC-LIVE-SPEC.md#managed-normal-chat-ownership)
 for ownership and recovery boundaries.
 
-**Evidence scope:** `npm run verify` at `a543d19` passed
-(`artifacts/herdr-managed-gen11-verify.log`: 835 server/client `node:test`
-tests, 465 client tests, 16 e2e, plus the Bun suites reported separately, exit
-0). The lifetime harness kills an actual separate test App process with
+**Evidence scope:** `npm run verify` at `a543d19` (the last product-source
+commit; later commits are documentation only) passed
+(`artifacts/herdr-managed-gen11-verify.log`: 835 server `node:test` tests,
+465 client `node:test` tests, 16 e2e tests, plus the Bun suites reported
+separately as 36 files / 292 tests, exit 0). The lifetime harness kills an actual separate test App process with
 SIGTERM/SIGKILL and keeps a real PTY Node host/Bun SDK child alive; its
 imported fixture supplies placement and deterministic model transport. The
 production Herdr CLI, the installed desktop bundle and the live provider were
