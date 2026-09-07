@@ -447,8 +447,11 @@ export class AutomationService {
       catch (error) {
         // A new session has no tab yet. Only the exact sidecar absence result
         // authorizes that narrow binding; transport failures are not absence.
-        if (!(error instanceof Error) || !error.message.startsWith('session_not_found:')
-          || (request.operation !== 'open' && !(request.operation === 'authorize' && typeof rawUrl === 'string'))) throw error;
+        if (!(error instanceof Error) || !error.message.startsWith('session_not_found:')) throw error;
+        // A command against a session this App instance does not have (it was
+        // opened by an instance that has since quit) can never bind: the agent
+        // must open the session again, which is a different invocation.
+        if (request.operation !== 'open' && !(request.operation === 'authorize' && typeof rawUrl === 'string')) throw new ManagedTargetRejectedError('Managed browser session is not open in this app instance: open the browser session first.');
         state = { sessionId: request.sessionId, activeTabId: null, tabs: [] };
       }
       const tab = state.tabs.find(candidate => candidate.id === state.activeTabId);

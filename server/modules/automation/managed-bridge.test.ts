@@ -166,7 +166,7 @@ test('managed Unix bridge resolves actual targets and durably arbitrates exact a
     await rpc(service, { type: 'managed-dispatch', attempt: attempt(firstOpen), invocation: open });
     const firstAuthorize = await resolve({ surface: 'browser', sessionId: 's', operation: 'authorize', payload: { url: 'https://first.test' } });
     assert.deepEqual(firstAuthorize.targetBinding, { kind: 'browser-origin', origin: 'https://first.test', tabId: 'no-active-tab' });
-    await assert.rejects(resolve(), /session_not_found/);
+    await assert.rejects(resolve(), /not open in this app instance: open the browser session first/);
     service.browser.state = async () => { throw new Error('Browser sidecar disconnected.'); };
     await assert.rejects(resolve(open), /disconnected/);
     const click = { surface: 'computer', sessionId: 's', tool: 'click', arguments: { target: { window_id: 7 }, name: 'ignored label' } };
@@ -306,7 +306,7 @@ test('a target the App can never bind is answered with the target_rejected code;
   Object.defineProperty(service, 'supported', { value: true });
   Object.defineProperty(service, 'grants', { value: new AutomationGrantStore({ get: () => null, set: () => {} }) });
   let sidecarDown = false;
-  service.browser.state = async () => { if (sidecarDown) throw new Error('sidecar_unavailable: transport down'); return { sessionId: 's', activeTabId: null, tabs: [] }; };
+  service.browser.state = async () => { if (sidecarDown) throw new Error('sidecar_unavailable: transport down'); throw new Error('session_not_found: Open the browser session first.'); };
   service.browser.shutdown = async () => {};
   service.cua.shutdown = async () => {};
   await service.startBridge();
@@ -334,7 +334,11 @@ test('a target the App can never bind is answered with the target_rejected code;
     assert.deepEqual([tabs.ok, tabs.code], [false, 'target_rejected']);
     const ok = await resolveFor('r3', { surface: 'browser', sessionId: 's', operation: 'open', payload: { url: 'https://example.test/page', allowDownload: false } });
     assert.equal(ok.ok, true);
-    // A transport failure while resolving is not a rejection of the target.
+    // A command against a session this instance never opened is a rejection: the
+    // agent has to open again. A transport failure while resolving is not.
+    const gone = await resolveFor('r6', { surface: 'browser', sessionId: 's', operation: 'command', payload: { command: { action: 'reload' } } });
+    assert.deepEqual([gone.ok, gone.code], [false, 'target_rejected']);
+    assert.match(String(gone.error), /open the browser session first/);
     sidecarDown = true;
     const down = await resolveFor('r4', { surface: 'browser', sessionId: 's', operation: 'command', payload: { command: { action: 'reload' } } });
     assert.equal(down.ok, false);
