@@ -36,9 +36,10 @@ for ownership and recovery boundaries.
 
 **Evidence scope:** `npm run verify` at `a543d19` (the last product-source
 commit; later commits are documentation only) passed
-(`artifacts/herdr-managed-gen11-verify.log`: 835 server `node:test` tests,
-465 client `node:test` tests, 16 e2e tests, plus the Bun suites reported
-separately as 36 files / 292 tests, exit 0). The lifetime harness kills an actual separate test App process with
+(`artifacts/herdr-managed-gen11-verify.log`: `[test] server` 835 `node:test`
+tests, `[test] client` 465, `[test] scripts` 16, plus the Bun suites reported
+separately as 36 files with 293 tests run — 292 passed, 1 skipped — exit 0;
+the managed lifetime e2e harness runs inside the server group). The lifetime harness kills an actual separate test App process with
 SIGTERM/SIGKILL and keeps a real PTY Node host/Bun SDK child alive; its
 imported fixture supplies placement and deterministic model transport. The
 production Herdr CLI, the installed desktop bundle and the live provider were
